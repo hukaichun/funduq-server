@@ -14,8 +14,9 @@ license-files = ["LICENSE"]
 
 dependencies = [
     # What a provider *is* — identity, the port, the loop. This package
-    # is only the socket around it.
-    "souk-provider-sdk",
+    # is only the socket around it. From PyPI now; the signing payloads
+    # it re-exports come from funduq-contract underneath.
+    "funduq-provider-sdk>=0.0.2,<0.1",
     # The work socket (WS /ws/provider — the frame protocol is authored
     # in the gateway repo's docs/server-mode.md).
     "websockets>=13",
@@ -37,6 +38,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["souk_agent_sdk"]
-
-[tool.uv.sources]
-souk-provider-sdk = { path = "../AgentSouk/souk-provider-sdk", editable = true }

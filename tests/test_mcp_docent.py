@@ -24,8 +24,9 @@ from datetime import UTC, datetime, timedelta
 
 from mcp import Client
 
-from souk.identity import provider_fingerprint
-from souk.models import AgentSummary
+from funduq.identity import provider_fingerprint
+from funduq.models import AgentSummary
+from funduq_provider_sdk import InProcessLink, ProviderRuntime
 from souk_server.mcp_docent import (
     _seen_ago,
     create_docent,
@@ -34,31 +35,36 @@ from souk_server.mcp_docent import (
     transport_security_for,
 )
 
+from tests.conftest import EchoAgent
+
 BASE = "https://souk.example.com"
 
 
 async def _register(souk, new_identity, provider_name: str, *agents: dict) -> str:
-    """Register a stall. Note the shape: skills belong under
-    `agent_card_extra`, because that is the only part of a registration
-    souk copies verbatim into the agent card (repo.register_agents builds
-    the card from name + description + agent_card_extra, and drops
-    anything else). souk-agent-sdk's AgentHandle sends them the same way,
-    so a test registering them at the top level would be searching data no
-    real provider produces.
+    """Register a stall, the only way one is registered now: publish on
+    an open link, then close the link — registered-but-offline, which is
+    the state most of this suite furnishes its market in.
+
+    Note the shape: skills belong under `agent_card_extra`, because that
+    is the only part of a registration funduq copies verbatim into the
+    agent card (repo.register_agents builds the card from name +
+    description + agent_card_extra, and drops anything else).
+    souk-agent-sdk's AgentHandle sends them the same way, so a test
+    registering them at the top level would be searching data no real
+    provider produces.
 
     Not the `register` fixture: these stalls need names and descriptions
     and skills, which that fixture deliberately does not take — its job is
-    to make a name souk knows, and this one's is to furnish a market.
+    to make a name funduq knows, and this one's is to furnish a market.
     """
     identity = new_identity()
-    signature, timestamp = identity.sign_registration([a["name"] for a in agents])
-    await souk.register_agents(
-        identity.public_key,
-        signature,
-        timestamp,
-        list(agents),
-        provider_name=provider_name,
-    )
+    runtime = ProviderRuntime(identity, EchoAgent())
+    runtime.start()
+    link = InProcessLink(souk, runtime)
+    await souk.attach_provider(link)
+    await souk.register_agents(link, list(agents), provider_name=provider_name)
+    souk.detach_provider(identity.public_key, link)
+    await runtime.aclose()
     return identity.public_key
 
 

@@ -1,10 +1,20 @@
 {
-  "comment": "The gateway's wire contract, minus everything upstream now publishes. The signed payload families — registration, deletion, kyok-call, and since v2 the link-open pair this handshake signs (souk-connect-provider / souk-connect-souk) — are vectored in AgentSouk/docs/contract-vectors.json, whose 'wire' section also declares the delivery envelopes the run and completionRequest frames carry (DeliveredRun / DeliveredCompletion, model_dump(by_alias=True)). What remains this file's to state: the handshake version, and each socket's frame vocabulary. All three implementations' suites consume this file; the frame sets are the module constants the gateway's dispatch reads.",
-  "handshake_version": 2,
-  "payload_vectors": "AgentSouk/docs/contract-vectors.json",
+  "comment": "The gateway's wire contract, minus everything upstream publishes. The signed payload families — the connect pair (funduq-connect-provider / funduq-connect-funduq), kyok-call, cancel, resolve, delegation, the actor-chain form — and the two delivery envelopes (delivered-run, delivered-completion, model_dump(by_alias=True)) are vectored in docs/upstream-contract-vectors.json, vendored verbatim from upstream funduq's docs/contract-vectors.json at contract revision 7. What remains this file's to state: the wire version, and each socket's frame vocabulary. All three in-repo implementations' suites (gateway, souk-agent-sdk, souk-client-sdk) plus the Go pod-probe consume this file; the inbound frame sets are the module constants the gateway's dispatch reads, asserted equal in tests.",
+  "handshake_version": 4,
+  "payload_vectors": "docs/upstream-contract-vectors.json",
+  "handshake": {
+    "comment": "Two frames. The provider fetches {ticket, funduqPublicKey} from POST /tickets out of band, computes proof = sign(provider_connect_payload(funduqPublicKey, ticket, nonce)) BEFORE connecting, and opens with hello; funduq answers welcome, whose 'answer' is its signature over funduq_connect_payload(ticket, nonce) — the provider verifies it against the pinned key (confirm_connect / WrongFunduq) before treating the link as open. Refusals close 1008 with a reason; 1011 is reserved for server faults. The /ws/kyok hello carries no maxConcurrentRuns. Attach is NAMELESS: nothing is served until a register frame on the open link.",
+    "hello": ["type", "version", "publicKey", "ticket", "nonce", "proof", "maxConcurrentRuns?"],
+    "welcome": ["type", "funduqPublicKey", "answer"]
+  },
   "frames": {
-    "comment": "Frame types per socket. After the four-frame handshake (hello, challenge, proof, welcome), a run frame is {'type': 'run', **DeliveredRun}, a completion request is {'type': 'completionRequest', 'requestId', **DeliveredCompletion}; the ack may carry a 'reason' (permanent refusal), the kyok error frame may carry a 'refusal' payload relayed intact. Full field semantics in docs/server-mode.md.",
-    "provider_socket_inbound": ["ack", "event", "finish", "query"],
-    "kyok_socket_inbound": ["chunk", "done", "error"]
+    "comment": "Frame types per socket, after the two-frame handshake. A run frame is {'type': 'run', **DeliveredRun}; a completion request is {'type': 'completionRequest', 'requestId', **DeliveredCompletion} (actorChain included since contract revision 7). The ack is three-valued: accepted true, false (transient decline — the run stays queued), or false with a 'reason' (permanent refusal). Registration frames are unsigned — the link is the credential: register carries the FULL roster (a smaller batch withdraws omitted names), 'registered' echoes what is now live, deleteAgent/deleteModel remove one record ('deleted' confirms; a refusal — e.g. an agent with a conversation behind it — is answered with an 'error' frame and the socket stays open). query methods are contract.LINK_QUERY_METHODS. Full field semantics in docs/server-mode.md.",
+    "handshake": ["hello", "welcome"],
+    "provider_socket_inbound": ["register", "deleteAgent", "ack", "event", "finish", "query"],
+    "provider_socket_outbound": ["welcome", "run", "cancel", "registered", "deleted", "queryResult", "error"],
+    "kyok_socket_inbound": ["register", "deleteModel", "chunk", "done", "error"],
+    "kyok_socket_outbound": ["welcome", "completionRequest", "registered", "deleted", "error"],
+    "register_provider": ["agents", "providerName?"],
+    "register_kyok": ["models", "metadata?"]
   }
 }

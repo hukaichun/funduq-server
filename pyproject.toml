@@ -1,7 +1,7 @@
 [project]
 name = "souk-server"
 version = "0.1.0"
-description = "The reference souk gateway: AG-UI + A2A over HTTP, and the WebSocket relays providers and KYOK bridges connect out to"
+description = "The reference funduq gateway: AG-UI + A2A over HTTP, and the WebSocket relays providers and KYOK bridges connect out to"
 requires-python = ">=3.12"
 # AGPL-3.0, and for a gateway that is the choice with teeth. Every other
 # strong copyleft licence is satisfied by never shipping a binary, which
@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 # someone who modifies this and lets people talk to it over a network owes
 # them the modified source, whether or not they ever distribute a copy.
 #
-# souk core is Apache-2.0 upstream and stays that way. Apache-2.0 is
+# funduq core is Apache-2.0 upstream and stays that way. Apache-2.0 is
 # one-way compatible with (A)GPLv3, so an AGPL work may include it; the
 # reverse is not true, which is why the licence lives on this side of the
 # boundary and not upstream.
@@ -22,19 +22,31 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 # This is where every I/O decision lives — which framework, which port,
 # which TLS story — and why it is a separate distribution rather than an
-# extra of `souk`: core cannot grow a uvicorn import without someone
+# extra of `funduq`: core cannot grow a uvicorn import without someone
 # noticing they are in the wrong package.
+#
+# Upstream arrives from PyPI now — the AgentSouk submodule is gone.
+# `<0.1` on all three: upstream is pre-1.0 and bumps the contract
+# revision inside the 0.0.x line; docs/contract-changelog.md upstream is
+# the record to read before widening these.
 dependencies = [
-    "souk",
-    # Upstream states the provider contract itself now — identity, the
-    # port, and the provider's own loop, with no transport in it. This
-    # gateway builds the socket around exactly that contract.
-    "souk-provider-sdk",
-    # Same relationship for the KYOK side: upstream states what an LLM
-    # provider is (`ConnectedLLMProvider`, `DeliveredCompletion`, the
-    # llm-registration payload), and /ws/kyok is the socket around it.
-    "souk-llm-provider-sdk",
+    "funduq>=0.0.4,<0.1",
+    # Upstream states the provider contract itself — identity, the
+    # ports, and the provider's own loop, with no transport in it. This
+    # gateway builds the socket around exactly that contract. The KYOK
+    # side is the same package's `llm` extra (`funduq_provider_sdk.llm`).
+    "funduq-provider-sdk[llm]>=0.0.2,<0.1",
+    # The signing vocabulary both ends verify: connect payloads, actor
+    # chains, CONTRACT_REVISION.
+    "funduq-contract>=0.0.4,<0.1",
     "fastapi>=0.115",
+    # ServingSettings reads SOUK_* from the environment; funduq's own
+    # CoreSettings stopped being a settings model, so nothing upstream
+    # carries this in any more.
+    "pydantic-settings>=2.6",
+    # The A2A door mounts a2a-sdk's JSON-RPC dispatcher over core's typed
+    # adapter — core stopped speaking JSON-RPC itself.
+    "a2a-sdk>=1.1,<2",
     # [standard] brings websockets, which serves /ws/provider and /ws/kyok
     # — the ws relays need no dependency of their own.
     "uvicorn[standard]>=0.32",
@@ -43,19 +55,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Passed through to souk itself — a gateway wanting the Postgres backend
+# Passed through to funduq itself — a gateway wanting the Postgres backend
 # installs `souk-server[postgres]` rather than reaching past this package.
-postgres = ["souk[postgres]"]
+postgres = ["funduq[postgres]"]
 
 [project.scripts]
 souk-server = "souk_server.server:main"
 
-# souk core comes from the AgentSouk submodule, not a published dependency
-# yet. Clone with --recurse-submodules or `uv sync` has nothing to resolve.
 [tool.uv.sources]
-souk = { path = "AgentSouk/souk", editable = true }
-souk-provider-sdk = { path = "AgentSouk/souk-provider-sdk", editable = true }
-souk-llm-provider-sdk = { path = "AgentSouk/souk-llm-provider-sdk", editable = true }
 # Dev only, and only for one test. Every KYOK test in this repo writes the
 # signing payload out by hand — deliberately, so a change to core's is
 # caught by a disagreement rather than propagated by a shared helper — but
@@ -74,15 +81,14 @@ dev = [
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
     "psycopg[binary,pool]>=3.2",
-    # No direct alembic dependency any more: the migration chain ships
-    # inside souk (`souk.migrate()`), which carries its own alembic.
+    # No direct alembic dependency: the migration chain ships inside
+    # funduq (`python -m funduq.migrate`), which carries its own alembic.
     "httpx-ws>=0.9.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Only this repo's suite — without this, pytest at the repo root recurses
-# into the AgentSouk submodule and collects every subproject's tests.
+# Only this repo's gateway suite — the subprojects run their own.
 testpaths = ["tests"]
 
 [build-system]

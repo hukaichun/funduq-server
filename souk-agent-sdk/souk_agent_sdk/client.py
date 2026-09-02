@@ -1,7 +1,7 @@
 """The WebSocket a provider reaches souk on — transport, and nothing else.
 
-What a provider *is* now comes from `souk_provider_sdk`: the identity and
-what it signs, the port an agent satisfies, and the loop that runs the
+What a provider *is* comes from `funduq_provider_sdk` (PyPI): the identity
+and what it signs, the port an agent satisfies, and the loop that runs the
 work. This module is the carrier for exactly that, and the split is the
 point — `ProviderRuntime` never learns it is on a wire, and this file
 never learns what an agent does.
@@ -13,17 +13,21 @@ full provider says so, and the run stays souk's problem — which is the
 only channel capacity has, and why nothing here counts anything.
 
 Nothing bearer-shaped is involved, and nothing replayable either. The
-socket opens with a mutual challenge-response: each side signs a nonce the
-other chose, so a recorded handshake is worth nothing to whoever recorded
-it, and the provider learns whether the thing answering the URL is the
-souk it meant. Four frames — hello, challenge, proof, welcome — described
-in `souk_server/handshake.py`, which is the spec both halves are written
-against.
+link opens on upstream's ticket handshake (funduq's
+docs/writing-a-transport.md; the gateway repo's docs/server-mode.md is
+the frame spec): the provider fetches a single-use ticket over HTTP
+(`POST /tickets`), signs a proof that *names the funduq it means to
+reach*, and connects with two frames — hello, welcome. The welcome
+carries funduq's counter-signature over the ticket and this side's
+nonce, and it is verified before the link is treated as open. Then the
+roster goes up on the authenticated link itself: `register` is unsigned,
+because the key was proved once when the link opened.
 
 Pass `souk_public_key` to say which souk this provider will talk to. Left
-unset, the provider still verifies that whatever answered holds the key it
-presents, but not that it is the right key — enough to notice a broken
-souk, not enough to notice a substituted one.
+unset, the provider still binds its proof to whatever key the `/tickets`
+answer presented (learned over TLS) and verifies the welcome under that
+same key — enough to notice a broken or mid-handshake-substituted souk,
+not enough to notice one substituted before the ticket was fetched.
 """
 
 from __future__ import annotations
@@ -41,32 +45,36 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import websockets
 from pydantic import ValidationError
-from souk_provider_sdk import (
+from funduq_provider_sdk import (
     AgentHandle,
     DeliveredRun,
+    FunduqLink,
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
-    SoukLink,
+    WrongFunduq,
+    funduq_connect_payload,
     new_nonce,
-    souk_connect_payload,
     verify_signature,
 )
 
 
 logger = logging.getLogger("souk_agent_sdk")
 
-# How long to wait for `welcome` before giving up and reconnecting.
+# How long to wait for `welcome` (and for `registered`) before giving up
+# and reconnecting.
 WELCOME_TIMEOUT_SECONDS = 10.0
 
 
 # The handshake this side speaks. The frame choreography must match the
-# gateway's `souk_server.handshake`; the *bytes signed* come from
-# souk_provider_sdk's link-open family now (`provider_connect_payload` /
-# `souk_connect_payload`), so this package no longer restates any payload
-# — v2 is exactly that migration, and the digest-of-the-hello subtlety
-# went with it.
-HANDSHAKE_VERSION = 2
+# gateway's (docs/server-mode.md is the spec of record); the *bytes
+# signed* come from funduq-contract via funduq_provider_sdk
+# (`provider_connect_payload` / `funduq_connect_payload`), so this
+# package restates no payload. v4 is the ticket handshake: the old
+# four-frame challenge/proof exchange collapsed to hello/welcome because
+# the ticket — fetched out-of-band over `POST /tickets` — *is* the
+# verifier-chosen challenge, and registration moved onto the open link.
+HANDSHAKE_VERSION = 4
 
 # How long an agent waits for souk to answer a question. Generous: it is a
 # database read on the far side of a socket, and the failure it guards is
@@ -74,12 +82,14 @@ HANDSHAKE_VERSION = 2
 QUERY_TIMEOUT_SECONDS = 30.0
 
 
-class SoukIdentityMismatch(Exception):
+class SoukIdentityMismatch(WrongFunduq):
     """The souk at this URL is not the one this provider was told to trust.
 
     Raised rather than logged. The whole value of pinning a key is that a
     substituted souk is refused, and a provider that carried on after
-    noticing would be pinning nothing.
+    noticing would be pinning nothing. A subclass of upstream's
+    `WrongFunduq`, because that is exactly what it reports — the funduq
+    answering this link-open did not prove the key we hold it to.
     """
 
 
@@ -94,10 +104,10 @@ class SoukQueryFailed(Exception):
     """
 
 
-class SoukProvider(SoukLink):
+class SoukProvider(FunduqLink):
     """One identity, its agents, and the socket between them and souk.
 
-    A `SoukLink`, because over a wire this object genuinely is both
+    A `FunduqLink`, because over a wire this object genuinely is both
     directions: run frames arrive on the same socket that event frames
     leave by. The gateway's own `SocketProvider` is deliberately *not* one
     — it holds no runtime and only carries work outward.
@@ -118,17 +128,20 @@ class SoukProvider(SoukLink):
         provider_name: str | None = None,
         souk_public_key: str | None = None,
     ) -> None:
-        # One URL is the whole address: registration posts to it, and the
-        # socket is the same listener with the scheme swapped.
+        # One URL is the whole address: the ticket endpoint and the work
+        # socket are the same listener, scheme swapped for the second.
         self.souk_http_url = souk_http_url.rstrip("/")
         self.reconnect_delay = reconnect_delay
         self.ca_cert_path = ca_cert_path
         self.provider_name = provider_name
         # Which souk this provider will talk to, as a hex Ed25519 public
-        # key. None means "whichever answers the URL" — see
-        # `_check_souk_identity` for exactly what is and is not checked
-        # then.
+        # key. None means "whichever key the /tickets answer presents" —
+        # the proof still names that key and the welcome is still verified
+        # under it, so a swap *during* the handshake is caught either way.
         self.souk_public_key = souk_public_key
+        # An instance attribute rather than derived on every use, so a
+        # test that must split the two listeners can point it elsewhere.
+        self._ws_url = self._derive_ws_url(self.souk_http_url)
         # `load_or_create` does not make the directory, and a provider's
         # key path is very often one it owns alone (`/data/…` on a fresh
         # volume, `./keys/…` in a checkout) — so this is the one thing
@@ -164,7 +177,7 @@ class SoukProvider(SoukLink):
     async def offer(self, run: DeliveredRun) -> bool:
         """souk offers a run. Never called on this side — a socket
         provider is offered work by a `run` frame, which `_offer` below
-        turns into `runtime.deliver`. It exists because `SoukLink` names
+        turns into `runtime.deliver`. It exists because `FunduqLink` names
         both directions and this is the half a wire routes differently."""
         return await self.runtime.deliver(run)
 
@@ -247,40 +260,24 @@ class SoukProvider(SoukLink):
                 waiter.set_exception(SoukQueryFailed(reason))
         self._pending.clear()
 
-    @property
-    def _ws_url(self) -> str:
-        scheme, netloc, path, query, fragment = urlsplit(self.souk_http_url)
+    @staticmethod
+    def _derive_ws_url(http_url: str) -> str:
+        scheme, netloc, path, query, fragment = urlsplit(http_url)
         ws_scheme = "wss" if scheme == "https" else "ws"
         return urlunsplit((ws_scheme, netloc, f"{path.rstrip('/')}/ws/provider", query, fragment))
 
-    async def register(self) -> None:
-        """Prove this identity holds its key, and say what it offers.
-
-        Nothing comes back that has to be kept: souk mints no ids, so this
-        provider already knows everything it needs — its key, and the names
-        it chose.
-        """
-        signature, timestamp = self.identity.sign_registration(sorted(self.agents))
-        body: dict[str, Any] = {
-            "agents": [agent.as_registration() for agent in self.agents.values()],
-            "public_key": self.public_key,
-            "signature": signature,
-            "timestamp": timestamp,
-        }
-        if self.provider_name is not None:
-            body["provider_name"] = self.provider_name
-        async with httpx.AsyncClient(timeout=30.0, verify=self.ca_cert_path or True) as client:
-            response = await client.post(f"{self.souk_http_url}/agents/register", json=body)
-            response.raise_for_status()
-        logger.info("registered %d agent(s) as provider %s", len(self.agents), self.public_key)
-
     async def run_forever(self) -> None:
-        """Stay connected, reconnecting on anything that is not shutdown."""
+        """Stay connected, reconnecting on anything that is not shutdown.
+
+        Every reconnect is the full ceremony again — a fresh ticket, a
+        fresh handshake, and a fresh `register`: the roster lives on the
+        link, so a link that is gone serves nothing and the next one must
+        say again what it offers.
+        """
         self.runtime.start()
         try:
             while True:
                 try:
-                    await self.register()
                     await self._run_connection()
                 except asyncio.CancelledError:
                     raise
@@ -292,48 +289,66 @@ class SoukProvider(SoukLink):
         finally:
             await self.runtime.aclose()
 
-    async def _handshake(self, ws) -> None:
-        """Four frames, and this side signs nothing until it has decided
-        who it is talking to.
+    async def _fetch_ticket(self) -> tuple[str, str]:
+        """`POST /tickets` — the out-of-band half of the handshake.
 
-        The order is the point: souk answers our nonce first, so a provider
-        can walk away from a souk it does not recognise *before* producing
-        anything worth stealing. The old shape signed first and asked
-        nobody, which is how a provider induced to connect to the wrong URL
-        handed a working credential to whatever picked up.
+        Upstream requires the ticket to travel on a channel that is not
+        the link it authorises, and this HTTPS request is that channel.
+        Whoever answers it is also telling us souk's public key, which is
+        what the proof will *name* — so a pinned provider checks the key
+        here, before signing anything at all.
+        """
+        async with httpx.AsyncClient(timeout=30.0, verify=self.ca_cert_path or True) as client:
+            response = await client.post(
+                f"{self.souk_http_url}/tickets", json={"publicKey": self.public_key}
+            )
+            response.raise_for_status()
+            data = response.json()
+        ticket = data.get("ticket")
+        funduq_key = data.get("funduqPublicKey")
+        if not isinstance(ticket, str) or not ticket:
+            raise RuntimeError(f"{self.souk_http_url}/tickets answered without a ticket: {data!r}")
+        if not isinstance(funduq_key, str) or not funduq_key:
+            # Upstream made the identity key mandatory, so a souk with
+            # nothing to present here is broken, not merely anonymous.
+            raise RuntimeError(
+                f"{self.souk_http_url}/tickets presented no funduqPublicKey — "
+                "souk's identity key is required, so this is not a working souk"
+            )
+        if self.souk_public_key is not None and funduq_key != self.souk_public_key:
+            raise SoukIdentityMismatch(
+                f"{self.souk_http_url} is souk {funduq_key[:16]}…, not the "
+                f"{self.souk_public_key[:16]}… this provider was told to trust"
+            )
+        return ticket, funduq_key
+
+    async def _handshake(self, ws, ticket: str, funduq_key: str) -> None:
+        """Two frames, and this side has already decided whom it is
+        addressing before it sends the first.
+
+        The proof is computed from the ticket and the key learned at
+        `/tickets` time, so it *names the recipient*: a proof coaxed out
+        by one souk cannot be relayed to attach at another — the verifier
+        builds the payload with its own key and a mismatch simply fails
+        the signature. The welcome then carries souk's answer, its
+        signature over the ticket and our nonce under a distinct role
+        tag, and it is verified before this link is treated as open —
+        upstream's `confirm_connect` ceremony, performed here because the
+        wire hands the answer over as a frame.
         """
         provider_nonce = new_nonce()
-        names = sorted(self.agents)
         await ws.send(
             json.dumps(
                 {
                     "type": "hello",
                     "version": HANDSHAKE_VERSION,
                     "publicKey": self.public_key,
-                    "agentNames": names,
-                    "maxConcurrentRuns": self.runtime.max_concurrent_runs,
+                    "ticket": ticket,
                     "nonce": provider_nonce,
-                }
-            )
-        )
-
-        challenge = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
-        if challenge.get("type") != "challenge":
-            raise RuntimeError(f"expected challenge, got {challenge!r}")
-        souk_nonce = challenge.get("nonce")
-        if not isinstance(souk_nonce, str) or not souk_nonce:
-            raise RuntimeError("challenge carried no nonce")
-        self._check_souk_identity(challenge, provider_nonce, souk_nonce)
-
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "proof",
-                    # The SDK's own statement of what a provider signs to
-                    # open a link — no local payload, no hello digest.
-                    "signature": self.identity.sign_connect(
-                        souk_nonce, provider_nonce, names
-                    ),
+                    "maxConcurrentRuns": self.runtime.max_concurrent_runs,
+                    # The ticket is the verifier-chosen challenge, in the
+                    # funduq-nonce seat of the connect payload.
+                    "proof": self.identity.sign_connect(funduq_key, ticket, provider_nonce),
                 }
             )
         )
@@ -341,77 +356,65 @@ class SoukProvider(SoukLink):
         welcome = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
         if welcome.get("type") != "welcome":
             raise RuntimeError(f"expected welcome, got {welcome!r}")
-
-    def _check_souk_identity(self, challenge: dict, provider_nonce: str, souk_nonce: str) -> None:
-        """Is the thing answering this URL the souk we meant?
-
-        Three states, and the difference between the last two is the whole
-        reason `souk_public_key` exists:
-
-        - **A souk with no identity.** It says so — `soukPublicKey: null` —
-          which is honest and is what every souk did before this existed.
-          Refused if we pinned a key, since a souk that cannot prove itself
-          is not the one we pinned. Otherwise a warning: we are no worse
-          off than before, and silence would hide a deployment that meant
-          to configure one.
-        - **A key we did not pin.** The signature is still checked, which
-          proves whoever answered holds the key it presented — enough to
-          notice a broken souk, not enough to notice a substituted one.
-          Logged with the fingerprint so it can be eyeballed, and so the
-          value to pin is in reach.
-        - **A key we pinned.** Must match, and must sign. This is the case
-          that makes a substituted souk fail instead of being trusted.
-
-        TOFU — pinning whatever appears on first connect — is deliberately
-        not built. It reads as free safety and is not: souk's key is
-        provisioned, so any deployment that rotates or regenerates it jams
-        every provider at once, and the recovery is to go and clear a pin
-        on each of them. A configured key costs one line and has no such
-        state.
-        """
-        souk_key = challenge.get("soukPublicKey")
-        signature = challenge.get("signature")
-
-        if souk_key is None:
-            if self.souk_public_key is not None:
-                raise SoukIdentityMismatch(
-                    f"{self.souk_http_url} has no identity configured, so it cannot be the "
-                    f"souk pinned as {self.souk_public_key[:16]}…"
-                )
-            logger.warning(
-                "souk at %s has no identity, so this provider cannot tell it from any "
-                "other souk at that URL",
-                self.souk_http_url,
-            )
-            return
-
-        if not isinstance(signature, str) or not verify_signature(
-            souk_key, signature, souk_connect_payload(souk_nonce, provider_nonce)
+        answer = welcome.get("answer")
+        if not isinstance(answer, str) or not verify_signature(
+            funduq_key, answer, funduq_connect_payload(ticket, provider_nonce)
         ):
+            # The half of the handshake that protects the provider: a
+            # welcome whose answer does not verify under the key we hold
+            # this souk to means whatever answered does not possess it.
             raise SoukIdentityMismatch(
-                f"{self.souk_http_url} presented public key {souk_key[:16]}… but did not "
-                "sign our nonce with it"
+                f"{self.souk_http_url} answered the handshake but did not prove "
+                f"possession of {funduq_key[:16]}… "
+                f"(it presented {str(welcome.get('funduqPublicKey'))[:16]}…)"
             )
 
-        if self.souk_public_key is None:
-            logger.warning(
-                "trusting unverified souk identity %s at %s — pass souk_public_key to pin it",
-                souk_key[:16],
-                self.souk_http_url,
-            )
-        elif souk_key != self.souk_public_key:
-            raise SoukIdentityMismatch(
-                f"{self.souk_http_url} is souk {souk_key[:16]}…, not the "
-                f"{self.souk_public_key[:16]}… this provider was told to trust"
-            )
+    async def _register(self, ws) -> None:
+        """Publish the roster, on the open link.
+
+        Unsigned, and that is the point of the handshake above: the key
+        was proved once, when the link opened, and a per-operation
+        signature would only re-prove it. Runs are only offered after
+        souk answers `registered`, so this side waits for that answer
+        before entering the frame loop — a refusal comes back as an
+        `error` frame with the socket still open, and is raised so the
+        reconnect loop retries rather than idling registered-as-nothing.
+        """
+        # `as_registration` is upstream's statement of what a card is
+        # (name + description, agent_card_extra/metadata only when
+        # non-empty); this only re-spells its keys camelCase, which is
+        # every wire frame's casing here.
+        wire_key = {"agent_card_extra": "agentCardExtra"}
+        frame: dict[str, Any] = {
+            "type": "register",
+            "agents": [
+                {wire_key.get(key, key): value for key, value in reg.items()}
+                for reg in (agent.as_registration() for agent in self.agents.values())
+            ],
+        }
+        if self.provider_name is not None:
+            frame["providerName"] = self.provider_name
+        await ws.send(json.dumps(frame))
+
+        answer = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
+        if answer.get("type") == "error":
+            raise RuntimeError(f"souk refused this registration: {answer.get('message')!r}")
+        if answer.get("type") != "registered":
+            raise RuntimeError(f"expected registered, got {answer!r}")
+        logger.info(
+            "registered %d agent(s) as provider %s", len(answer.get("names") or []), self.public_key
+        )
 
     async def _run_connection(self) -> None:
+        ticket, funduq_key = await self._fetch_ticket()
+
         ssl_context: ssl.SSLContext | None = None
         if self._ws_url.startswith("wss") and self.ca_cert_path:
             ssl_context = ssl.create_default_context(cafile=self.ca_cert_path)
 
         async with websockets.connect(self._ws_url, ssl=ssl_context) as ws:
-            await self._handshake(ws)
+            await self._handshake(ws, ticket, funduq_key)
+            await self._register(ws)
 
             writer = asyncio.create_task(self._write_loop(ws))
             try:
@@ -453,20 +456,20 @@ class SoukProvider(SoukLink):
         # bare decline while a validation failure below carries a reason.
         #
         # souk should never send one: it offers a run only to a provider
-        # attached for that agent. This is the answer for when it does.
+        # registered for that agent. This is the answer for when it does.
         if agent_name not in self.agents:
             logger.warning(
                 "declining run %s: this provider does not serve %r", run_id, agent_name
             )
             self._outbound.put_nowait({"type": "ack", "runId": run_id, "accepted": False})
             return
-        # The frame *is* the declared envelope now — `DeliveredRun.
+        # The frame *is* the declared envelope — `DeliveredRun.
         # model_dump(by_alias=True)` on souk's side, rebuilt here with
-        # `model_validate` (AgentSouk#74's answer). No field mapping on
-        # either end; a frame that does not validate is a permanent
-        # refusal, because the same bytes re-offered can never do better —
-        # the rule `DeliveredRun.from_claimed` states in-process, met at
-        # this transport's rebuild step.
+        # `model_validate`. No field mapping on either end; a frame that
+        # does not validate is a permanent refusal, because the same bytes
+        # re-offered can never do better — the rule `DeliveredRun.
+        # from_claimed` states in-process, met at this transport's rebuild
+        # step. The reason rides the ack, which keeps it three-valued.
         try:
             delivered = DeliveredRun.model_validate(frame)
         except ValidationError as e:

@@ -142,6 +142,7 @@ class SoukClient:
         role: str = "user",
         metadata: dict[str, Any] | None = None,
         resume: list[dict[str, Any]] | None = None,
+        addressed_run_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """POSTs a RunAgentInput to `/agui/{provider}/{name}` and yields each
         AG-UI event as it streams back. Pass `thread_id` from a previous
@@ -167,6 +168,12 @@ class SoukClient:
         alongside it — resolving an interrupt isn't necessarily saying
         anything new in the conversation, so an empty `message` sends no
         message at all rather than an empty one.
+
+        `addressed_run_id` declares this message an *interjection* into a
+        run already going on that thread (pass its id — a previous call's
+        `last_run_id`): it rides as `forwardedProps.addressedRunId`, and
+        souk delivers the message into that run instead of starting a new
+        turn. Interjection is caller-declared, never inferred.
         """
         if thread_id is None:
             thread_id = await self.create_thread(agent)
@@ -174,7 +181,8 @@ class SoukClient:
         # The real ag_ui.core.RunAgentInput wire shape — threadId is the
         # only id souk actually uses; runId is required by the schema but
         # never read, so a placeholder satisfies it without meaning
-        # anything.
+        # anything. souk mints every thread id itself: an unseen threadId
+        # here gets a fresh one, announced on RUN_STARTED (read below).
         body: dict[str, Any] = {
             "threadId": thread_id,
             "runId": str(uuid4()),
@@ -190,6 +198,8 @@ class SoukClient:
             body["metadata"] = metadata
         if resume is not None:
             body["resume"] = resume
+        if addressed_run_id is not None:
+            body["forwardedProps"] = {"addressedRunId": addressed_run_id}
         url = f"{self.souk_http_url}/agui/{agent.path}"
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:

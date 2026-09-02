@@ -2,12 +2,12 @@
 exposed on a network.
 
 Deliberately a separate class in a separate distribution from
-`souk.config.CoreSettings`. Core never reads any of this — it cannot, it does
-not depend on this package — which is what makes "core knows a database and
-nothing else" a property of the packaging rather than of everyone's
-discipline. Both are still `pydantic-settings` models reading the same
-`SOUK_*` environment variables, so a deployment configures one process the
-way it always did.
+`funduq.config.CoreSettings`. Core never reads any of this — it cannot, it
+does not depend on this package — which is what makes "core knows a
+database and nothing else" a property of the packaging rather than of
+everyone's discipline. The prefixes diverged with the split: core reads
+`FUNDUQ_*` (and only when asked to, via `CoreSettings.from_env()`), while
+this serving layer keeps the `SOUK_*` prefix a deployment already sets.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict

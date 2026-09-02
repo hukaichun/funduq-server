@@ -8,15 +8,13 @@ model client normally sends the exact same static `api_key` on every
 request, which can't carry any fresher proof than that.
 
 This `httpx.Auth` signs each outgoing request afresh with this provider's
-own identity key — the same Ed25519 keypair already proven at
-registration (see souk_agent_sdk.identity) — so souk can verify, per
-call, that whoever is presenting the token really holds the private key
-for the agent_id it names. Binding the signature to the token, a
-timestamp, and a hash of the request body (not just the token alone)
-means a captured signature can't be replayed against a different
-request, and the timestamp bounds how long a captured one is usable at
-all — same freshness-window defense as every other signed request in
-this system (see souk.identity.SIGNATURE_FRESHNESS_WINDOW_SECONDS).
+own identity key — the same Ed25519 keypair already proven when its link
+opened (see souk_agent_sdk.identity) — so souk can verify, per call,
+that whoever is presenting the token really holds the private key for
+the agent it names. Binding the signature to the token, a timestamp, and
+a hash of the request body (not just the token alone) means a captured
+signature can't be replayed against a different request, and the
+timestamp bounds how long a captured one is usable at all.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from collections.abc import Generator
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from souk_provider_sdk.identity import kyok_call_payload
+from funduq_provider_sdk.identity import kyok_call_payload
 
 from souk_agent_sdk.identity import sign
 
@@ -49,11 +47,11 @@ class KyokSigningAuth(httpx.Auth):
         token = request.headers.get("authorization", "").removeprefix("Bearer ")
         timestamp = int(time.time())
         body_hash = hashlib.sha256(request.content).hexdigest()
-        # From souk_provider_sdk rather than spelled out here. What a
-        # provider signs is that package's statement to make, and this one
-        # is only the socket around it — written out a second time, the
-        # operation prefix is a thing to forget, which is exactly what it
-        # was before core added one.
+        # From funduq_provider_sdk (which re-exports funduq_contract's
+        # statement) rather than spelled out here. What a provider signs
+        # is the contract package's statement to make, and this one is
+        # only the socket around it — written out a second time, the
+        # operation prefix is a thing to forget.
         payload = kyok_call_payload(token, timestamp, body_hash)
         request.headers["X-Souk-Kyok-Timestamp"] = str(timestamp)
         request.headers["X-Souk-Kyok-Signature"] = sign(self._private_key, payload)

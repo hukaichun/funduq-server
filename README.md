@@ -1,43 +1,44 @@
 # Agent Souk Server
 
-**The reference [Agent Souk](https://github.com/hukaichun/AgentSouk) gateway — every network decision, in one place.** One HTTP surface serving humans (AG-UI SSE), agents (A2A v1.0 JSON-RPC), and the outbound relay that lets providers behind NAT serve agents without public IPs, open ports, or tunnels.
+**The reference [funduq](https://github.com/hukaichun/funduq) gateway — every network decision, in one place.** One HTTP surface serving humans (AG-UI SSE), agents (A2A v1.0 JSON-RPC), and the outbound relay that lets providers behind NAT serve agents without public IPs, open ports, or tunnels.
 
 ---
 
-## Two repositories, one boundary
+## Two projects, one boundary
 
-This repo is the *serving* half of Agent Souk. The split is a hard line, recorded in [AgentSouk#27](https://github.com/hukaichun/AgentSouk/issues/27):
+This repo is the *serving* half. Upstream — [funduq](https://github.com/hukaichun/funduq) — is the domain, and it arrives here as ordinary PyPI packages; the split is a hard line, recorded in [funduq#27](https://github.com/hukaichun/funduq/issues/27):
 
-| | **[AgentSouk](https://github.com/hukaichun/AgentSouk)** (upstream) | **AgentSoukServer** (this repo) |
+| | **[funduq](https://github.com/hukaichun/funduq)** (upstream, from PyPI) | **AgentSoukServer** (this repo) |
 |---|---|---|
 | **Owns** | The domain: agents, threads, runs, identity, persistence, protocol *translation* | The network: ports, transports, TLS, CORS, endpoints, wire framing, admin surface — **both ends of every wire** |
-| **Ships** | `souk` (network-free core) | The gateway process assembled from core, plus the client SDKs that speak its wire ([`souk-agent-sdk/`](souk-agent-sdk), [`souk-client-sdk/`](souk-client-sdk)) |
+| **Ships** | `funduq` (network-free core), `funduq-provider-sdk`, `funduq-contract` | The gateway process assembled from core, plus the client SDKs that speak its wire ([`souk-agent-sdk/`](souk-agent-sdk), [`souk-client-sdk/`](souk-client-sdk)) |
 | **May it bind a socket?** | Never — enforced by packaging and test | Yes — that is its entire job |
 
 Two consequences worth knowing before touching anything:
 
-- **The wire contract is authored here, and so are both sides of it.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, gRPC removed. The SDKs that implement that spec live in this repo too ([`souk-agent-sdk/`](souk-agent-sdk) for providers, [`souk-client-sdk/`](souk-client-sdk) for callers and their KYOK bridges): upstream keeps no network code at all, client side included.
-- **souk core arrives via the git submodule** (`AgentSouk/souk`, a `uv` path dependency), pinned by commit. This repo contains no domain logic — it lifts headers, frames responses, binds sockets, and hands everything else to core.
+- **The wire contract is authored here, and so are both sides of it.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, the ticket handshake. The SDKs that implement that spec live in this repo too ([`souk-agent-sdk/`](souk-agent-sdk) for providers, [`souk-client-sdk/`](souk-client-sdk) for callers and their KYOK bridges): upstream keeps no network code at all, client side included. The signed payloads inside the frames are upstream's, vendored as [`docs/upstream-contract-vectors.json`](docs/upstream-contract-vectors.json).
+- **funduq core arrives from PyPI** (`funduq`, version-pinned in `pyproject.toml`). This repo contains no domain logic — it lifts headers, frames responses, binds sockets, and hands everything else to core.
 
 ---
 
 ## Quick start
 
-The submodule is required — without it there is no `souk` to resolve:
-
 ```bash
-git clone --recurse-submodules git@github.com:hukaichun/AgentSoukServer.git
+git clone git@github.com:hukaichun/AgentSoukServer.git
 cd AgentSoukServer
-# (already cloned without it? git submodule update --init)
 ```
 
 Then, in three commands:
 
 ```bash
 uv sync --group dev
-uv run alembic -c AgentSouk/souk/alembic.ini upgrade head   # one-time DDL step
-SOUK_TOKEN_SIGNING_SECRET=dev uv run souk-server            # everything on :8000
+uv run python -m funduq.migrate     # one-time DDL step; the chain ships inside the funduq wheel
+FUNDUQ_TOKEN_SIGNING_SECRET=dev \
+FUNDUQ_IDENTITY_PRIVATE_KEY=$(uv run python -c "from funduq.identity import FunduqIdentity; print(FunduqIdentity.generate_hex())") \
+  uv run souk-server                # everything on :8000
 ```
+
+(The identity key is required, and in a real deployment it is the *same* value across restarts and replicas — providers pin it. Generate once, keep it.)
 
 Verify it's alive:
 
@@ -56,7 +57,7 @@ graph TD
     Bridge([Caller's KYOK bridge]) ==>|"WS /ws/kyok"| HTTP
 
     subgraph Process ["souk-server (single process)"]
-        HTTP --> Core["souk core (from the submodule)<br/>broker · handlers · protocol adapters"]
+        HTTP --> Core["funduq core (from PyPI)<br/>broker · handlers · protocol adapters"]
     end
 
     Process --> DB[(SQLite / Postgres)]
@@ -65,28 +66,28 @@ graph TD
 
 `create_app(souk, serving)` returns a plain ASGI app that binds nothing — mount it inside a larger app, wrap it in your own middleware (pure ASGI, not `BaseHTTPMiddleware`: that class buffers streams and never sees WebSocket scopes), or let the `souk-server` console script serve it. Every I/O decision — which framework, which port, which TLS story — is made here so that core never has to.
 
-**Server mode is live** ([`docs/server-mode.md`](docs/server-mode.md)): providers and KYOK bridges each hold a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok` — JSON frames, dual-track auth). One port, one TLS certificate, any reverse proxy (`wss` is a plain HTTP/1.1 upgrade), and a browser can be a provider. The MCP docent rides the same listener at `/mcp`.
+**Server mode is live** ([`docs/server-mode.md`](docs/server-mode.md)): providers and KYOK bridges each hold a WebSocket on the one HTTP port (`/ws/provider`, `/ws/kyok` — JSON frames, the v4 ticket handshake). One port, one TLS certificate, any reverse proxy (`wss` is a plain HTTP/1.1 upgrade), and a browser can be a provider. The MCP docent rides the same listener at `/mcp`.
 
 ---
 
 ## Configuration
 
-Everything is `SOUK_*` environment variables — [.env.example](.env.example) documents them (nothing auto-loads it; it's for `export` / compose). The split mirrors the repo boundary:
+Two env families now — [.env.example](.env.example) documents both (nothing auto-loads it; it's for `export` / compose). The prefixes mirror the project boundary:
 
 | Layer | Variables | Examples |
 |---|---|---|
-| **Core** (`CoreSettings`, upstream) | database, domain timing, signing key | `SOUK_DATABASE_URL` (unset = zero-config SQLite `./souk.db`), `SOUK_TOKEN_SIGNING_SECRET` (**required in any real deployment**), `SOUK_DB_SCHEMA` |
-| **Serving** (`ServingSettings`, here) | everything that only means something once there's a socket | `SOUK_HTTP_PORT`, `SOUK_GRPC_PORT`, `SOUK_PUBLIC_HTTP_URL`, `SOUK_CORS_ALLOW_ORIGINS`, `SOUK_*_TLS_CERT_PATH`/`_KEY_PATH` |
+| **Core** (`CoreSettings`, upstream — read explicitly via `CoreSettings.from_env()`) | database, domain policy, keys | `FUNDUQ_DATABASE_URL` (unset = zero-config SQLite `./funduq.db`), `FUNDUQ_DB_SCHEMA`, `FUNDUQ_TOKEN_SIGNING_SECRET` (**required**), `FUNDUQ_IDENTITY_PRIVATE_KEY` (**required** — the funduq's own Ed25519 identity; providers pin it, so it must be stable across restarts and replicas) |
+| **Serving** (`ServingSettings`, here) | everything that only means something once there's a socket | `SOUK_HTTP_PORT`, `SOUK_PUBLIC_HTTP_URL`, `SOUK_CORS_ALLOW_ORIGINS`, `SOUK_HTTP_TLS_CERT_PATH`/`_KEY_PATH` |
 
 ---
 
 ## TLS is required off localhost
 
-Not hardening advice — a specific threat: registration and KYOK requests are replay-protected only by a **60-second freshness window**, and session tokens are **bearer credentials**. On a plaintext path, anyone in the middle reads a token outright or replays a captured signed request inside that window. TLS turns "bounded to 60s" into "not visible at all". The server logs a warning when it binds HTTP without it.
+Not hardening advice — specific threats: session and KYOK tokens are **bearer credentials**, and `POST /tickets` is where a provider learns the funduq public key its connect proof will name — on a plaintext path, anyone in the middle reads a token outright or substitutes the key at the one moment it is taken on faith. TLS is what makes the ticket channel the trustworthy out-of-band step the handshake assumes. The server logs a warning when it binds HTTP without it.
 
 Two supported terminations — pick one, but off-localhost you need one:
 
-- **At the gateway**: `SOUK_HTTP_TLS_CERT_PATH` / `SOUK_HTTP_TLS_KEY_PATH` with a real CA-issued cert (dev pair: `uv run python AgentSouk/scripts/gen_dev_tls_cert.py`).
+- **At the gateway**: `SOUK_HTTP_TLS_CERT_PATH` / `SOUK_HTTP_TLS_KEY_PATH` with a real CA-issued cert (dev pair: `uv run python scripts/gen_dev_tls_cert.py`).
 - **At a reverse proxy** (nginx / caddy / cloud LB), gateway plaintext on an internal network. `wss` is a plain HTTP/1.1 upgrade — no HTTP/2 support required of the proxy.
 
 ---
@@ -97,7 +98,7 @@ Two supported terminations — pick one, but off-localhost you need one:
 docker compose up --build
 ```
 
-brings up the stack: **paradedb** (Postgres), **souk-migrate** (one-shot `alembic upgrade head`, then exits), **souk** (the gateway, after migration completes), and **docent** (the guide at the gate — needs `.env` with LLM credentials; see `.env.example`).
+brings up the stack: **paradedb** (Postgres), **souk-migrate** (one-shot `python -m funduq.migrate` — the alembic chain ships inside the funduq wheel, no `alembic.ini` anywhere — then exits), **souk** (the gateway, after migration completes), and **docent** (the guide at the gate — needs `.env` with LLM credentials; see `.env.example`).
 
 For a market with something in it, add the demo profile:
 
@@ -107,7 +108,7 @@ docker compose --profile demo up --build
 
 which opens three more stalls beside the docent — **Zahra's Tongues** (a plain translator and a haggler), **Yusuf's Workshop** (a poetry translator and a scribe) and **The Midnight Tea House** (a storyteller). Six agents, four stalls, two of them with more than one agent and one with only one; Zahra's and Yusuf's both call their translator `translator`, so the ambiguous-name path is live rather than theoretical; and the haggler delegates across stalls to Yusuf's scribe, which shows up as real lineage under `GET /threads/{id}/tree`. The migration is deliberately its own service — DDL runs with different credentials than the DML-only role the server needs; the gateway never creates tables at startup.
 
-Building the image requires the submodule checked out (`git clone --recurse-submodules`) — `scripts/` and `souk/` are COPYed from it.
+The images install upstream (`funduq` and friends) from PyPI during the build — a plain `git clone` is all the checkout the build needs.
 
 ---
 
@@ -124,7 +125,7 @@ SOUK_DATABASE_URL=postgresql+psycopg://souk:souk@localhost:5433/souk uv run pyte
 A green suite does **not** import `souk_server/server.py` — after broad edits, also prove the app assembles:
 
 ```bash
-uv run python -c "from souk.config import CoreSettings; from souk.core import Souk; from souk_server.server import create_app; create_app(Souk(CoreSettings(token_signing_secret='x'))); print('app builds')"
+uv run python -c "from funduq.config import CoreSettings; from funduq.core import Funduq; from souk_server.server import create_app; create_app(Funduq(CoreSettings(token_signing_secret='x', identity_private_key='11'*32))); print('app builds')"
 ```
 
 ---
@@ -133,19 +134,19 @@ uv run python -c "from souk.config import CoreSettings; from souk.core import So
 
 From [`docs/server-mode.md`](docs/server-mode.md); the transport work is done:
 
-1. **`WS /ws/provider`** — landed. The worker relay (claim / event / finish / cancel) over one socket, probed end-to-end including reconnect-mid-run and cancel ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
+1. **`WS /ws/provider`** — landed, now on wire **v4**: the ticket handshake (`POST /tickets` + two frames) and registration on the open link ([tests/test_ws_provider.py](tests/test_ws_provider.py)).
 2. **`WS /ws/kyok`** — landed. Replaced the poll/respond pair; answers are only accepted on the connection each request was delivered to (a security fix, not just a transport swap — see the design note).
-3. **gRPC stripped** — landed. Listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames, `proto/souk.proto` remains upstream as their record.
+3. **gRPC stripped** — landed. Listener, stubs, deps, `:50051` all gone; the wire semantics live on in the ws frames and in upstream's contract vectors (vendored as [docs/upstream-contract-vectors.json](docs/upstream-contract-vectors.json)).
 4. **MCP docent** (`/mcp`) — landed. Discovery, not invocation: who is in the souk, what each stall offers, and the A2A endpoint to go talk to them ([souk_server/mcp_docent.py](souk_server/mcp_docent.py)). Read-only; calling an agent stays A2A's job.
-5. **Examples** — remaining. A browser provider (frame-protocol conformance, no SDK), an end-to-end `demo` compose profile, and a managed-gateway embedding sample (edge auth + admin router over the `Souk` facade).
+5. **Examples** — the `demo` compose profile and the SDK-free Go probe ([providers/pod-probe-agent](providers/pod-probe-agent)) landed; a browser provider and a managed-gateway embedding sample (edge auth + admin router over the `Funduq` facade) remain.
 
 ## License
 
 **The gateway is [AGPL-3.0](LICENSE); the SDKs, the template and the
 reference providers are [Apache-2.0](souk-agent-sdk/LICENSE).** What you
 *run* is copyleft, what you *build against* is not — so a hosted, modified
-souk stays open, while your own agent stays yours. souk core is Apache-2.0
-upstream and unaffected.
+souk stays open, while your own agent stays yours. funduq core is
+Apache-2.0 upstream and unaffected.
 
 See [LICENSING.md](LICENSING.md) for the per-directory map and the
 reasoning. Nobody has to use the SDKs at all: the wire is documented in

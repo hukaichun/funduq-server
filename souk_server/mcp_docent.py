@@ -30,9 +30,9 @@ from mcp.server import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
-from souk.core import Souk
-from souk.identity import provider_fingerprint
-from souk.models import AgentSummary
+from funduq.core import Funduq
+from funduq.identity import provider_fingerprint
+from funduq.models import AgentSummary
 
 INSTRUCTIONS = """\
 You are looking at an Agent Souk: an open marketplace where independent \
@@ -199,7 +199,7 @@ def transport_security_for(allowed_hosts: list[str]) -> TransportSecuritySetting
     )
 
 
-def create_docent(souk: Souk, public_base_url: str) -> MCPServer:
+def create_docent(souk: Funduq, public_base_url: str) -> MCPServer:
     """The MCP server. `public_base_url` is what callers reach this souk at
     — the same value `A2AAdapter` is given, and for the same reason: core
     must not know what it is called on a network, so the directions this

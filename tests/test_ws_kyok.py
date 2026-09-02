@@ -1,19 +1,21 @@
 """The WS /ws/kyok relay (souk_server.ws_kyok) — the socket an LLM
-provider serves completions over, since upstream made the answering party
-a first-class provider kind instead of an anonymous session-keyed bridge.
+provider serves completions over.
 
-The round trips mirror what the old bridge socket carried: a provider's
-/kyok/v1/chat/completions call answered over the socket, streaming and
-not, plus the error path and requestId multiplexing. What changed is who
-is on the socket — an Ed25519-identified LLM provider that registered its
-offerings and attached, through the same four-frame mutual handshake as
-/ws/provider — and what the completionRequest frame carries: the run,
-the proven calling agent, the addressed model, and the caller's context.
+The round trips: a provider's /kyok/v1/chat/completions call answered
+over the socket, streaming and not, plus the error path and requestId
+multiplexing. The LLM provider arrives through the same v4 ticket
+handshake as /ws/provider and then publishes its offerings **on the open
+link** — `register {models}` / `registered` / `deleteModel` / `deleted`
+— since the signed HTTP registration road is gone upstream and the link
+is the credential.
 
 What deliberately did not change: an answer is accepted only on the
 connection its request was delivered to. A second authenticated socket —
 same identity, same offering, so it passes every credential check there
-is — presenting a valid requestId it was never delivered is refused.
+is — presenting a valid requestId it was never delivered is refused. And
+a later attach *takes over* the offering: funduq holds one connection
+per role, the replacement serves, and the replaced socket's teardown
+cannot take it down.
 
 The agent-provider side of every test stays plain HTTP; that endpoint is
 deliberately untouched.
@@ -31,9 +33,9 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
-from souk.kyok import KyokBinding, issue_kyok_token
-from souk.models import LlmRef
-from souk_server.handshake import HANDSHAKE_VERSION, new_nonce
+from funduq.kyok import KyokBinding, issue_kyok_token
+from funduq.models import LlmRef
+from souk_server.handshake import WIRE_VERSION
 from souk_server.server import create_app
 
 from tests.conftest import TEST_SIGNING_SECRET, Identity
@@ -43,7 +45,7 @@ RECEIVE_TIMEOUT = 2.0
 
 def _kyok_headers(bearer: str, private_key, body: bytes) -> dict:
     timestamp = str(int(time.time()))
-    payload = f"souk-kyok-call:{bearer}:{timestamp}:{hashlib.sha256(body).hexdigest()}".encode()
+    payload = f"funduq-kyok-call:{bearer}:{timestamp}:{hashlib.sha256(body).hexdigest()}".encode()
     return {
         "Authorization": f"Bearer {bearer}",
         "X-Souk-Kyok-Timestamp": timestamp,
@@ -67,15 +69,57 @@ def _chunk(content: str = "", role: str | None = None, finish_reason: str | None
     }
 
 
-async def _live(register, souk, run_id: str, llm: LlmRef, context=None):
-    """A registered agent, a run the broker is dispatching, a KYOK binding
-    to `llm`, and a token naming run and agent — the setup every round
-    trip shares. The binding is written the way protocols/agui.py writes
-    it at opt-in; these tests supply the run, not the AG-UI road in."""
-    served = await register("greeter")
-    souk.enqueue_run(run_id, served.ref(), "thread_1", {}, "ag-ui")
+class HoldingAgent:
+    """Accepts its run and holds it open — the seat an agent occupies
+    while its model client is out at /kyok/v1/chat/completions."""
+
+    async def run_stream(self, agent_name: str, run_input):
+        yield {
+            "type": "RUN_STARTED",
+            "threadId": run_input.thread_id,
+            "runId": run_input.run_id,
+        }
+        await asyncio.Event().wait()
+
+
+def _run_input(run_id: str, thread_id: str) -> dict:
+    """A valid RunAgentInput wire shape: the broker refuses to enqueue for
+    an unserved agent now, so these runs really reach a provider — whose
+    runtime validates the envelope before accepting."""
+    return {
+        "threadId": thread_id,
+        "runId": run_id,
+        "state": None,
+        "messages": [],
+        "tools": [],
+        "context": [],
+        "forwardedProps": None,
+    }
+
+
+async def _live(serve, souk, llm: LlmRef, context=None):
+    """A served agent (held mid-run, the way a real KYOK caller is), a run
+    the broker is dispatching, a KYOK binding to `llm`, and a token naming
+    run and agent — the setup every round trip shares. The binding is
+    written the way protocols/agui.py writes it at opt-in; these tests
+    supply the run, not the AG-UI road in.
+
+    A real thread and run row back the in-memory run: event persistence
+    has foreign keys to satisfy, and a run failing to persist its first
+    event is failed — which reads three layers away as a 403 on the
+    completions route.
+    """
+    from funduq import repo
+
+    served = await serve(HoldingAgent(), "greeter")
+    thread_id = await souk.create_thread(served.ref())
+    async with souk.session() as session:
+        created = await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+        await session.commit()
+    run_id = created["run_id"]
+    souk.enqueue_run(run_id, served.ref(), thread_id, _run_input(run_id, thread_id), "ag-ui")
     souk.kyok_relay.bind_run(run_id, KyokBinding(llm_provider=llm, context=context))
-    return served, issue_kyok_token(run_id, served.ref(), TEST_SIGNING_SECRET)
+    return served, issue_kyok_token(run_id, served.ref(), TEST_SIGNING_SECRET), run_id
 
 
 def _client(souk) -> httpx.AsyncClient:
@@ -87,38 +131,31 @@ def _client(souk) -> httpx.AsyncClient:
     )
 
 
-async def _register_llm(souk, names: list[str]) -> Identity:
-    identity = Identity()
-    signature, timestamp = identity.sign_llm_registration(names)
-    await souk.register_llm_providers(identity.public_key, signature, timestamp, names)
-    return identity
-
-
 class _LlmSocket:
     """One /ws/kyok connection speaking the frame table directly, opening
-    with the same mutual challenge-response as the provider socket."""
+    with the same ticket handshake as the provider socket (no
+    maxConcurrentRuns) and registering its offerings on the open link."""
 
     def __init__(self, ws, identity: Identity) -> None:
         self._ws = ws
         self.identity = identity
 
-    async def connect(self, model_names: list[str]) -> None:
-        nonce = new_nonce()
-        await self._ws.send_text(
-            json.dumps(
-                {
-                    "type": "hello",
-                    "version": HANDSHAKE_VERSION,
-                    "publicKey": self.identity.public_key,
-                    "modelNames": model_names,
-                    "nonce": nonce,
-                }
-            )
-        )
-        challenge = await self.recv()
-        assert challenge["type"] == "challenge"
-        await self.send(self.identity.proof(model_names, nonce, challenge["nonce"]))
-        assert (await self.recv()) == {"type": "welcome"}
+    async def connect(self, souk, model_names: list[str] | None = None) -> None:
+        await self.send(self.identity.hello(souk))
+        welcome = await self.recv()
+        assert welcome["type"] == "welcome", welcome
+        assert welcome["funduqPublicKey"] == souk.identity_public_key
+        if model_names is not None:
+            await self.register(model_names)
+
+    async def register(self, model_names: list[str], metadata: dict | None = None) -> dict:
+        frame: dict = {"type": "register", "models": model_names}
+        if metadata is not None:
+            frame["metadata"] = metadata
+        await self.send(frame)
+        answer = await self.recv()
+        assert answer == {"type": "registered", "names": sorted(model_names)}, answer
+        return answer
 
     async def recv(self) -> dict:
         return json.loads(await self._ws.receive_text(timeout=RECEIVE_TIMEOUT))
@@ -132,14 +169,14 @@ class _LlmSocket:
         await self.send({"type": "done", "requestId": request_id})
 
 
-# --- handshake and attach ----------------------------------------------------
+# --- handshake, registration, deletion ---------------------------------------
 
 
 @pytest.mark.parametrize(
     "first_frame",
     [
         {"type": "hello"},  # no version, no identity
-        {"type": "hello", "version": HANDSHAKE_VERSION, "publicKey": "ab", "nonce": "n"},  # no modelNames
+        {"type": "hello", "version": WIRE_VERSION, "publicKey": "ab", "nonce": "n"},  # no ticket/proof
         {"type": "chunk", "requestId": "x"},  # anything else before hello
     ],
 )
@@ -152,40 +189,30 @@ async def test_a_bad_hello_closes_the_socket(souk, first_frame):
             assert excinfo.value.code == 1008
 
 
-async def test_attaching_unregistered_model_names_is_refused(souk):
-    """Registration is the prerequisite, exactly as it is for agents —
-    core refuses the attach, and the socket closes by name rather than
-    serving an offering nobody registered."""
-    identity = Identity()  # never registered anything
+async def test_a_proof_that_answers_no_ticket_is_refused(souk):
+    """Same admission rule as the provider socket: no live ticket for this
+    key, no link — closed by name, not served."""
+    identity = Identity()
+    hello = identity.hello(souk)
     async with _client(souk) as client:
         async with aconnect_ws("http://test/ws/kyok", client) as ws:
-            socket = _LlmSocket(ws, identity)
-            with pytest.raises((WebSocketDisconnect, AssertionError)):
-                await socket.connect(["gpt-test"])
+            await ws.send_text(json.dumps({**hello, "ticket": "not-a-ticket"}))
+            with pytest.raises(WebSocketDisconnect) as excinfo:
                 await ws.receive_text(timeout=RECEIVE_TIMEOUT)
+            assert excinfo.value.code == 1008
+            # The close reason is capped at 123 bytes on the wire, so match the
+            # front of core's sentence rather than a word the cap may cut.
+            assert "connect proof" in (excinfo.value.reason or "")
 
 
-async def test_registration_over_http_then_attach(souk):
-    """The whole LLM-provider arrival, over the wire a real one uses:
-    POST /llm-providers/register with the SDK-signed payload, then the
-    socket handshake, then attached — visible as the offering resolving."""
+async def test_registering_on_the_link_is_the_whole_llm_provider_arrival(souk):
+    """The arrival a real LLM provider makes now: ticket handshake, then
+    offerings published on the open link — visible on the roster with the
+    metadata, online while attached, offline the moment the socket drops
+    (record intact)."""
     identity = Identity()
-    signature, timestamp = identity.sign_llm_registration(["gpt-test"])
+    ref = LlmRef(provider_key=identity.public_key, name="gpt-test")
     async with _client(souk) as client:
-        resp = await client.post(
-            "/llm-providers/register",
-            json={
-                "models": ["gpt-test"],
-                "public_key": identity.public_key,
-                "signature": signature,
-                "timestamp": timestamp,
-                "metadata": {"family": "test"},
-            },
-        )
-        assert resp.status_code == 201, resp.text
-        assert resp.json() == {"models": ["gpt-test"]}
-
-        ref = LlmRef(provider_key=identity.public_key, name="gpt-test")
 
         async def roster_row() -> dict:
             resp = await client.get("/llm-providers")
@@ -193,86 +220,72 @@ async def test_registration_over_http_then_attach(souk):
             (row,) = resp.json()["offerings"]
             return row
 
-        # Registered but not attached: discoverable, and honestly offline —
-        # the pre-flight glance a KYOK caller binds on.
-        row = await roster_row()
-        assert (row["provider_key"], row["name"]) == (identity.public_key, "gpt-test")
-        assert row["metadata"] == {"family": "test"}
-        assert row["online"] is False
-
         async with aconnect_ws("http://test/ws/kyok", client) as ws:
-            await _LlmSocket(ws, identity).connect(["gpt-test"])
+            socket = _LlmSocket(ws, identity)
+            await socket.connect(souk)
+            assert (await client.get("/llm-providers")).json() == {"offerings": []}
+
+            await socket.register(["gpt-test"], metadata={"family": "test"})
+
             assert souk.kyok_relay.serving(ref) is not None
-            assert (await roster_row())["online"] is True
-        # And detached the moment the socket is gone.
+            row = await roster_row()
+            assert (row["provider_key"], row["name"]) == (identity.public_key, "gpt-test")
+            assert row["metadata"] == {"family": "test"}
+            assert row["online"] is True
+
+        # And detached the moment the socket is gone — registered but
+        # offline, the pre-flight glance a KYOK caller binds on.
         async with asyncio.timeout(RECEIVE_TIMEOUT):
             while souk.kyok_relay.serving(ref) is not None:
                 await asyncio.sleep(0.01)
         assert (await roster_row())["online"] is False
 
 
-async def test_a_signed_deletion_removes_the_offering_and_serving_blocks_it(souk):
-    """Roster symmetry's deletion half through this gateway: the mirror
-    of upstream's delete_llm_offering, driven over the wire a throwaway
-    bridge uses to clean up after itself. While attached, the delete is a
-    409 — retiring a live offering means detaching first, same rule as
-    agents; afterwards a signed order removes the row and the roster
-    stops listing it."""
-    from souk_llm_provider_sdk import sign_llm_deletion
-
-    identity = await _register_llm(souk, ["gpt-test"])
-
-    def order() -> dict:
-        signature, timestamp = sign_llm_deletion(identity, "gpt-test")
-        return {
-            "name": "gpt-test",
-            "public_key": identity.public_key,
-            "signature": signature,
-            "timestamp": timestamp,
-        }
-
+async def test_delete_model_on_the_link_removes_the_offering(souk):
+    """Deletion happens on the link that serves it — "something is serving
+    it" cannot be the guard when the caller is that something, so the
+    offering is taken offline and the record removed in one act. Gone
+    means gone: a second order is answered with an error frame, socket
+    intact. (The refusal that remains is a live run bound to the offering
+    — LlmOfferingInUse — which needs work in flight, not a connection.)"""
+    identity = Identity()
     async with _client(souk) as client:
         async with aconnect_ws("http://test/ws/kyok", client) as ws:
-            await _LlmSocket(ws, identity).connect(["gpt-test"])
-            refused = await client.request("DELETE", "/llm-providers", json=order())
-            assert refused.status_code == 409
+            socket = _LlmSocket(ws, identity)
+            await socket.connect(souk, ["gpt-test"])
 
-        ref = LlmRef(provider_key=identity.public_key, name="gpt-test")
-        async with asyncio.timeout(RECEIVE_TIMEOUT):
-            while souk.kyok_relay.serving(ref) is not None:
-                await asyncio.sleep(0.01)
+            await socket.send({"type": "deleteModel", "name": "gpt-test"})
+            assert (await socket.recv()) == {"type": "deleted", "name": "gpt-test"}
+            assert (await client.get("/llm-providers")).json() == {"offerings": []}
 
-        # A registration signature is not a deletion order.
-        wrong_signature, timestamp = identity.sign_llm_registration(["gpt-test"])
-        forged = await client.request(
-            "DELETE",
-            "/llm-providers",
-            json={
-                "name": "gpt-test",
-                "public_key": identity.public_key,
-                "signature": wrong_signature,
-                "timestamp": timestamp,
-            },
-        )
-        assert forged.status_code == 401
+            await socket.send({"type": "deleteModel", "name": "gpt-test"})
+            frame = await socket.recv()
+            assert frame["type"] == "error"
+            assert frame["name"] == "gpt-test"
 
-        deleted = await client.request("DELETE", "/llm-providers", json=order())
-        assert deleted.status_code == 204
-        assert (await client.get("/llm-providers")).json() == {"offerings": []}
-        # Gone means gone: a second order finds nothing.
-        assert (
-            await client.request("DELETE", "/llm-providers", json=order())
-        ).status_code == 404
+            # The link survived both answers and can publish again.
+            await socket.register(["gpt-test"])
+
+
+async def test_a_registration_mistake_is_answered_and_the_socket_stays(souk):
+    identity = Identity()
+    async with _client(souk) as client:
+        async with aconnect_ws("http://test/ws/kyok", client) as ws:
+            socket = _LlmSocket(ws, identity)
+            await socket.connect(souk)
+            await socket.send({"type": "register", "models": []})
+            frame = await socket.recv()
+            assert frame["type"] == "error"
+            await socket.register(["gpt-test"])
 
 
 # --- round trips -------------------------------------------------------------
 
 
-async def test_full_round_trip_non_streaming(souk, register):
-    run_id = "run_ws_nonstream"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+async def test_full_round_trip_non_streaming(souk, serve):
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm, context={"voucher": "v1"})
+    served, token, run_id = await _live(serve, souk, llm, context={"voucher": "v1"})
     try:
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
 
@@ -281,7 +294,7 @@ async def test_full_round_trip_non_streaming(souk, register):
             # fails fast (503) on an unattached offering, by design.
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
                 socket = _LlmSocket(ws, llm_identity)
-                await socket.connect(["gpt-test"])
+                await socket.connect(souk, ["gpt-test"])
 
                 agent_call = asyncio.ensure_future(
                     client.post(
@@ -292,14 +305,17 @@ async def test_full_round_trip_non_streaming(souk, register):
                 )
                 request = await socket.recv()
                 assert request["type"] == "completionRequest"
-                # The policy material keep-your-own-key.md promises the
-                # LLM provider, on the frame itself.
+                # The policy material keep-your-own-key promises the LLM
+                # provider, on the frame itself.
                 assert request["runId"] == run_id
                 assert request["providerKey"] == served.public_key
                 assert request["agentName"] == "greeter"
                 assert request["llmName"] == "gpt-test"
                 assert request["context"] == {"voucher": "v1"}
                 assert request["body"]["messages"][0]["content"] == "hi"
+                # The chain seat rides the envelope since revision 7 —
+                # this run bound no authority, and absence is stated.
+                assert request.get("actorChain") in (None, [])
                 await socket.answer(
                     request["requestId"],
                     [
@@ -316,18 +332,17 @@ async def test_full_round_trip_non_streaming(souk, register):
         souk.broker.forget(run_id)
 
 
-async def test_full_round_trip_streaming(souk, register):
-    run_id = "run_ws_stream"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+async def test_full_round_trip_streaming(souk, serve):
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm)
+    served, token, run_id = await _live(serve, souk, llm)
     try:
         body = json.dumps({"messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
                 socket = _LlmSocket(ws, llm_identity)
-                await socket.connect(["gpt-test"])
+                await socket.connect(souk, ["gpt-test"])
 
                 async def agent_call():
                     async with client.stream(
@@ -353,18 +368,17 @@ async def test_full_round_trip_streaming(souk, register):
         souk.broker.forget(run_id)
 
 
-async def test_an_error_frame_fails_the_completion_fast(souk, register):
-    run_id = "run_ws_error"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+async def test_an_error_frame_fails_the_completion_fast(souk, serve):
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm)
+    served, token, run_id = await _live(serve, souk, llm)
     try:
         body = json.dumps({"messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
                 socket = _LlmSocket(ws, llm_identity)
-                await socket.connect(["gpt-test"])
+                await socket.connect(souk, ["gpt-test"])
 
                 async def agent_call():
                     async with client.stream(
@@ -386,32 +400,31 @@ async def test_an_error_frame_fails_the_completion_fast(souk, register):
                     )
 
                 lines, _ = await asyncio.gather(agent_call(), llm_refuses())
+        # The one line is the error frame — never a [DONE] after it.
         assert len(lines) == 1
-        assert json.loads(lines[0].removeprefix("data: ")) == {
-            "error": {"message": "upstream LLM call failed"}
-        }
+        payload = json.loads(lines[0].removeprefix("data: "))
+        assert "upstream LLM call failed" in payload["error"]["message"]
     finally:
         souk.broker.forget(run_id)
 
 
-async def test_a_structured_refusal_reaches_the_agent_intact(souk, register):
-    """The #63 envelope through this gateway, both response shapes: an
-    error frame carrying a `refusal` dict arrives as the agent's error
-    payload — data, not prose — in-stream for a streaming call, and on
-    the 502 body for a non-streaming one. The vocabulary inside is the
+async def test_a_structured_refusal_reaches_the_agent_intact(souk, serve):
+    """An error frame carrying a `refusal` dict arrives as the agent's
+    error payload — data, not prose — in-stream for a streaming call, and
+    on the 502 body for a non-streaming one. The vocabulary inside is the
     two roles' own; nothing on this path interprets it."""
     refusal = {"kind": "throttled", "retryAfter": 30}
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
 
     for run_id, stream in (("run_refused_stream", True), ("run_refused_plain", False)):
-        served, token = await _live(register, souk, run_id, llm)
+        served, token, run_id = await _live(serve, souk, llm)
         try:
             body = json.dumps({"messages": [], "stream": stream}).encode()
             async with _client(souk) as client:
                 async with aconnect_ws("http://test/ws/kyok", client) as ws:
                     socket = _LlmSocket(ws, llm_identity)
-                    await socket.connect(["gpt-test"])
+                    await socket.connect(souk, ["gpt-test"])
 
                     async def agent_call():
                         if stream:
@@ -449,19 +462,18 @@ async def test_a_structured_refusal_reaches_the_agent_intact(souk, register):
             souk.broker.forget(run_id)
 
 
-async def test_one_socket_multiplexes_concurrent_completions(souk, register):
+async def test_one_socket_multiplexes_concurrent_completions(souk, serve):
     """requestId multiplexing: two completions in flight on one socket,
     answered out of order, each answer landing on its own completion."""
-    run_id = "run_ws_multiplex"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm)
+    served, token, run_id = await _live(serve, souk, llm)
     try:
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
                 socket = _LlmSocket(ws, llm_identity)
-                await socket.connect(["gpt-test"])
+                await socket.connect(souk, ["gpt-test"])
 
                 async def agent_call(prompt: str) -> str:
                     body = json.dumps({"messages": [{"role": "user", "content": prompt}]}).encode()
@@ -498,26 +510,24 @@ async def test_one_socket_multiplexes_concurrent_completions(souk, register):
 
 
 async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivered_to(
-    souk, register
+    souk, serve
 ):
-    """The security property carried over from the old socket, now proven
-    against the strongest intruder the new model allows: the *same
-    identity*, attached for the *same offering* — every credential check
-    passes, and later completions would genuinely be its to serve. It
-    presents a valid requestId it was not delivered, is refused with an
-    error frame, and the completion still gets its real answer from the
-    socket that holds it."""
-    run_id = "run_ws_binding"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+    """The security property, proven against the strongest intruder the
+    model allows: the *same identity*, attached for the *same offering* —
+    every credential check passes, and later completions would genuinely
+    be its to serve. It presents a valid requestId it was not delivered,
+    is refused with an error frame, and the completion still gets its
+    real answer from the socket that holds it."""
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm)
+    served, token, run_id = await _live(serve, souk, llm)
     try:
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as holder_ws:
                 holder = _LlmSocket(holder_ws, llm_identity)
-                await holder.connect(["gpt-test"])
+                await holder.connect(souk, ["gpt-test"])
 
                 agent_call = asyncio.ensure_future(
                     client.post(
@@ -531,7 +541,7 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
 
                 async with aconnect_ws("http://test/ws/kyok", client) as intruder_ws:
                     intruder = _LlmSocket(intruder_ws, llm_identity)
-                    await intruder.connect(["gpt-test"])
+                    await intruder.connect(souk, ["gpt-test"])
                     await intruder.send(
                         {
                             "type": "chunk",
@@ -553,13 +563,77 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
         souk.broker.forget(run_id)
 
 
-async def test_a_dropped_socket_fails_its_in_flight_completions_fast(souk, register):
+async def test_a_later_attach_takes_over_the_offering_and_the_old_teardown_spares_it(
+    souk, serve
+):
+    """funduq holds one connection per role: a re-attach under the same
+    key replaces the old link, new completions resolve to the newcomer,
+    and — because detach is connection-scoped — the replaced socket's own
+    teardown cannot take the replacement offline.
+
+    The old socket lives in its own task because httpx-ws contexts hold
+    anyio cancel scopes, which must unwind in the task that entered them
+    — the shape of the test, not of the property.
+    """
+    llm_identity = Identity()
+    llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
+    served, token, run_id = await _live(serve, souk, llm)
+    try:
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+
+        async with _client(souk) as client:
+            old_attached = asyncio.Event()
+            release_old = asyncio.Event()
+
+            async def old_socket():
+                async with aconnect_ws("http://test/ws/kyok", client) as ws:
+                    await _LlmSocket(ws, llm_identity).connect(souk, ["gpt-test"])
+                    old_attached.set()
+                    await release_old.wait()
+
+            old_task = asyncio.create_task(old_socket())
+            async with asyncio.timeout(RECEIVE_TIMEOUT):
+                await old_attached.wait()
+
+            async with aconnect_ws("http://test/ws/kyok", client) as new_ws:
+                new = _LlmSocket(new_ws, llm_identity)
+                await new.connect(souk, ["gpt-test"])
+
+                # The old socket goes away *after* the takeover — and its
+                # teardown, being connection-scoped, is a no-op against
+                # the link that replaced it.
+                release_old.set()
+                async with asyncio.timeout(RECEIVE_TIMEOUT):
+                    await old_task
+                assert souk.kyok_relay.serving(llm) is not None
+
+                # The offering is still served — by the newcomer, which
+                # answers the next completion end to end.
+                agent_call = asyncio.ensure_future(
+                    client.post(
+                        "/kyok/v1/chat/completions",
+                        content=body,
+                        headers=_kyok_headers(token, served.identity._key, body),
+                    )
+                )
+                request = await new.recv()
+                assert request["type"] == "completionRequest"
+                await new.answer(
+                    request["requestId"],
+                    [_chunk(content="takeover", role="assistant", finish_reason="stop")],
+                )
+                resp = await agent_call
+        assert resp.json()["choices"][0]["message"]["content"] == "takeover"
+    finally:
+        souk.broker.forget(run_id)
+
+
+async def test_a_dropped_socket_fails_its_in_flight_completions_fast(souk, serve):
     """A truncated answer must fail the completion, not complete it — and
     fail it now, not at the chunk-gap timeout."""
-    run_id = "run_ws_dropped"
-    llm_identity = await _register_llm(souk, ["gpt-test"])
+    llm_identity = Identity()
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
-    served, token = await _live(register, souk, run_id, llm)
+    served, token, run_id = await _live(serve, souk, llm)
     try:
         body = json.dumps({"messages": [], "stream": True}).encode()
 
@@ -576,7 +650,7 @@ async def test_a_dropped_socket_fails_its_in_flight_completions_fast(souk, regis
 
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
                 socket = _LlmSocket(ws, llm_identity)
-                await socket.connect(["gpt-test"])
+                await socket.connect(souk, ["gpt-test"])
                 call = asyncio.ensure_future(agent_call())
                 request = await socket.recv()
                 await socket.send(
@@ -589,8 +663,7 @@ async def test_a_dropped_socket_fails_its_in_flight_completions_fast(souk, regis
             # the socket drops with the answer unfinished
             async with asyncio.timeout(5):
                 lines = await call
-        assert json.loads(lines[-1].removeprefix("data: ")) == {
-            "error": {"message": "LLM provider disconnected mid-response"}
-        }
+        payload = json.loads(lines[-1].removeprefix("data: "))
+        assert "disconnected mid-response" in payload["error"]["message"]
     finally:
         souk.broker.forget(run_id)

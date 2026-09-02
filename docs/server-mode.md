@@ -5,10 +5,16 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Nothing here is constrained by compatibility: souk is unreleased, this
-gateway has no deployments, and the gRPC SDK has no users. This is the
-cheapest possible moment to pick the final shape, so we pick it outright
-rather than staging a migration.
+Upstream is the published `funduq` packages now (`funduq`,
+`funduq-provider-sdk`, `funduq-contract` — the repo is
+[hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
+payloads and delivery envelopes on this wire are theirs, pinned at a
+named **contract revision** (currently 7, vendored in
+[`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json)).
+The *framing* — which frames exist, what each carries, the handshake's
+shape on a socket — remains this repo's to decide, and this gateway has
+no deployments outside this repo, so a wire change is still a hard
+cutover selected by the `version` field rather than a staged migration.
 
 ## The decision
 
@@ -20,18 +26,26 @@ a persistent WebSocket each, replacing gRPC entirely.
 
 | Who | Surface | Transport | Status |
 |---|---|---|---|
-| Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`/agents*`), health | HTTP + SSE | exists, unchanged |
+| Callers | AG-UI (`/agui/*`, `/threads/*`), A2A (`/a2a/*`), registry (`GET /agents`, `GET /llm-providers`), health | HTTP + SSE | exists |
 | Callers | MCP (the docent) | streamable HTTP at `/mcp`, same listener | built; see "MCP: the docent" below |
-| Providers | work relay | `WS /ws/provider` | built |
-| LLM providers (KYOK) | registration + roster + deletion (`/llm-providers*`), completion relay | HTTP + `WS /ws/kyok` | built |
+| Providers, both kinds | admission | `POST /tickets` | built; the out-of-band half of the handshake — see below |
+| Providers | work relay + registration | `WS /ws/provider` | built |
+| LLM providers (KYOK) | completion relay + registration | `WS /ws/kyok` | built |
 | Provider's model client | `POST /kyok/v1/chat/completions` | HTTP (OpenAI-compatible by definition) | exists, unchanged |
 
 gRPC is **removed**, not demoted to an option: `grpc_server.py`,
 `grpc_gen/`, the proto generation step, the `grpcio`/`protobuf`
-dependencies, port 50051, and the Dockerfile's stub-gen step all go. A
+dependencies, port 50051, and the Dockerfile's stub-gen step all went. A
 transport with zero users is not an option worth maintaining; the wire
-*semantics* it carried are kept (below), because those were the hard-won
-part — `proto/souk.proto` remains upstream as the record of them.
+*semantics* it carried were kept, because those were the hard-won part —
+and they have since been restated as upstream's contract vectors, which
+is a better record than a proto file ever was.
+
+The signed registration and deletion HTTP routes are removed the same
+way, one redesign later: registration is an operation on an open,
+authenticated link now (see "Registration on the open link"), so
+`POST /agents/register`, `POST /llm-providers/register` and the signed
+deletion routes are gone, and only the read-only roster GETs remain.
 
 What one port buys: one TLS certificate, one load-balancer rule, no
 HTTP/2 requirement on proxies (wss is an HTTP/1.1 upgrade), and a
@@ -39,14 +53,14 @@ browser can be a provider — which is the audience that makes WebSocket
 the right default rather than a fallback.
 
 Core is untouched throughout. The provider port is core's to state, and
-it has since been inverted again — souk offers a run and the provider
+it has since been inverted again — funduq offers a run and the provider
 answers, rather than the provider asking for work — so what a transport
 carries today is `broker.ConnectedProvider`: who you are, how much you
 will take at once, how to hand you a run, how to ask you to stop one. A
 transport is just a carrier for that port, and this is the third carrier
-after in-process and gRPC. The KYOK edge swaps the same way because
-`LLMBridge` is likewise a transport-free port; only this repo's serving
-layer changes.
+after in-process and gRPC. The KYOK edge swaps the same way because the
+LLM-provider link is likewise a transport-free port; only this repo's
+serving layer changes.
 
 ## Addressing: an agent is `(provider, name)`
 
@@ -61,10 +75,10 @@ vocabulary whenever the database was replaced, with no way to rebuild it.
 ```
 
 `{provider}` is the provider's Ed25519 public key or its 16-hex
-fingerprint (`sha256(key)[:16]`); core tells them apart by length. This
-gateway puts the fingerprint in URLs and the roster carries both, with
-`provider_key` the one to compare — the fingerprint is derived from it and
-never authoritative.
+fingerprint (`funduq_contract.provider_fingerprint`, `sha256(key)[:16]`);
+core tells them apart by length. This gateway puts the fingerprint in
+URLs and the roster carries both, with `provider_key` the one to
+compare — the fingerprint is derived from it and never authoritative.
 
 **The by-name routes are deleted, not deprecated.** A display name is not
 unique: two identities may both register `translator`, and that is
@@ -90,104 +104,104 @@ express.
 
 Frames are JSON text messages, camelCase — matching the AG-UI/A2A wire
 style, readable in devtools, and free for the browser providers that
-justify ws in the first place. The semantics mirror `proto/souk.proto`'s
-PollForWork/AgentSession, minus what a single duplex socket makes
-redundant.
+justify ws in the first place. The frame vocabulary is published in
+[`docs/wire-vectors.json`](wire-vectors.json) and asserted equal to the
+gateway's dispatch sets in tests; the signed payloads and envelopes
+inside the frames are upstream's, vectored in
+[`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json).
 
-**souk hands work over; it does not wait to be asked for it.** There is
-no claim loop on either side. souk's broker knows which provider serves
+**funduq hands work over; it does not wait to be asked for it.** There is
+no claim loop on either side. The broker knows which provider serves
 which agent, offers each run to it, and the answer comes back as a frame.
-The socket carries the offer; `souk_provider_sdk.ProviderRuntime`, on the
-far side, decides.
+The socket carries the offer; `funduq_provider_sdk.ProviderRuntime`, on
+the far side, decides.
 
-### Opening a socket: a mutual challenge-response
+### Opening a socket: the ticket handshake
 
-Four frames, two round trips, and **each side signs bytes the other
-chose**. Handshake **v2**: the signed payloads are upstream's link-open
-family (`souk_provider_sdk.identity`, vectored in
-AgentSouk/docs/contract-vectors.json), and `souk_server/handshake.py`
-re-exports them beside the version number. Three packages used to restate
-these bytes because none could import another; the SDK was the home all
-three could already import, and upstream publishing the family there is
-what dissolved the triplication — the SDKs now call
-`ProviderIdentity.sign_connect` and restate nothing.
+Handshake **v4**: two frames, with the admission step moved off the
+socket entirely. The signed payloads are `funduq_contract`'s connect
+family, and `souk_server/handshake.py` re-exports them beside the
+version number (object identity asserted in tests, so they cannot drift
+into local restatements — the same rule that once dissolved three
+packages' private copies of these bytes).
+
+**Step zero is `POST /tickets`, and it is not on the socket.** The
+provider posts its public key and receives
+`{"ticket": ..., "funduqPublicKey": ...}` — a single-use, ~60-second
+ticket naming the key it admits, minted by core's `Funduq.issue_ticket`.
+Upstream keeps `issue_ticket` off the link's operation set on purpose: a
+ticket obtained over the link would mean the link existed before
+anything authorised it. **Issuing is the admission decision** — a key
+with no ticket cannot connect at all — which makes this endpoint the
+edge-auth plug point: a deployment that gates who may serve gates it
+here. It is unauthenticated today, deliberately; this souk is an open
+market.
+
+Holding the ticket *and* funduq's public key, the provider computes its
+proof before connecting, and the socket exchange collapses to:
 
 ```
-provider → hello      { version, publicKey, agentNames,
-                        maxConcurrentRuns, nonce }
-souk     → challenge  { soukPublicKey, nonce, signature }
-provider → proof      { signature }
-souk     → welcome    { }
+provider → hello    { version: 4, publicKey, ticket, nonce,
+                      maxConcurrentRuns?, proof }    # /ws/kyok: no maxConcurrentRuns
+souk     → welcome  { funduqPublicKey, answer }
 ```
 
 ```
-sig_s = souk.sign(     b"souk-connect-souk:"     + nonce_s + b":" + nonce_p )
-sig_p = identity.sign( b"souk-connect-provider:" + nonce_s + b":" + nonce_p
-                       + b":" + ",".join(sorted(names)) )
+proof  = identity.sign( provider_connect_payload(funduq_public_key, ticket, nonce) )
+answer = funduq.sign(   funduq_connect_payload(ticket, nonce) )
 ```
 
-**What v1 replaced.** A provider used to open a socket by signing a
-statement it composed itself — timestamp freshness, verifier chose
-nothing — so anyone who observed the signature could replay it and attach
-as that provider. The mutual challenge-response closed that, and v2 keeps
-its shape exactly.
-
-**What v2 changed, and gave up.** v1's proof signed `sha256(hello_raw)` —
-the exact bytes of the hello — binding every claim in it,
-`maxConcurrentRuns` included, at the price of a subtlety all three
-implementations had to carry: the digest must cover the bytes actually
-sent, never a re-serialization. The connect family binds the sorted names
-and nothing else. The names are the authorization-relevant claim (which
-agents or offerings this key attaches for, and the thing the smuggled-name
-test drives); tampering with a live connection's other fields was already
-outside the threat model here — an intercepting proxy is trusted by
-construction (AgentSoukServer#10). Traded knowingly.
-
-**Who verifies moved, deliberately.** The proof is checked by core's
-`attach` now, not by this gateway: souk mints the challenge
-(`Souk.issue_connect_challenge` — single-use, freshness-bounded), the
-socket relays it as the challenge frame's nonce and passes the returned
-signature into `attach_provider`/`attach_llm_provider`, and core refuses
-an attach whose proof does not answer a live challenge. Attaching is
-where runs change hands, so it is where the proof belongs — and the
-in-process links are challenged the same way, closing the era when this
-transport was the only authenticated road in. The dev stack and the test
-suite run `SOUK_REQUIRE_CONNECT_PROOF=true`; the permissive default is
-upstream's migration switch for deployments whose transports still
-authenticate at their own edge, which this gateway no longer is.
+The gateway relays the hello's ticket, nonce and proof into
+`funduq.attach_provider(...)` (`attach_llm_provider` on the KYOK
+socket); **core is the verifier**, exactly as it was for the old
+challenge. `attach` returns `answer` — funduq's counter-signature under
+its own role tag — and the welcome frame relays it. Every handshake
+refusal closes with 1008 (policy violation) and a reason string; 1011
+stays reserved for server-side failure the client didn't cause.
 
 Why each piece is there:
 
-- **Both nonces in both signatures.** Each side contributes freshness, so
-  a recorded exchange is worth nothing to whoever recorded it.
-- **`souk-connect-souk:` / `souk-connect-provider:` role tags.** Neither
-  signature can be presented as the other, and neither can be mistaken
-  for a registration or deletion.
-- **The sorted names.** Which roster entries this socket attaches for
-  cannot be altered in flight; sorted, so order is nobody's problem.
-- **souk signs first.** A provider must be able to walk away from a souk
-  it does not recognise *before* producing anything worth stealing.
-  Signing second would mean handing a credential to whatever answered the
-  URL and only then asking who it was.
+- **The ticket is the freshness, and the verifier chose it.** A recorded
+  exchange is worth nothing: the ticket is single-use and destroyed by
+  the handshake that answers it. This is the property v1's
+  challenge-response bought with two extra frames; the ticket buys it
+  out of band, and a leaked ticket is worthless besides — only the named
+  key can sign the answer, and a stranger cannot even burn it (the name
+  is matched before the ticket is destroyed).
+- **The proof names the recipient.** The pinned funduq key goes into the
+  signed bytes, so a proof one funduq coaxes out cannot be relayed to
+  attach at another — the verifying funduq builds the payload with its
+  *own* key, and a mismatch simply fails the signature.
+- **The connect payloads carry no names.** v2 signed the sorted agent
+  names into the proof so a captured proof could not be replayed to
+  serve a different roster; a ticket issued to one key cannot be
+  replayed at all, so the names left the handshake and moved to where
+  they now belong — registration frames on the open link.
+- **The role tags** (`funduq-connect-provider` / `funduq-connect-funduq`)
+  mean neither signature can be presented as the other.
 
-`sig_s` is the half souk never had: until now it proved nothing to
-anybody, so a provider connected to a URL and trusted whatever picked up.
-A souk with no `SOUK_IDENTITY_PRIVATE_KEY` says so — `soukPublicKey:
-null`, no signature — rather than failing, which is an honest report of
-today's deployments; a provider that pinned a key refuses it, and one
-that pinned nothing is no worse off than before.
+**"souk signs first" changed shape, not substance.** The old handshake
+had souk sign before the provider produced anything worth stealing, so a
+provider could walk away from a souk it did not recognise. In v4 the
+provider signs first on the socket — but it learned the funduq key over
+TLS at ticket time and bound its proof to that key, so the proof is
+worthless to any other funduq; and the `answer` in the welcome proves
+the far side actually *holds* the key the ticket response named. The SDK
+verifies it (`confirm_connect`, raising `WrongFunduq`) **before treating
+the link as open** — upstream hands the answer over before the link is
+recorded open, so a provider that raises there never appears in the
+roster and never receives a run. The mutual-identity property survives;
+the frames that carried it do not.
 
-**Provider-side trust.** `SoukProvider(souk_public_key=…)` pins one souk,
-and that is the recommended shape: the provider already receives the souk
-URL from somewhere, and the same channel carries a fingerprint. Unset, the
-provider still checks that whoever answered holds the key it presents —
-enough to notice a broken souk, not enough to notice a substituted one —
-and logs the fingerprint so the value to pin is in reach.
-
-TOFU is deliberately **not** built. It reads as free safety and is not:
-souk's key is provisioned, so any deployment that rotates or regenerates
-it jams every provider at once, with the recovery being to go and clear a
-pin on each. A configured key costs one line and has no such state.
+Pinning is still the recommended shape: `SoukProvider(souk_public_key=…)`
+pins one funduq, and the same channel that carries the URL carries the
+fingerprint. Unpinned, the provider verifies the answer against the key
+`POST /tickets` returned — enough to notice a broken souk, not enough to
+notice one substituted before ticket time — and logs the fingerprint so
+the value to pin is in reach. TOFU is deliberately **not** built, for
+the reason it never was: souk's key is provisioned, so a rotation would
+jam every provider at once with per-provider pin-clearing as the
+recovery; a configured key costs one line and has no such state.
 
 **Channel binding is out — decided, not overlooked.** It is the standard
 answer to a relay, and unusable here: a Zscaler-class proxy terminates and
@@ -195,50 +209,95 @@ re-originates TLS by design, so the two sides never derive the same value
 and the check fails every time. Enforcing it would not harden the
 deployment; it would lock out every enterprise running one, which is the
 deployment this exists for. It was also never the fix — the defect is a
-*stealable* credential, and challenge-response closes that with an
+*stealable* credential, and the ticket flow closes that with an
 intercepting proxy in the path:
 
 | | before | after |
 |---|---|---|
 | see the traffic | yes | yes — it terminates TLS, that is its job |
-| capture the credential, connect later as that provider | **yes** | **no** — cannot answer a fresh nonce |
+| capture the credential, connect later as that provider | **yes** | **no** — the ticket is single-use and the proof names its funduq |
 | tamper with frames on a live connection | yes | yes |
 
 The bottom row stays open, deliberately: run inputs and events are not
 individually signed, an intercepting proxy is in the trust model by
-construction (the enterprise installed it and pushed its CA), and signing
-every frame is a large cost against a threat the operator chose.
+construction (the enterprise installed it and pushed its CA — see
+`docs/threat-model.md`), and signing every frame is a large cost against
+a threat the operator chose.
 
-**`version` is in `hello`, and there is no compatibility branch.** A hard
-cutover: the old shape carried no version field, so it cannot be accepted
-and told apart from a corrupt frame, and its absence is what the refusal
-names — a bare signature failure is what an attack looks like too, and
-would send whoever is debugging it somewhere unhelpful. Dual-shape
-acceptance was considered and skipped because every provider that exists
-is in this repo behind one SDK; the field is there so the *next* change
-has something to select on, which is when it earns its keep.
+**`version` selects the handshake, and there is no compatibility
+branch.** A v2/v3 client is refused by name ("this souk speaks wire v4,
+the ticket handshake"), not by a bare signature failure — which is what
+an attack looks like too, and would send whoever is debugging it
+somewhere unhelpful. Dual-shape acceptance was skipped for the same
+reason as every previous bump: every provider that exists is in this
+repo behind one SDK, plus one Go probe whose whole point is tracking the
+current wire.
 
-**`welcome` is queued before attaching**, and that ordering is
-load-bearing: attaching is what makes the provider reachable, and the
-broker begins offering inside `attach_provider`'s own awaits — so queueing
-it after lets a provider with work already waiting receive a `run` frame
-as the first thing after its proof. A client reading exactly one frame
-there raises and reconnects into the same race forever. Every handshake
-refusal closes with 1008 (policy violation) and a reason string; 1011
-stays reserved for server-side failure the client didn't cause.
+**`welcome` is queued before attaching completes**, and that ordering is
+still load-bearing for the frames behind it — everything this link will
+ever receive queues after it. One old race is now structurally gone
+rather than merely tested for: attach is nameless, so a fresh link
+serves nothing and **no `run` frame can precede the first `registered`**,
+where under v2 a provider with work waiting could legally see `run`
+arrive as the first post-proof frame. The reconnect tests stay anyway;
+orderings that are "structurally impossible" are exactly the ones worth
+a regression net.
+
+### Registration on the open link
+
+Attach carries no names. What a link serves is what it last published,
+via frames — the signed registration/deletion payloads (and their HTTP
+routes) are gone upstream, because the key was proved once, when the
+link opened, and a per-operation signature would only re-prove it. What
+that asks of this transport is the ordinary thing: **an open link stays
+the party that opened it** — one read loop, one identity, established at
+the handshake and never rebound.
+
+```
+provider → register    {agents: [{name, description?, agentCardExtra?,
+                                  metadata?}, …], providerName?}   # /ws/provider
+provider → register    {models: [name, …], metadata?}              # /ws/kyok
+souk     → registered  {names: [...]}     # echo of what is now live
+provider → deleteAgent {name}    /    deleteModel {name}
+souk     → deleted     {name}
+souk     → error       {message, …}       # answered; the socket stays open
+```
+
+The semantics are core's, restated here because they shape the wire:
+
+- **Not registered is offline.** An open link that has published nothing
+  serves nothing; runs are only offered after the first `register`.
+- **A roster replaces, it does not append.** `register` carries the full
+  roster, and publishing a shorter one takes the omitted names offline.
+  The SDK re-registers its whole roster on every reconnect, which is
+  what makes reconnection self-repairing.
+- **Delete is refused for an agent with a conversation behind it** — the
+  one guard a deletion still has. Core's refusal reaches the provider
+  verbatim in an `error` frame; a registration mistake is a caller error
+  on an authenticated link, not a breach, so it is answered and the
+  socket stays.
+- The agent fields are upstream's `REGISTRATION_FIELDS` (name,
+  description, `agentCardExtra`, `metadata`), compared against the
+  gateway's validation model in a test. Skills still reach souk only
+  through `agentCardExtra`; everything else in the card is dropped
+  silently by core, exactly as before.
 
 ### Once attached
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "run", **DeliveredRun}` | an **offer**: the frame is upstream's declared envelope — `DeliveredRun.model_dump(by_alias=True)` (`runId`, `agentName`, `runInput`, `threadId`, `metadata`), rebuilt on the far side with `model_validate`. Canonical frame in AgentSouk/docs/contract-vectors.json's `wire` section; neither end hand-writes the mapping |
-| ↑ | `{"type": "ack", "runId", "accepted", "reason"?}` | whether this provider took it. A bare `accepted: false` is how a full one says so — transient, souk re-offers later. `reason` makes the decline *permanent* (an input that does not parse): souk fails the run with the provider's words recorded verbatim in `failureReason` and stops re-offering. souk invents no reason vocabulary; the string is the provider's own |
-| ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against `Run.claimed_by` |
+| ↑ | `{"type": "register", "agents": […], "providerName"?}` | the full roster this link serves — see above |
+| ↓ | `{"type": "registered", "names": […]}` | what is now live, sorted |
+| ↑ | `{"type": "deleteAgent", "name"}` | remove one record outright |
+| ↓ | `{"type": "deleted", "name"}` | it is gone |
+| ↓ | `{"type": "run", **DeliveredRun}` | an **offer**: the frame is upstream's declared envelope — `DeliveredRun.model_dump(by_alias=True)` (`runId`, `agentName`, `runInput`, `threadId`, `metadata`), rebuilt on the far side with `model_validate`. Canonical frame in `docs/upstream-contract-vectors.json`'s `wire` section; neither end hand-writes the mapping |
+| ↑ | `{"type": "ack", "runId", "accepted", "reason"?}` | whether this provider took it — and the answer is a **receipt**, produced from the provider's own state without asking the agent anything (upstream holds the next utterance of the same conversation until it lands, so a link that waits for the agent to start turns that round-trip into startup time). A bare `accepted: false` is how a full one says so — transient, souk re-offers later. `reason` makes the decline *permanent* (an input that does not parse): souk fails the run with the provider's words recorded verbatim and stops re-offering. souk invents no reason vocabulary; the string is the provider's own |
+| ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against the run's claim |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |
 | ↓ | `{"type": "cancel", "runId"}` | a request, not an order — outcome decided when the stream ends |
 | ↑ | `{"type": "query", "queryId", "method", "params"}` | a question about the work souk gave this provider |
 | ↓ | `{"type": "queryResult", "queryId", "result"?, "error"?}` | its answer, correlated by `queryId` |
-| ↓ | `{"type": "error", "message", "runId"?}` | server-side rejection of a frame (bad runId, not the holder) |
+| ↓ | `{"type": "error", "message", "runId"?/"name"?}` | server-side rejection of a frame (bad runId, not the holder, a refused registration or deletion) |
 
 ### Queries: the one thing here that expects an answer
 
@@ -250,8 +309,8 @@ pending map, a timeout, and a rule for a socket that dies mid-question.
 more.** An AG-UI client resends its whole history every turn by
 convention; A2A's `message/send` carries one message. The same agent,
 unchanged, cannot tell a tenth turn from a first — and souk has held the
-thread the whole time. `souk_provider_sdk.SoukLink.thread_messages` is
-the question, and this is how it crosses a wire.
+thread the whole time. `funduq_provider_sdk.FunduqLink.thread_messages`
+is the question, and this is how it crosses a wire.
 
 ```json
 ↑ {"type": "query", "queryId": "9f3c…", "method": "thread_messages",
@@ -276,11 +335,10 @@ the question, and this is how it crosses a wire.
   on that `queryId`; silence costs it the full timeout for a mistake souk
   could see at once.
 - **A dead socket fails its outstanding queries immediately**, rather than
-  leaving them to time out. Unlike a run — which is addressed by `runId`
-  and whose frames go out on whatever connection is next — a question was
-  asked of *this* connection and nothing will ever answer it. It is not
-  retried on reconnect either: the agent asked mid-run, and whether it
-  still wants the answer is the agent's to decide.
+  leaving them to time out. A question was asked of *this* connection and
+  nothing will ever answer it. It is not retried on reconnect either: the
+  agent asked mid-run, and whether it still wants the answer is the
+  agent's to decide.
 - **What may be asked is deliberately short.** Upstream's
   `contract.LINK_QUERY_METHODS` states the rule — this is not a mirror of
   souk's API, because every method admitted is one more frame type every
@@ -288,14 +346,14 @@ the question, and this is how it crosses a wire.
   it, so a method added upstream without a frame here fails a test instead
   of a provider.
 
-Adding these frames does **not** bump `version`. They are additive: a
-provider that never asks is unaffected, and an older gateway answers an
+Adding frames like these does **not** bump `version`. They are additive:
+a provider that never asks is unaffected, and an older gateway answers an
 unknown frame type with `error`. The version selects the *handshake*,
 which is the part that genuinely cannot interoperate across shapes.
 
 ### Which object is which
 
-`SoukLink` is one provider joined to one souk — both directions, one
+`FunduqLink` is one provider joined to one funduq — both directions, one
 object — and the socket client in souk-agent-sdk is one, because over a
 wire that is literally true: run frames arrive on the same socket event
 frames leave by.
@@ -307,7 +365,10 @@ protocol structurally, and checks itself against
 `contract.CONNECTED_PROVIDER_ATTRS` at construction — because souk sizes a
 capacity bucket from `max_concurrent_runs`, and a connection that forgets
 it attaches perfectly well and then fails inside the broker, three layers
-from the cause.
+from the cause. It deliberately exposes no `sign_connect`: core would
+otherwise mint a ticket and sign on this object's behalf, and this object
+*cannot* sign — the only holder of the key is the real provider on the
+far side of the socket, which is the whole point of the handshake.
 
 A declined offer costs the run nothing: it stays queued and is offered
 again when something changes — a run arriving, a provider registering, one
@@ -318,7 +379,10 @@ the answer having changed.
 Flow control is `maxConcurrentRuns`, declared once at hello. souk keeps a
 bucket that size and offers nothing while it is empty. No credit frames
 and no counting in the transport — the number is a fact about the
-provider, and souk sees for itself when a run ends.
+provider, and souk sees for itself when a run ends. Leaving it unset
+declares *unlimited*, and upstream takes that at its word: an unlimited
+provider that declines is counted `misdeclared`. Pacing is declared, not
+improvised.
 
 Two deadlines apply to an offer, and only one governs. souk wraps every
 offer in `RunBroker.deliver_timeout_seconds` (5s) because it has a single
@@ -328,23 +392,38 @@ backstop for a souk that offers without a deadline. Answering after
 either has run out is the same as declining: the ack arrives for a run
 nobody is waiting on, and is dropped.
 
-**Liveness is not a heartbeat.** `online` is `is_serving` — souk holds a
-live provider mapping for that agent or it does not — so attaching *is*
-being online, and a dropped socket takes its agents offline in the same
-instant. There is no window to age out of and no `last_seen_at` clock to
-read. Because a provider connects once for every agent it serves, its
-agents go online and offline together, by construction. `last_seen_at` is
-still recorded and still worth reading, but it now answers a different
-question: how long since anybody was here, which `online` no longer says
-anything about. WebSocket ping/pong keeps intermediaries from reaping
-idle sockets and is not the liveness signal.
+**Liveness is not a heartbeat.** `online` is *registered on a live
+link*: souk holds a connection serving that agent or it does not, so a
+link's first `register` is what brings its agents online and a dropped
+socket takes them offline in the same instant. There is no window to age
+out of and no sweep behind the boolean. Because a link publishes one
+roster, its agents go online and offline together, by construction.
+`last_seen_at` is still recorded and still worth reading, but it answers
+a different question: how long since anybody was here, which `online` no
+longer says anything about. WebSocket ping/pong keeps intermediaries from
+reaping idle sockets and is not the liveness signal.
 
-**A dropped socket ends nothing.** Events are addressed by `runId`, so a
-provider reconnects (a fresh `hello`) and reports the rest, including how
-runs ended. souk records nothing at disconnect; one that is truly gone is
-caught by the stall sweep. This property was probed and kept under gRPC
-and must be preserved: reconnect-and-finish is a test to carry over, not
-a hope.
+**A dropped socket now ends every run it was holding — a real behavior
+change, recorded honestly.** Under this repo's earlier wire, "a dropped
+socket ends nothing" was a property probed and kept from the gRPC days:
+events are addressed by `runId`, so a provider could reconnect and
+report the rest, including how runs ended. funduq 0.0.4 decides
+differently, and as the published core it wins: liveness is a fact funduq
+holds, not a deduction from a timestamp, and **a provider that stops
+serving while still holding a claimed run has taken work and never ended
+it** — the run fails at once as `provider_left_holding_it`, and the same
+observation increments the provider's `abandoned` quality counter
+(enough of those and the provider is withdrawn from service). Only
+*queued* runs survive a drop: nothing had been promised about them, so
+they wait for the reconnect and are offered again. What reconnect-and-
+finish used to cover — a blip mid-run — is now a failed run and a mark
+against the provider, and an agent author should know that a provider's
+socket is part of its run's fate. This repo's position — that a
+grace window would let a reconnect finish honest work without reviving
+the two-clocks problem upstream removed — is argued in
+[hukaichun/funduq#214](https://github.com/hukaichun/funduq/issues/214);
+until that lands, this document describes the published behavior, not
+the preferred one.
 
 At-least-once delivery (an ack per *event*) remains expressible and
 remains unbuilt — the `ack` frame above answers an offer, not an event.
@@ -354,7 +433,7 @@ name is never reused.
 ## KYOK relay: `WS /ws/kyok`
 
 The socket an **LLM provider** connects out on — the party upstream's
-KYOK redesign made first-class (`AgentSouk/docs/keep-your-own-key.md`).
+KYOK redesign made first-class (upstream `docs/mechanisms/kyok.md`).
 The agent-provider-facing `POST /kyok/v1/chat/completions` endpoint is
 untouched — an OpenAI-compatible URL is the whole point of that side.
 
@@ -371,22 +450,19 @@ the session id before putting it in the token — is gone along with the
 session id itself: a KYOK token now carries `{runId, providerKey,
 agentName, exp}` and nothing caller-side at all.
 
-The arrival is the agent provider's, rule for rule:
-
-1. **register** — `POST /llm-providers/register` with
-   `{models, metadata?, public_key, signature, timestamp}`, the signature
-   over upstream's `souk-register-llm` payload
-   (`souk_llm_provider_sdk.sign_llm_registration` builds it). Names are
-   deliberately not exclusive across identities: two providers both
-   offering `gpt4` is normal, and an offering is `(provider_key, name)`
-   exactly as an agent is.
-2. **attach** — this socket, opened with the same four-frame mutual
-   challenge-response as `/ws/provider` (same `handshake.py` payloads,
-   same version), the hello carrying `modelNames` where the provider
-   socket says `agentNames`. Core refuses an attach for a name this key
-   never registered; a socket that drops takes its offerings offline in
-   the same instant, and a re-attach mid-run just works because a run's
-   binding names the offering, not the connection.
+The arrival is the agent provider's, rule for rule: the same
+`POST /tickets`, the same two-frame handshake (same `handshake.py`
+payloads, same version — the hello merely omits `maxConcurrentRuns`,
+which a completion relay has no use for), and then a `register` frame on
+the open link, `{"models": [...], "metadata"?}` where the provider
+socket says `agents`. The signed `POST /llm-providers/register` road is
+gone upstream — `sign_llm_registration` no longer exists — and the same
+roster-replace and delete semantics apply (`deleteModel`, refused by
+core while a live run is bound to the offering). Names are deliberately
+not exclusive across identities: two providers both offering `gpt4` is
+normal, and an offering is `(provider_key, name)` exactly as an agent
+is. A socket that drops takes its offerings offline in the same instant,
+and a later attach with the same identity takes the offering over.
 
 A caller opts a run in with
 `metadata: {"kyok": {"llmProvider": {"providerKey", "name"}, "context"}}`
@@ -399,11 +475,15 @@ the reference LLM provider and builds that metadata via
 
 | direction | frame | carries |
 |---|---|---|
-| ↓ | `{"type": "completionRequest", "requestId", **DeliveredCompletion}` | upstream's declared envelope — `DeliveredCompletion.model_dump(by_alias=True)` (`runId`, `providerKey`, `agentName`, `body`, `llmName`, `context`, `actorChain`): the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body. Canonical frame in AgentSouk/docs/contract-vectors.json |
+| ↑ | `{"type": "register", "models": […], "metadata"?}` | the offering roster this link serves |
+| ↓ | `{"type": "registered", "names": […]}` | what is now live |
+| ↑ | `{"type": "deleteModel", "name"}` | remove one offering's record |
+| ↓ | `{"type": "deleted", "name"}` | it is gone |
+| ↓ | `{"type": "completionRequest", "requestId", **DeliveredCompletion}` | upstream's declared envelope — `DeliveredCompletion.model_dump(by_alias=True)` (`runId`, `providerKey`, `agentName`, `body`, `llmName`, `context`, `actorChain` — the chain rides the envelope since contract revision 7): the run, the *proven* calling agent, which of this provider's models was addressed, the caller's opaque context, the delegation chain, and the OpenAI-shaped body. Canonical frame in `docs/upstream-contract-vectors.json` |
 | ↑ | `{"type": "chunk", "requestId", "data"}` | one OpenAI `chat.completion.chunk`; validated on souk's side, an invalid one fails the completion |
 | ↑ | `{"type": "done", "requestId"}` | end of that response |
 | ↑ | `{"type": "error", "requestId", "message", "refusal"?}` | provider-side failure or refusal, so the waiting completion fails fast instead of timing out — policy (throttling, billing, refusing a chain it does not recognise) is the LLM provider's, and this frame is how it says no. `refusal` is a structured payload relayed to the calling agent *intact* (in-stream as the `{"error": ...}` value, or as `error` on the non-streaming 502 body) — the envelope souk guarantees; the vocabulary inside is the two roles' own |
-| ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
+| ↓ | `{"type": "error", "requestId"?, "message"}` | server-side rejection of a frame (unknown type, a refused registration, or a `requestId` not in flight on this connection) — answered, not a teardown, same as the provider socket |
 
 `requestId` multiplexing means one socket serves concurrent completions.
 A gap of `CHUNK_GAP_TIMEOUT_SECONDS` (120s) between frames of one answer
@@ -439,11 +519,84 @@ frame.
 
 What souk still deliberately does not do: validate the LLM output a
 provider returns (a provider must treat KYOK output as untrusted input
-regardless — see "Scope / limitations" in `keep-your-own-key.md`), or
-impose a spend ceiling. The ceiling belongs to the LLM provider, which
-is now an identified party with the material to enforce one — the run
-id, the proven calling agent, the caller's context and the delegation
-chain arrive on every `completionRequest` frame (AgentSouk#26).
+regardless), or impose a spend ceiling. The ceiling belongs to the LLM
+provider, which is now an identified party with the material to enforce
+one — the run id, the proven calling agent, the caller's context and the
+delegation chain arrive on every `completionRequest` frame
+([hukaichun/funduq#26](https://github.com/hukaichun/funduq/issues/26)).
+
+## The A2A door
+
+Core no longer speaks JSON-RPC at all. `funduq.protocols.a2a.A2AAdapter`
+hands back A2A's own messages — `AgentCard`, `Task`, the update events —
+and writes no envelopes, no method names, no error codes. The gateway
+mounts a2a-sdk's `JsonRpcDispatcher` over a thin `RequestHandler` per
+upstream's transport guide (`souk_server/api_a2a.py`), which puts the
+whole protocol vocabulary in the package where it is versioned instead
+of hand-written here.
+
+- **`enable_v0_3_compat=True`, and forgetting it drops every v0.3
+  client.** Which protocol version a request speaks rides the
+  `A2A-Version` HTTP header, and *no header means 0.3* — with the flag
+  on, the dispatcher accepts the v0.3 method names and converts the
+  shapes. That header is exactly why this cannot live in core: only the
+  transport ever sees one, and the version decision belongs to the party
+  holding the evidence.
+- **Two errors deliberately leave A2A's vocabulary**, because A2A has no
+  word for either and one that means something else would be worse:
+  `AgentNotFound` is a **404 on the route** — the agent is the endpoint,
+  resolved from the path before the dispatcher runs, never a JSON-RPC
+  error inside a 200 — and `ThreadQueueFull` is a **429 with
+  `Retry-After`**: backpressure, the request was *not* accepted, and
+  accept-then-expire is the lie this refuses to tell.
+- **Cancel metadata passes through whole.** A run on a thread that bound
+  an authority at birth can only be stopped by one of that thread's
+  authorities, and the proof rides in `CancelTaskRequest.metadata`
+  (`metadata.cancel`, with `metadata.resolution` / `metadata.delegation`
+  beside it). Drop the field and every cancel on a bound thread is
+  refused; forge nothing — funduq verifies the signature, not the
+  envelope.
+- **`presenter_key=None` today, and the deployment invariant is
+  upstream's operational-limits §1**: core's caller doors are not
+  independently safe. Verifying a chain proves the head's key signed hop
+  zero, never that whoever *presented* it holds that key — and the chain
+  is not a secret, since every serving provider receives it verbatim. A
+  deployment therefore puts an authenticating seat in front of the
+  doors, and this gateway is that seat: the adapter call sites in
+  `api_a2a.py` are the plug point where an edge-authenticated caller's
+  key becomes `presenter_key`, at which point funduq refuses a chain
+  whose last hop someone else signed. Unbuilt here (open market, no edge
+  auth), and this paragraph is the record that the exposure is chosen,
+  not missed.
+- **Events are dumped `exclude_none=True`, and unknown event types are
+  relayed untouched.** A default dump injects `timestamp: null` into the
+  caller's stream; and funduq is a relay, so a provider on a newer AG-UI
+  must not be cut off by an event type nobody here has heard of.
+
+Interjection rides the standard extension point — the A2A extension's
+metadata key, and `forwardedProps.addressedRunId` on AG-UI — and funduq
+handles it; the gateway just relays.
+
+## Health and lifecycle
+
+Liveness and readiness stay two endpoints (`/healthz` touches nothing;
+`/readyz` maps `Health.ready` to a status code). **Ready is core's
+conjunction of three facts — database answers ∧ `schema_current` ∧
+`dispatching`** — and `background_running` is gone from `Health` because
+the health sweeps it reported no longer exist: upstream removed the
+paused-run deadline and the sweep loop with it, so **a paused
+(`input-required`) run now waits indefinitely**, across restarts. It
+costs a row, not a slot; the parties that hold the lever (the asking
+provider's `Interrupt.expires_at`, the caller that owes the answer) are
+the ones funduq's clock could only have overruled. Relatedly, the final
+status of a run is decided in a fixed order in which an interrupt
+outcome outranks everything — a stream that ends on `RUN_FINISHED` with
+unanswered tool calls is `input-required`, not `completed`: the run
+stopped to ask, and is not filed as one that finished.
+
+`Funduq.start()` returns the ids of runs it had to fail as orphaned by a
+previous process; the gateway logs them (`souk_server/server.py`) so a
+restart that ended work says which work it ended.
 
 ## MCP: the docent
 
@@ -501,14 +654,12 @@ fixes the surface below at "who is here, what do they do, where do I go".
   `last_seen` in words ("40s ago", "3d ago"), because the boolean cannot
   separate "stepped away" from "gone for a week" and that is the
   difference a visitor deciding whether to wait is asking about.
-- **Notifications.** Not built. If built, necessarily two-track:
-  `souk.on_change` fires for registrations and de-listings, but an agent
-  going stale fires *nothing* — `online` is derived from `last_seen_at`
-  against a window at query time, so there is no instant to fire on
-  (souk/changes.py records this deliberately). A directory that
-  advertises live updates off `on_change` alone would miss exactly the
-  transition its users care most about; pair the hook with a slow poll,
-  or just poll. Not load-bearing either way.
+- **Notifications.** Not built. If built, necessarily paired with a
+  poll: a change hook fires for registrations and de-listings, but a
+  boolean derived from a live mapping has transitions no hook names —
+  a directory that advertises live updates off registration events alone
+  would miss the ones its users care most about. Not load-bearing either
+  way.
 - **Not exposed:** invocation (A2A's job), registration/identity
   (provider business), KYOK (bridge business), threads/runs (run
   observation is a different feature with a different audience — add
@@ -516,7 +667,7 @@ fixes the surface below at "who is here, what do they do, where do I go".
   policy — the managed-gateway example's job).
 
 Core serves all of it from `list_agents` alone
-([AgentSouk#31](https://github.com/hukaichun/AgentSouk/issues/31), now
+([hukaichun/funduq#31](https://github.com/hukaichun/funduq/issues/31), now
 closed: typed query models landed, enumeration was withdrawn as
 unneeded). Search filters that roster in Python rather than querying —
 a market's worth of stalls is not a log, and if a deployment ever
@@ -524,7 +675,7 @@ outgrows it, that is when a core query earns its place.
 
 **The docent is also a stall.**
 `providers/pydantic-ai-agent/config.docent.yaml` runs it as an ordinary
-provider — its own key, a row in the roster, runs claimed over
+provider — its own key, a row in the roster, runs served over
 `/ws/provider` — reaching the market through `/mcp` as a real MCP
 client rather than through `GET /agents`. Two things that buys: every
 frontend gets a guide instead of each one building its own, and the
@@ -537,23 +688,27 @@ not two.) It runs unthrottled on purpose: backpressure is a feature at a
 working stall and a bad front door at the gate.
 
 **The one question the docent cannot answer: "are they busy right
-now?"** Capacity is per-stall in souk's model (`maxClaim` is a
+now?"** Capacity is per-stall in souk's model (`maxConcurrentRuns` is a
 provider's budget across everything it hosts), and the roster carries
 nothing about it — so "you'll have to wait, they're serving someone",
 one of the few genuinely market-shaped answers a guide could give, is
 unavailable. Note where the data actually is before reaching upstream
-for it: this gateway knows each connected worker's `maxClaim` (it
-arrives in the hello frame) and how many runs it has in flight (it
-drives the claim loop), so the honest version is per-process serving
-state, not a core projection — and it would read as authoritative while
-being blind to workers connected to another replica.
+for it: this gateway knows each connected provider's declared budget (it
+arrives in the hello frame) and the broker knows what is in flight, so
+the honest version is per-process serving state, not a core projection —
+and it would read as authoritative while being blind to providers
+connected to another replica.
 
 ## Serving state stays out of core's database
 
 **Today the gateway persists nothing.** Its only database access is
 `deps.get_session`, which borrows core's session and hands it to a route;
-every table in the deployment belongs to `souk`, is created by
-`souk/alembic/`, and is migrated by the one-shot `souk-migrate` service.
+every table in the deployment belongs to funduq, whose alembic chain
+**ships inside the wheel** — `python -m funduq.migrate` is the whole
+migration story, there is no `alembic.ini` anywhere in this repo, and the
+one-shot `souk-migrate` compose service runs exactly that command,
+reading `FUNDUQ_DATABASE_URL` / `FUNDUQ_DB_SCHEMA` from its environment.
+Tests migrate through the same door (`funduq.migrate.migrate(url)`).
 That is not an accident to preserve by luck — it is the state this rule
 protects.
 
@@ -561,17 +716,20 @@ protects.
 the isolation is structural rather than a naming convention.** Whatever
 it turns out to be — edge-auth records, rate limits, admin state, an MCP
 event store for resumable streams — it does not get a table in core's
-schema and never gets a revision in `souk/alembic/`.
+schema, and obviously never gets a revision into the wheel's chain: the
+rule is not about a directory, it is that **no serving table lives in
+core's schema**.
 
 Three reasons, in the order they bite:
 
-1. **A shared migration chain merges the two repos.** `souk/alembic/` is
-   upstream's, versioned with core. A gateway table added there makes
-   `alembic upgrade head` from souk responsible for serving state, and
-   makes this repo's schema a function of the submodule pin.
-2. **It would break core's own readiness answer.** `Souk.health` compares
-   `alembic_version` against `EXPECTED_SCHEMA_REVISION`, a literal in
-   `souk/db_schema.py`. A chain carrying gateway revisions would move
+1. **A shared migration chain merges the two projects.** The chain is
+   upstream's, versioned with core and shipped in its wheel. A gateway
+   table added to core's schema outside that chain makes the schema a
+   thing no single migration owns; added *through* it would need a fork
+   of the package.
+2. **It would break core's own readiness answer.** `Funduq.health`
+   compares the database's revision against the one this build expects
+   (`schema_current`). A chain carrying gateway revisions would move
    past what core expects, and core would report a database it is
    perfectly able to serve as not ready.
 3. **The DDL/DML split is already load-bearing here.** `souk-migrate`
@@ -580,13 +738,14 @@ Three reasons, in the order they bite:
    split, not a merged one.
 
 **Follow upstream's mechanism rather than inventing one** (see
-`AgentSouk/souk/souk/db_schema.py` and `souk/alembic/env.py`): a schema
-namespace read from the environment, quoted in exactly one place, ignored
-on SQLite (which has no schema namespace at all), with a dependency-free
-module holding the constants so both the app and its `env.py` can import
-them without dragging in required settings. The serving version is the
-same shape under its own names — a `SOUK_SERVER_DB_SCHEMA`, an
-`alembic/` in this repo, its own expected-revision check.
+`funduq.db_schema` and the wheel's `alembic/env.py`): a schema namespace
+read from the environment (`FUNDUQ_DB_SCHEMA`), quoted in exactly one
+place, ignored on SQLite (which has no schema namespace at all), with a
+dependency-free module holding the constants so both the app and its
+`env.py` can import them without dragging in required settings. The
+serving version is the same shape under its own names — a
+`SOUK_SERVER_DB_SCHEMA`, an `alembic/` in this repo, its own
+expected-revision check.
 
 Whether the two live in one database under separate schemas, or in two
 databases entirely, is a deployment choice and both must keep working —
@@ -598,52 +757,38 @@ which sets the real test, and it is not the schema name:
 A shared session or a single `begin()` spanning both makes them one
 database in practice however they are namespaced, and forecloses the
 split deployment silently. Serving persistence therefore gets its own
-engine and sessionmaker, not `souk.session()`.
+engine and sessionmaker, never core's session.
 
 ## Where examples live
 
-Split by what an example teaches, not by where it happens to run:
+Split by what an example teaches, not by where it happens to run — and
+since upstream became a set of PyPI packages, everything network-shaped
+lives here, full stop:
 
 | example | teaches | lives | why |
 |---|---|---|---|
-| `agent-template`, python providers | writing a provider against **souk-agent-sdk** | upstream (AgentSouk), for now | written when the SDK lived there; with the SDKs relocated here, whether they follow or stay as path-dep consumers is settled in upstream's half of the move |
-| end-to-end demo (gateway + agent, one `docker compose` command) | what the whole system looks like running | **this repo**, a `demo` compose profile | after souk-server leaves upstream, only this repo has a gateway to demo against; build contexts point into the submodule (`AgentSouk/agent-template/…`) so the example code keeps one home |
-| browser provider (single HTML file speaking `/ws/provider`) | the frame protocol in this document, directly — no SDK | **this repo**, `examples/` | the frames are authored here, so their conformance demo belongs here; it is also the living proof of the claim that justified ws — a browser can be a provider |
-| managed-gateway embedding (`create_app` wrapped in edge auth + an admin router over the `Souk` facade) | how a deployment adds management without this repo shipping policy | **this repo**, `examples/` | the embedding surface (`create_app`, `app.state.souk`) is this repo's contract |
+| `agent-template`, `providers/*` | writing a provider against **souk-agent-sdk** | **this repo** | the SDK they consume is this repo's; upstream ships libraries, not examples of serving them |
+| the `demo` compose profile (gateway + docent + three stalls, one command) | what the whole system looks like running | **this repo**, `docker-compose.yml` | only this repo has a gateway to demo against |
+| `providers/pod-probe-agent` (Go, no SDK) | the frame protocol in this document, directly | **this repo** | the frames are authored here, so their conformance probe belongs here — it replays `docs/wire-vectors.json` and the vendored upstream vectors, and it is the living proof that the wire is implementable from the documents alone |
+| managed-gateway embedding (`create_app` wrapped in edge auth + an admin router over the `Funduq` facade) | how a deployment adds management without this repo shipping policy | **this repo**, `examples/` (unbuilt) | the embedding surface (`create_app`, `app.state.souk`) is this repo's contract |
 
-This settles the one judgment call flagged in the extraction plan's
-Phase 2 checklist: upstream's compose drops its `agent-demo`-style
-services and slims to library development (database + tests); the demo
-role moves here wholesale.
+## What moved out, and where upstream went
 
-## What this removes from this repo
+The gRPC removal list (listener, stubs, `grpcio`/`protobuf`, port 50051,
+the stub-gen Docker layer) is history now — see the repo log if the
+details matter.
 
-- `souk_server/grpc_server.py`, `souk_server/grpc_gen/`
-- `grpcio`, `protobuf` runtime deps; `grpcio-tools` dev dep
-- the `gen_proto.sh` invocation (README, Dockerfile) and the stub-gen
-  Docker layer
-- port 50051 everywhere: `ServingSettings.grpc_*` fields, Dockerfile
-  `EXPOSE`, compose ports, TLS cert pair for gRPC
-- adds: `websockets` (or uvicorn's built-in ws support — FastAPI's
-  `WebSocket` route type needs no new top-level dependency)
-
-The SDKs (`souk-agent-sdk/`, `souk-client-sdk/`) implement the matching
-ws transports and live **in this repo** — relocated from upstream when
-they were rewritten, because a wire client is network code and upstream
-keeps none: this repo owns both ends of every wire it defines. Their
-removal from AgentSouk (with `agent-template`/`providers/*` re-pointed at
-the new home) is upstream's half of the move.
-
-## Build order
-
-1. `WS /ws/provider` + a probe provider driving a real run end-to-end
-   (including reconnect-mid-run and cancel — the two cases reading code
-   gets wrong; see upstream CLAUDE.md).
-2. `WS /ws/kyok` + the completions relay against it; delete
-   `poll`/`respond`.
-3. Strip gRPC (the removal list above); `ServingSettings` loses its
-   `grpc_*` fields.
-4. SDK ws transports — done, and the SDKs moved into this repo with
-   them (upstream keeps no network code; see "What this removes").
-   Remaining upstream: delete the old SDK directories and re-point
-   their consumers.
+The larger move since: upstream stopped being a submodule at all.
+**funduq core arrives as PyPI packages** (`funduq`,
+`funduq-provider-sdk[llm]`, `funduq-contract`), the `AgentSouk/`
+directory is gone, and the boundary is unchanged in spirit — upstream is
+the domain and the contract, published as wheels; this repo is every
+socket, both SDKs (`souk-agent-sdk/`, `souk-client-sdk/`), the reference
+providers and the directory UI, because a wire client is network code
+and upstream keeps none: this repo owns both ends of every wire it
+defines. What used to be "pinned by commit" is now pinned by version
+bounds in each `pyproject.toml`, and what used to be a path into the
+submodule (vectors, scripts, docs) now has an in-repo home:
+`docs/upstream-contract-vectors.json` (vendored at contract revision 7,
+regenerated by re-vendoring when the pin moves) and
+`scripts/gen_dev_tls_cert.py`.

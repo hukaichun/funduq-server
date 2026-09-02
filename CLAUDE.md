@@ -16,7 +16,8 @@ Three rules, and they are not stylistic:
   miss service names (`http://souk:8000` resolves in compose and nowhere
   else), volume-persisted identity keys, and startup ordering.
 - **Anything Python goes through `uv`.** `uv sync --group dev`, `uv run
-  pytest`, `uv run souk-server`, `uv run alembic`. Never a bare `python`,
+  pytest`, `uv run souk-server`, `uv run python -m funduq.migrate`.
+  Never a bare `python`,
   `pip` or a manually activated venv: each subproject
   (`souk-agent-sdk/`, `souk-client-sdk/`, `agent-template/`,
   `providers/*`) has its own environment, and `uv run` from that
@@ -67,8 +68,11 @@ catches all of it; "verified end to end" is a claim about one path.
 - Every `[tool.uv.sources]` path entry needs its own `COPY` in the
   Dockerfile. A missing one fails at `uv sync` with "Distribution not
   found at: file:///app/…", during build, long before any import — which
-  reads as a broken image rather than as a missing line. Both images here
-  were missing `AgentSouk/souk-provider-sdk` the day the SDK arrived.
+  reads as a broken image rather than as a missing line. The path
+  sources are all in-repo now (`souk-agent-sdk/`, `souk-client-sdk/`;
+  upstream funduq comes from PyPI and needs no COPY), but the lesson
+  stands: both images here were missing the provider-SDK COPY the day
+  that SDK arrived as a path dependency.
 - `docker compose run -v "$PWD/x:/app/y"` resolves `$PWD` in *this
   shell*, whose directory persists across commands. Pointed at a path
   that does not exist, Docker creates it — root-owned — so a stale `cd`
@@ -84,7 +88,7 @@ catches all of it; "verified end to end" is a claim about one path.
 - **A green suite does not mean the app starts.** Nothing under `tests/`
   imports `souk_server/server.py`. After any broad edit, build the app:
   ```bash
-  uv run python -c "from souk.config import CoreSettings; from souk.core import Souk; from souk_server.server import create_app; create_app(Souk(CoreSettings(token_signing_secret='x'))); print('app builds')"
+  uv run python -c "from funduq.config import CoreSettings; from funduq.core import Funduq; from souk_server.server import create_app; create_app(Funduq(CoreSettings(token_signing_secret='x', identity_private_key='11'*32))); print('app builds')"
   ```
 - WebSocket tests drive the real ASGI app over `httpx-ws` in the same
   event loop as the `souk` fixture. A threaded test client would be
@@ -100,15 +104,18 @@ Breaking one has caused a real bug here or upstream.
 
 - **This repo owns both ends of every wire it defines.** Gateway, both
   SDKs, the reference providers and the directory UI live here; upstream
-  AgentSouk is souk core and its docs, nothing network-facing
-  (AgentSouk#27). `docs/server-mode.md` is the spec of record for the
-  frame protocol.
+  is [hukaichun/funduq](https://github.com/hukaichun/funduq) — core, the
+  contract and their docs, nothing network-facing (funduq#27) — and it
+  arrives as PyPI packages (`funduq`, `funduq-provider-sdk`,
+  `funduq-contract`), not as a submodule. `docs/server-mode.md` is the
+  spec of record for the frame protocol.
 - **Core is network-free, and this is where every I/O decision lives.**
   Ports, TLS, CORS, framing, edge auth. `create_app` binds nothing.
 - **Serving state stays out of core's database.** No gateway table in
-  core's schema, no revision in `souk/alembic/`, and no code path putting
-  core state and serving state in one transaction — see
-  `docs/server-mode.md`.
+  core's schema (the migration chain ships inside the funduq wheel — no
+  revision of ours could reach it anyway; the rule is about the schema,
+  not the directory), and no code path putting core state and serving
+  state in one transaction — see `docs/server-mode.md`.
 - **The docent gives directions and stops.** No MCP tool may run,
   resume or cancel anything; invocation is A2A's, which souk already
   serves without deviation. A test asserts the tool list.

@@ -9,22 +9,25 @@ import (
 	"github.com/coder/websocket"
 )
 
-// runFrame is the offer that arrives after welcome. agentName rides along
-// because this provider routes by it and the RunAgentInput does not name
-// it. input is the AG-UI RunAgentInput, kept raw so a KYOK token in its
-// forwardedProps survives untouched.
+// runFrame is the offer that arrives after registration: {"type": "run"}
+// plus the DeliveredRun envelope, model_dump(by_alias=True) on souk's side
+// (see docs/upstream-contract-vectors.json, kind "delivered-run").
+// agentName rides along because this provider routes by it and the
+// RunAgentInput does not name it. runInput is the AG-UI RunAgentInput,
+// kept raw so a KYOK token in its forwardedProps survives untouched.
 type runFrame struct {
 	Type      string          `json:"type"`
 	RunID     string          `json:"runId"`
 	ThreadID  string          `json:"threadId"`
 	AgentName string          `json:"agentName"`
-	Input     json.RawMessage `json:"input"`
+	Input     json.RawMessage `json:"runInput"`
 }
 
 // serve reads frames until the socket dies. This is the whole loop, and it
-// is one loop on purpose: the first frame after welcome may already be a
-// run, so there is no "read the welcome, then start reading" seam for a
-// race to live in. Writes are serialized through writeFrame's mutex so a
+// is one loop on purpose: the first frame after `registered` may already be
+// a run (nothing is offered before registration, but nothing waits after
+// it), so there is no seam for a race to live in. Writes are serialized
+// through writeFrame's mutex so a
 // run's events and its finish leave in order and never interleave mid-frame
 // with another run's.
 func (c *SoukConn) serve(ctx context.Context, answer AnswerFunc) error {

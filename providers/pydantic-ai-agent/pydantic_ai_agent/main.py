@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
-from souk_provider_sdk import KyokForwardedProps
+from funduq_provider_sdk import KyokForwardedProps
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.models.openai import OpenAIChatModel

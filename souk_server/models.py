@@ -1,13 +1,18 @@
-"""Pydantic schemas for souk's HTTP surface.
+"""Pydantic schemas for the gateway's HTTP surface and wire frames.
 
 `RunAgentInput` itself is deliberately *not* defined here — the inbound
-`/agui/{name}` request body uses `ag_ui.core.RunAgentInput`, the real
-AG-UI schema, directly (see api_agui.py). A separate, souk-flavored
-reimplementation of the same model used to live here, which meant two
-different types with the same name, only one of which was the real
-protocol — and the souk-only one was missing `tools`/`state`/`context`
-entirely, fields a real caller may legitimately want to send. There is
-nothing left to duplicate.
+`/agui/{provider}/{name}` request body uses `ag_ui.core.RunAgentInput`,
+the real AG-UI schema, directly (see api_agui.py). A separate,
+souk-flavored reimplementation of the same model used to live here,
+which meant two different types with the same name, only one of which
+was the real protocol.
+
+The signed registration/deletion request bodies are gone with their
+routes: registration and deletion moved onto the provider sockets, where
+the open link is the credential (see ws_provider.py / ws_kyok.py).
+`AgentRegistration` survives because the shape of one roster entry is
+still this layer's to validate — it now describes an element of the
+`register` frame's `agents` list, camelCase on the wire.
 """
 
 from __future__ import annotations
@@ -16,47 +21,52 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+
+
+class TicketRequest(BaseModel):
+    """`POST /tickets`: the out-of-band half of the v4 handshake.
+
+    The body names the Ed25519 public key (hex) the ticket admits — a
+    leaked ticket is worthless because only the named key can sign the
+    proof that answers it.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    public_key: str = Field(min_length=1)
+
+
+class TicketResponse(BaseModel):
+    """The single-use ticket (valid ~60s, destroyed by the handshake that
+    answers it) and funduq's public key — learned here, over TLS, which is
+    what the connect proof then binds."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    ticket: str
+    funduq_public_key: str
 
 
 class AgentRegistration(BaseModel):
+    """One agent in a `register` frame. camelCase on the wire
+    (`agentCardExtra`), snake_case toward core — the same field list as
+    upstream's `REGISTRATION_FIELDS`, compared in a test."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
     name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     description: str = ""
     agent_card_extra: dict[str, Any] = Field(default_factory=dict)
     # souk-internal, not exposed via the public A2A Agent Card — see
-    # agents.metadata in souk/schema.py.
+    # agents.metadata in funduq's schema.
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class RegisterBatchRequest(BaseModel):
-    agents: list[AgentRegistration]
-    # Optional storefront label for this public_key, shown when
-    # souk-directory groups agents by provider — see souk/schema.py's
-    # providers table. Purely descriptive (like AgentRegistration.
-    # description below), so — like description — it's not part of what
-    # registration_signing_payload covers; only which names are being
-    # claimed needs to be tamper-proof.
-    provider_name: str | None = Field(default=None, max_length=128)
-    # Ed25519 public key (hex) this provider's identity is backed by, and
-    # a signature (hex) over souk.identity.registration_signing_payload —
-    # proves possession of the matching private key. See
-    # souk_agent_sdk.identity for how a provider generates/persists one.
-    # First registration of a name binds it to this key; later attempts
-    # to register the same name with a different key are rejected (see
-    # repo.register_agents) — this is the whole of souk's provider
-    # identity model: no signup flow, the keypair *is* the identity.
-    public_key: str
-    signature: str
-    # Unix timestamp (seconds) included in what was signed — souk rejects
-    # anything outside souk.identity.SIGNATURE_FRESHNESS_WINDOW_SECONDS of
-    # its own clock, so a captured signed request can't be replayed
-    # indefinitely to keep minting fresh session tokens.
-    timestamp: int
 
 
 class AgentRosterEntry(BaseModel):
     """One roster row on the wire.
 
-    An agent *is* `(provider_key, name)` now — souk mints no id for anyone
+    An agent *is* `(provider_key, name)` — funduq mints no id for anyone
     to hold — so the pair is what a caller addresses it by. `fingerprint`
     is the same identity in 16 hex, which is what this gateway puts in a
     URL; it is derived, never authoritative, and `provider_key` is the
@@ -73,69 +83,13 @@ class AgentRosterEntry(BaseModel):
     joined_at: datetime
     last_seen_at: datetime
     online: bool
-    # The optional storefront label for that key (souk.schema's providers
+    # The optional storefront label for that key (funduq's providers
     # table), None if this provider never set one.
     provider_name: str | None = None
 
 
 class RosterResponse(BaseModel):
     agents: list[AgentRosterEntry]
-
-
-class RegisterBatchResponse(RosterResponse):
-    """What a provider gets back for proving who it is.
-
-    No session token: souk stopped issuing one when work stopped being
-    claimed, and this gateway's socket is authenticated by a signature
-    from the same key instead (see ws_provider.connect_signing_payload) —
-    so there is nothing bearer-shaped to leak or to expire under a
-    long-lived connection.
-
-    No ids either, for the reason core gives: a provider that held ids
-    souk minted could be cut off from its own work by a database it never
-    saw replaced. It already knows its key and the names it chose, and
-    that pair is the agent.
-    """
-
-
-class LlmRegisterRequest(BaseModel):
-    """Registration for the KYOK side's party: an LLM provider declaring
-    model offerings. Same Ed25519 machinery as agent registration, under
-    its own payload prefix (`souk-register-llm`) so neither signature can
-    be replayed as the other.
-
-    Names are freer than agent names on purpose — a model offering is
-    addressed inside frames and metadata, never in a URL path, and real
-    model names carry dots ("gpt-4.1").
-    """
-
-    models: list[str] = Field(min_length=1)
-    # Free-form description of the offerings (pricing hints, model family,
-    # whatever the provider wants a directory to show). Stored verbatim.
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    public_key: str
-    signature: str
-    timestamp: int
-
-
-class LlmRegisterResponse(BaseModel):
-    models: list[str]
-
-
-class DeletionRequest(BaseModel):
-    """One signed deletion order, serving both rosters.
-
-    `name` is the agent or offering being removed; the signature is over
-    the deletion payload for that roster (`souk-delete-agent:` /
-    `souk-delete-llm:` — distinct domain tags, so neither a registration
-    signature nor the other roster's deletion signature can be replayed
-    as this one).
-    """
-
-    name: str
-    public_key: str
-    signature: str
-    timestamp: int
 
 
 class LlmOfferingEntry(BaseModel):
@@ -174,7 +128,7 @@ class CreateThreadResponse(BaseModel):
 
 
 class LivenessResponse(BaseModel):
-    """`/healthz`. Nothing about souk's dependencies belongs here — the
+    """`/healthz`. Nothing about funduq's dependencies belongs here — the
     response existing is the answer."""
 
     status: str
@@ -183,8 +137,12 @@ class LivenessResponse(BaseModel):
 class HealthResponse(BaseModel):
     """`/readyz`. Facts, so an operator reading a 503 does not have to go
     and find out which of them was false. Carries no connection string and
-    no driver message — see souk.core.Health, and note that this endpoint is
-    unauthenticated because a probe cannot hold a credential.
+    no driver message — see funduq.core.Health, and note that this
+    endpoint is unauthenticated because a probe cannot hold a credential.
+
+    `background_running` is gone with core's health sweeps; `dispatching`
+    — whether the broker's dispatch loop is turning — is the fact that
+    replaced it in `Health`, and readiness includes it.
     """
 
     ready: bool
@@ -193,4 +151,4 @@ class HealthResponse(BaseModel):
     database_error: str | None = None
     schema_revision: str | None = None
     expected_schema_revision: str
-    background_running: bool
+    dispatching: bool

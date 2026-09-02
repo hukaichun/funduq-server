@@ -1,31 +1,30 @@
 """Covers the AG-UI HTTP surface: the optional POST /threads endpoint,
-and that /agui/... runs mint a fresh thread automatically for an
-unrecognized threadId rather than requiring POST /threads first (see
-souk-no-forced-protocol-deviation) — real ag_ui.core.RunAgentInput shape
-and all.
+that /agui/... runs mint a fresh thread automatically for an
+unrecognized threadId rather than requiring POST /threads first
+(souk-no-forced-protocol-deviation) — real ag_ui.core.RunAgentInput
+shape and all — and the actor-chain door behaviour: a valid chain is
+verified, its head copied onto the run, and the chain relayed to the
+agent verbatim plus funduq's own dispatch hop; a tampered one is a 401
+at the door.
 
-Every route takes the pair now. What that changed here is more than the
-URLs: "offline" used to be arranged by backdating `last_seen_at` past a
-heartbeat window, which is why half these tests reached into the `agents`
-table to set up a fact about liveness. `online` is `is_serving`, so an
-agent nobody attached is already offline and the setup is simply not
-attaching one.
+Every route takes the pair. "Offline" is arranged by simply not
+attaching anyone — `online` is `is_serving`, so an agent nobody attached
+is already offline.
 """
 
 from __future__ import annotations
 
 import json
 
-from souk import repo
-from souk.models import AgentRef
+from funduq import repo
+from funduq_contract import verify_chain
 
 
 def _run_input(thread_id: str, message: str = "hi") -> dict:
     """The real ag_ui.core.RunAgentInput wire shape — threadId/runId/
     state/messages/tools/context/forwardedProps all required by the real
-    schema (see souk/models.py's module docstring for why souk no longer
-    has its own looser version of this). runId is required by the schema
-    but never actually used by souk — any placeholder satisfies it.
+    schema. runId is required by the schema but never adopted by funduq —
+    any placeholder satisfies it.
     """
     return {
         "threadId": thread_id,
@@ -73,10 +72,10 @@ async def test_create_thread_for_an_unregistered_agent_404s(client, register):
 
 async def test_agui_run_mints_a_fresh_thread_for_an_unrecognized_thread_id(client, register):
     """AG-UI's `threadId` is caller-minted and required by the schema —
-    an id souk has never seen is a brand new conversation, not an error
-    (unlike A2A's optional `contextId` — see test_api_a2a.py). Nobody is
-    attached, purely so the run resolves immediately instead of streaming
-    forever waiting for a provider — unrelated to what this test checks.
+    an id funduq has never seen is a brand new conversation, not an error
+    (unlike A2A's optional `contextId`). Nobody is attached, purely so
+    the run resolves immediately instead of streaming forever waiting for
+    a provider — unrelated to what this test checks.
     """
     served = await register("greeter")
 
@@ -103,12 +102,8 @@ async def test_agui_run_against_an_offline_agent_fails_fast(client, register):
 
 
 async def test_agui_run_reaches_an_attached_provider(client, serve):
-    """The other half, and the one the old suite could not write: back then
-    "online" was a timestamp, so a test could fake it by leaving
-    `last_seen_at` fresh without anyone actually serving — and the run would
-    then hang. Serving is now a live mapping, so there is nothing to fake:
-    the provider is really there, and the stream really comes from it.
-    """
+    """Serving is a live mapping, so there is nothing to fake: the
+    provider is really there, and the stream really comes from it."""
     served = await serve(None, "greeter")
 
     resp = await client.post(f"/agui/{served.path()}", json=_run_input("thread_new"))
@@ -124,35 +119,59 @@ async def test_agui_run_reaches_an_attached_provider(client, serve):
     assert types[-1] == "RUN_FINISHED"
 
 
+async def test_agui_events_carry_no_null_padding(client, serve):
+    """The relay rule: events are dumped `exclude_none=True`, so a
+    default dump's `timestamp: null` / `rawEvent: null` never enters a
+    caller's stream."""
+    served = await serve(None, "greeter")
+
+    resp = await client.post(f"/agui/{served.path()}", json=_run_input("thread_nulls"))
+
+    assert resp.status_code == 200, resp.text
+    for line in resp.text.splitlines():
+        if line.startswith("data: "):
+            event = json.loads(line[len("data: ") :])
+            assert None not in event.values(), event
+
+
 async def _offline_run_with_metadata(client, served, metadata):
     """The fast-fail path resolves synchronously, still going through
-    ensure_thread/create_run with the real metadata first (see
-    api_agui._run_agent) — so it is enough to check what got persisted
-    without needing a live provider.
+    ensure_thread/create_run with the real metadata first — so it is
+    enough to check what got persisted without needing a live provider.
     """
     body = _run_input("thread_made_up")
     body["metadata"] = metadata
     return await client.post(f"/agui/{served.path()}", json=body)
 
 
-async def test_agui_run_with_valid_actor_chain_stores_verified_chain(client, session, register, new_identity):
+async def test_agui_run_with_valid_actor_chain_stores_its_head(
+    client, session, register, new_identity
+):
+    """funduq's part in caller identity is four verbs — verify, copy the
+    head, relay, refuse. This is the copy: the chain's head key lands on
+    the run row, and the chain itself is stored verbatim (revision 5: the
+    chain funduq stores is the chain it dispatched)."""
     caller = new_identity()
     served = await register("greeter")
-    subject = {"type": "user", "id": "employee_x"}
-    chain = [caller.sign_chain_hop(subject)]
+    chain = [caller.sign_hop()]
+    assert verify_chain(chain).head == caller.public_key
 
     resp = await _offline_run_with_metadata(client, served, {"actorChain": chain})
     assert resp.status_code == 200, resp.text
     run_id = _run_started(resp.text)["runId"]
 
     run = await repo.get_run(session, run_id)
-    assert run.metadata["verifiedActorChain"]["subject"] == subject
-    assert run.metadata["verifiedActorChain"]["actors"] == [
-        {"publicKey": caller.public_key, "agentName": None}
-    ]
+    assert run.head_key == caller.public_key
+    # The chain funduq stores is the chain it dispatched (revision 5):
+    # the caller's hops as a prefix, funduq's own dispatch hop after.
+    stored = list(run.actor_chain)
+    assert stored[: len(chain)] == chain
+    assert len(stored) == len(chain) + 1
 
 
 async def test_agui_run_with_invalid_actor_chain_401s(client, register):
+    """A tampered chain is refused at the door, never carried —
+    `funduq_contract.InvalidChain`, mapped app-wide to 401."""
     served = await register("greeter")
 
     body = _run_input("thread_made_up")
@@ -171,33 +190,32 @@ async def test_agui_run_without_actor_chain_is_unaffected(client, session, regis
     run_id = _run_started(resp.text)["runId"]
 
     run = await repo.get_run(session, run_id)
-    assert "verifiedActorChain" not in run.metadata
+    assert run.head_key is None
+    assert not run.actor_chain
 
 
-def test_build_forwarded_props_includes_caller_when_chain_verified():
-    from souk.protocols.agui import build_forwarded_props
+async def test_the_chain_reaches_the_agent_verbatim_plus_funduqs_dispatch_hop(
+    client, serve, new_identity, souk
+):
+    """No summary is produced: the agent verifies for itself, from
+    `forwardedProps.actorChain` — the caller's hops unmodified **plus**
+    funduq's own dispatch hop naming where it sent the run, so the chain
+    arriving is one longer than the one the caller presented."""
+    caller = new_identity()
+    served = await serve(None, "greeter")
+    chain = [caller.sign_hop()]
 
-    subject = {"type": "user", "id": "employee_x"}
-    actors = [{"publicKey": "abc", "agentName": None}]
-    chain = ["hop0"]
-    agent = AgentRef(provider_key="abc", name="greeter")
+    body = _run_input("thread_chain")
+    body["metadata"] = {"actorChain": chain}
+    resp = await client.post(f"/agui/{served.path()}", json=body)
+    assert resp.status_code == 200, resp.text
+    assert "RUN_FINISHED" in resp.text
 
-    result = build_forwarded_props(
-        "test-signing-secret", "run_1", agent, {}, {"appSpecific": True}, subject, actors, chain
-    )
-
-    assert result == {
-        "appSpecific": True,
-        "caller": {"subject": subject, "actors": actors, "chain": chain},
-    }
-
-
-def test_build_forwarded_props_without_chain_or_kyok_passes_through_untouched():
-    from souk.protocols.agui import build_forwarded_props
-
-    agent = AgentRef(provider_key="abc", name="greeter")
-    result = build_forwarded_props(
-        "test-signing-secret", "run_1", agent, {}, {"appSpecific": True}
-    )
-
-    assert result == {"appSpecific": True}
+    seen = served.provider.seen_chain
+    assert seen is not None and seen[: len(chain)] == chain
+    assert len(seen) == len(chain) + 1
+    verified = verify_chain(seen)
+    assert verified.head == caller.public_key
+    # The extra hop is funduq's, and it names the dispatch target.
+    assert verified.hops[-1].actor_public_key == souk.identity_public_key
+    assert verified.hops[-1].dispatched_to is not None

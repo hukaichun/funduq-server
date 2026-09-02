@@ -2,26 +2,40 @@
 for a run's LLM usage with their own key instead of leaving that to the
 agent provider. Purely additive — a caller that never touches this module
 is simply not offering KYOK; `SoukClient.run()` alone is a complete,
-ordinary caller either way. See docs/keep-your-own-key.md in the souk
-repo for the design, and the gateway repo's docs/server-mode.md for the
-wire protocol this speaks.
+ordinary caller either way. See upstream funduq's docs (mechanisms/kyok)
+for the design, and this repo's docs/server-mode.md for the wire protocol
+this speaks.
 
-**This is an LLM provider now.** Upstream retired the anonymous
-session-keyed bridge — the one actor in the system with no identity, and
-the root of that design's failures — and made the answering party a
-first-class provider kind. So this bridge holds an Ed25519 keypair
-(`souk_llm_provider_sdk.ProviderIdentity`), registers a model offering
-under it (`register()`, payload prefix `souk-register-llm`), and opens
-`/ws/kyok` with the same four-frame mutual challenge-response an agent
-provider uses. The caller then opts a run in by naming the offering —
-`run_metadata()` builds exactly that — instead of minting a session id.
+**This is an LLM provider.** The bridge holds an Ed25519 keypair
+(`funduq_provider_sdk.ProviderIdentity`) and connects to `/ws/kyok` with
+the wire-v4 ticket handshake:
+
+1. `POST /tickets {"publicKey"}` over HTTP — the admission decision —
+   returns a single-use ticket plus funduq's public key.
+2. The bridge signs `provider_connect_payload(funduq_key, ticket, nonce)`
+   *before* connecting, naming the funduq it means to reach.
+3. One `hello` frame carries key, ticket, nonce and proof; funduq answers
+   one `welcome` carrying its counter-signature over
+   `funduq_connect_payload(ticket, nonce)`. The bridge verifies that
+   answer — and any pinned funduq key — before treating the link open
+   (`WrongFunduq` otherwise), so an imposter never receives a completion.
+4. Registration then happens **on the open link**: a `register` frame
+   naming the model offering, answered by `registered`. Nothing is signed
+   past the handshake — the key was proved once, when the link opened.
+   Every reconnect re-registers, because an open link serves exactly what
+   it last published. Withdrawal is a `deleteModel` frame, answered by
+   `deleted`.
+
+The caller then opts a run in by naming the offering — `run_metadata()`
+builds exactly that.
 
 The transport after the handshake is what it always was: one WebSocket,
-completion requests pushed down it, the real LLM's chunks streamed back
-as frames multiplexed by requestId. An answer is only accepted on the
-socket its request was delivered to, so a reconnect starts fresh:
-completions in flight on a dead socket are failed by souk immediately
-rather than retried here.
+completion requests pushed down it (`completionRequest` =
+`funduq_provider_sdk.llm.DeliveredCompletion`, camelCase), the real LLM's
+chunks streamed back as frames multiplexed by requestId. An answer is
+only accepted on the socket its request was delivered to, so a reconnect
+starts fresh: completions in flight on a dead socket are failed by souk
+immediately rather than retried here.
 
 **Experimental**, same status as before: no state survives a crash; if
 this process dies mid-run the run's provider sees errors, with no
@@ -47,25 +61,30 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import litellm
 import websockets
-from pydantic import ValidationError
-from souk_llm_provider_sdk import (
+from funduq_provider_sdk import (
+    WrongFunduq,
+    funduq_connect_payload,
+    new_nonce,
+    verify_signature,
+)
+from funduq_provider_sdk.llm import (
     CompletionHandler,
     CompletionRefused,
     DeliveredCompletion,
     ProviderIdentity,
-    sign_llm_deletion,
-    sign_llm_registration,
 )
-from souk_provider_sdk import new_nonce
+from pydantic import ValidationError
 
 logger = logging.getLogger("souk_client_sdk.kyok_bridge")
 
 WELCOME_TIMEOUT_SECONDS = 10.0
 
-# The frame choreography matches souk_server/handshake.py; the bytes
-# signed are souk_provider_sdk's link-open family (`sign_connect`), so
-# this package no longer restates any payload. v2 is that migration.
-HANDSHAKE_VERSION = 2
+# The frame choreography matches souk_server's handshake; the bytes
+# signed are funduq-contract's link-open family (provider_connect_payload
+# / funduq_connect_payload), so this package restates no payload. v4 is
+# the ticket handshake: the proof is computed before connecting, from the
+# ticket and funduq key learned over HTTP.
+HANDSHAKE_VERSION = 4
 
 
 class KyokBridge:
@@ -79,14 +98,21 @@ class KyokBridge:
             ...
     ```
 
-    (`register()` + `serve_forever()` remain callable separately for a
-    long-lived bridge that outlives any single run.)
+    (`serve_forever()` remains callable separately for a long-lived bridge
+    that outlives any single run; registration is part of every connection
+    it opens, not a separate step.)
 
     `offering` is the model name callers address —
     `(identity.public_key, offering)` is the offering exactly as
     `(provider_key, name)` is an agent. `model`/`api_key`/`api_base` are
     what this bridge actually calls with, litellm-side, and souk never
     sees them.
+
+    `funduq_public_key` pins the funduq this bridge will serve: the key
+    `POST /tickets` returns must match it, and the welcome's answer must
+    verify under it, else `WrongFunduq`. Unpinned, the bridge trusts the
+    key it learned over TLS at ticket time — the proof binds that key
+    into the handshake, and the answer proves possession of it.
     """
 
     def __init__(
@@ -98,6 +124,7 @@ class KyokBridge:
         api_base: str | None = None,
         offering: str = "kyok",
         identity: ProviderIdentity | None = None,
+        funduq_public_key: str | None = None,
         reconnect_delay: float = 2.0,
         handler: CompletionHandler | None = None,
     ) -> None:
@@ -111,24 +138,29 @@ class KyokBridge:
         # provider_key across restarts. Remembered which, because it
         # decides cleanup: an ephemeral key can never come back, so the
         # offering registered under it is roster garbage the moment this
-        # process exits — `serving()` deletes it on the way out. A
-        # persisted identity keeps its registration, same as an agent
-        # provider between connections.
+        # process exits — `serving()` withdraws it (deleteModel) on the
+        # way out, while the socket is still up. A persisted identity
+        # keeps its registration, same as an agent provider between
+        # connections.
         self._ephemeral = identity is None
         self.identity = identity or ProviderIdentity.generate()
+        self.funduq_public_key = funduq_public_key
         self.reconnect_delay = reconnect_delay
         # The interposition point the library guarantees (see the
-        # souk-llm-provider-sdk README and AgentSouk#26's resolution):
-        # every completion passes through this before any money moves.
-        # None means the default litellm call with this bridge's own key;
-        # a caller enforcing policy — a spend ceiling, a model allow-list,
-        # refusing a delegation chain it doesn't recognise — wraps or
-        # replaces it, and may raise `CompletionRefused` to answer with a
-        # structured refusal that reaches the calling agent intact.
+        # funduq-provider-sdk README): every completion passes through
+        # this before any money moves. None means the default litellm call
+        # with this bridge's own key; a caller enforcing policy — a spend
+        # ceiling, a model allow-list, refusing an actor chain it doesn't
+        # recognise — wraps or replaces it, and may raise
+        # `CompletionRefused` to answer with a structured refusal that
+        # reaches the calling agent intact.
         self.handler = handler
-        # Set while a connection is attached (welcome received), cleared
-        # when it drops. `serving()` waits on it; polling code may read it.
+        # Set while a connection is attached and registered (souk's
+        # `registered` received), cleared when it drops. `serving()` waits
+        # on it; polling code may read it.
         self.attached = asyncio.Event()
+        self._outbound: asyncio.Queue | None = None
+        self._deleted = asyncio.Event()
 
     @property
     def _ws_url(self) -> str:
@@ -136,65 +168,35 @@ class KyokBridge:
         ws_scheme = "wss" if scheme == "https" else "ws"
         return urlunsplit((ws_scheme, netloc, path.rstrip("/") + "/ws/kyok", "", ""))
 
-    async def register(self) -> None:
-        """Register this bridge's offering with souk, signed by its own
-        key — the prerequisite the socket's attach enforces. Idempotent
-        (the upsert refreshes the record), and `serve_forever` re-runs it
-        before every connection, so a souk whose database was reset gets
-        the registration back on the next reconnect instead of refusing
-        the attach forever — the same self-healing the agent SDK has
-        always had (AgentSoukServer#16)."""
-        signature, timestamp = sign_llm_registration(self.identity, [self.offering])
+    async def _fetch_ticket(self) -> tuple[str, str]:
+        """One `POST /tickets` — the out-of-band half of the handshake.
+
+        Returns (ticket, funduq_public_key). The ticket is single-use and
+        short-lived, so this runs immediately before every connect. The
+        returned key is what the proof will name; a pinned key that does
+        not match it is refused here, before any socket exists.
+        """
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{self.souk_http_url}/llm-providers/register",
-                json={
-                    "models": [self.offering],
-                    "public_key": self.identity.public_key,
-                    "signature": signature,
-                    "timestamp": timestamp,
-                },
+                f"{self.souk_http_url}/tickets",
+                json={"publicKey": self.identity.public_key},
             )
             resp.raise_for_status()
-
-    async def deregister(self) -> None:
-        """Delete this bridge's offering from souk's roster, signed by its
-        own key — `register()`'s mirror (payload prefix `souk-delete-llm`).
-
-        Best-effort by design: souk refuses (409) while the offering is
-        attached or a run is still bound to it, and a bridge tearing down
-        has nothing useful to do about either — so refusals and transport
-        failures are logged, not raised. A stale row's only cost is roster
-        noise; crashing a clean shutdown over it would cost more.
-        """
-        signature, timestamp = sign_llm_deletion(self.identity, self.offering)
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.request(
-                    "DELETE",
-                    f"{self.souk_http_url}/llm-providers",
-                    json={
-                        "name": self.offering,
-                        "public_key": self.identity.public_key,
-                        "signature": signature,
-                        "timestamp": timestamp,
-                    },
-                )
-            if resp.status_code not in (204, 404):
-                logger.warning(
-                    "kyok bridge could not deregister %r: %s %s",
-                    self.offering,
-                    resp.status_code,
-                    resp.text,
-                )
-        except Exception:
-            logger.warning("kyok bridge could not deregister %r", self.offering, exc_info=True)
+            data = resp.json()
+        funduq_key = data["funduqPublicKey"]
+        if self.funduq_public_key is not None and funduq_key != self.funduq_public_key:
+            raise WrongFunduq(
+                f"ticket endpoint presented funduq key {funduq_key}, "
+                f"but this bridge pinned {self.funduq_public_key}"
+            )
+        return data["ticket"], funduq_key
 
     def run_metadata(self, context: Any = None) -> dict[str, Any]:
         """The `metadata` a caller passes to opt a run into this bridge:
         names the offering, and carries `context` — opaque to souk,
         stripped before anything persists, delivered back to this bridge
-        on every completion the run (and its delegation tree) makes."""
+        on every completion the run makes (a delegated run carries only
+        what *its* caller submitted; bindings do not propagate)."""
         kyok: dict[str, Any] = {
             "llmProvider": {
                 "providerKey": self.identity.public_key,
@@ -205,18 +207,50 @@ class KyokBridge:
             kyok["context"] = context
         return {"kyok": kyok}
 
+    async def deregister(self) -> None:
+        """Withdraw this bridge's offering: a `deleteModel` frame on the
+        open link, awaiting souk's `deleted`. Registration is unsigned on
+        the wire now — the link authenticates — so withdrawal needs the
+        link, and there is nothing to send when none is open.
+
+        Best-effort by design: souk answers an `error` frame instead of
+        `deleted` while a run is still bound to the offering, and a bridge
+        tearing down has nothing useful to do about that — so refusals,
+        timeouts and a missing link are logged, not raised. A stale row's
+        only cost is roster noise; crashing a clean shutdown over it would
+        cost more.
+        """
+        outbound = self._outbound
+        if outbound is None or not self.attached.is_set():
+            logger.warning(
+                "kyok bridge has no open link to withdraw %r on; leaving the registration",
+                self.offering,
+            )
+            return
+        self._deleted.clear()
+        outbound.put_nowait({"type": "deleteModel", "name": self.offering})
+        try:
+            async with asyncio.timeout(WELCOME_TIMEOUT_SECONDS):
+                await self._deleted.wait()
+        except TimeoutError:
+            logger.warning(
+                "kyok bridge: no 'deleted' confirmation for %r; leaving the registration",
+                self.offering,
+            )
+
     async def serve_forever(self) -> None:
         """Holds the `/ws/kyok` socket and serves every completion souk
         pushes down it — through `handler` if one was given, else calling
         the real LLM via litellm with this bridge's own api_key — and
-        streams the response back as frames. Registers before every
-        connection and reconnects on a drop. Runs until cancelled;
-        `serving()` below wraps the whole lifecycle when the bridge lives
-        alongside the run it serves.
+        streams the response back as frames. Every connection fetches a
+        fresh ticket, walks the handshake and re-registers the offering
+        (an open link serves exactly what it last published, so a
+        reconnect that skipped this would serve nothing), and reconnects
+        on a drop. Runs until cancelled; `serving()` below wraps the whole
+        lifecycle when the bridge lives alongside the run it serves.
         """
         while True:
             try:
-                await self.register()
                 await self._serve_connection()
             except asyncio.CancelledError:
                 raise
@@ -228,7 +262,7 @@ class KyokBridge:
 
     @contextlib.asynccontextmanager
     async def serving(self):
-        """The whole lifecycle as one block: registered, attached, torn
+        """The whole lifecycle as one block: attached, registered, torn
         down — so \"run a KYOK-backed run\" stops being four manual steps
         with three ways to sequence them wrong.
 
@@ -239,11 +273,13 @@ class KyokBridge:
                 ...
         ```
 
-        Yields once the first attach is confirmed (souk's welcome), so a
-        run started inside the block can't race the socket and eat a 503
-        on its first completion. On exit the serve task is cancelled and
-        awaited; completions still in flight die with it, which is the
-        crash-behavior this bridge has always documented.
+        Yields once the first attach is confirmed and the offering is
+        registered (souk's `registered`), so a run started inside the
+        block can't race the roster and fail its kyok binding. On exit an
+        ephemeral identity's offering is withdrawn over the still-open
+        link, then the serve task is cancelled and awaited; completions
+        still in flight die with it, which is the crash-behavior this
+        bridge has always documented.
         """
         task = asyncio.create_task(self.serve_forever())
         try:
@@ -258,16 +294,22 @@ class KyokBridge:
                 raise RuntimeError("kyok bridge failed before attaching") from task.exception()
             yield self
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            # After the socket is down, so the attach no longer blocks the
-            # delete. Only for an identity this bridge minted itself — a
+            # Before the socket goes down — withdrawal travels on the
+            # link now. Only for an identity this bridge minted itself; a
             # persisted one keeps its registration between runs.
             if self._ephemeral:
                 await self.deregister()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
-    async def _handshake(self, ws) -> None:
+    async def _handshake(self, ws, ticket: str, funduq_key: str) -> None:
+        """Two frames: hello out, welcome back — the proof was computable
+        before connecting, because `POST /tickets` already named funduq's
+        key. The welcome's `answer` is funduq's signature over
+        `funduq_connect_payload(ticket, nonce)` (role-tagged, so neither
+        side's proof reflects as the other's); it is verified before this
+        returns, so nothing is ever produced for an imposter."""
         nonce = new_nonce()
         await ws.send(
             json.dumps(
@@ -275,38 +317,47 @@ class KyokBridge:
                     "type": "hello",
                     "version": HANDSHAKE_VERSION,
                     "publicKey": self.identity.public_key,
-                    "modelNames": [self.offering],
+                    "ticket": ticket,
                     "nonce": nonce,
-                }
-            )
-        )
-        challenge = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
-        if challenge.get("type") != "challenge":
-            raise RuntimeError(f"expected challenge, got {challenge!r}")
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "proof",
-                    # The SDK's statement of the link-open proof — no local
-                    # payload, no hello digest.
-                    "signature": self.identity.sign_connect(
-                        challenge["nonce"], nonce, [self.offering]
-                    ),
+                    "proof": self.identity.sign_connect(funduq_key, ticket, nonce),
                 }
             )
         )
         welcome = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
         if welcome.get("type") != "welcome":
             raise RuntimeError(f"expected welcome, got {welcome!r}")
+        answer = welcome.get("answer")
+        if not isinstance(answer, str) or not verify_signature(
+            funduq_key, answer, funduq_connect_payload(ticket, nonce)
+        ):
+            raise WrongFunduq(
+                "the funduq answering this link-open did not prove the key "
+                "it presented at ticket time"
+            )
+
+    async def _register_on_link(self, ws) -> None:
+        """Publish the offering on the open link and await souk's echo.
+        Unsigned — the handshake already proved the key — and answered
+        before anything else flows: an unregistered link serves nothing,
+        so no completionRequest can precede the `registered`."""
+        await ws.send(json.dumps({"type": "register", "models": [self.offering]}))
+        reply = json.loads(await asyncio.wait_for(ws.recv(), WELCOME_TIMEOUT_SECONDS))
+        if reply.get("type") == "error":
+            raise RuntimeError(f"souk refused the registration: {reply.get('message')!r}")
+        if reply.get("type") != "registered" or self.offering not in reply.get("names", []):
+            raise RuntimeError(f"expected registered [{self.offering!r}], got {reply!r}")
 
     async def _serve_connection(self) -> None:
+        ticket, funduq_key = await self._fetch_ticket()
         async with websockets.connect(self._ws_url) as ws:
-            await self._handshake(ws)
-            self.attached.set()
+            await self._handshake(ws, ticket, funduq_key)
+            await self._register_on_link(ws)
 
             # Single writer: concurrent completions queue frames here
             # rather than interleaving sends on the socket directly.
             outbound: asyncio.Queue = asyncio.Queue()
+            self._outbound = outbound
+            self.attached.set()
             writer = asyncio.create_task(self._write_loop(ws, outbound))
             in_flight: set[asyncio.Task] = set()
             try:
@@ -319,12 +370,15 @@ class KyokBridge:
                         )
                         in_flight.add(task)
                         task.add_done_callback(in_flight.discard)
+                    elif kind == "deleted":
+                        self._deleted.set()
                     elif kind == "error":
                         logger.warning("souk rejected a frame: %s", frame)
                     else:
                         logger.warning("unexpected frame from souk, ignoring: %s", frame)
             finally:
                 self.attached.clear()
+                self._outbound = None
                 writer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await writer
@@ -347,8 +401,9 @@ class KyokBridge:
         handler puts its structured payload on the error frame, and souk
         relays it to the calling agent intact."""
         # The frame is the declared envelope (`DeliveredCompletion.
-        # model_dump(by_alias=True)` on souk's side) plus type/requestId;
-        # rebuilding is one validate, not a field mapping.
+        # model_dump(by_alias=True)` on souk's side, actorChain included)
+        # plus type/requestId; rebuilding is one validate, not a field
+        # mapping.
         try:
             delivered = DeliveredCompletion.model_validate(frame)
         except ValidationError as e:

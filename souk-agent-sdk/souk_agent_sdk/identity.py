@@ -1,35 +1,27 @@
 """A provider's identity to any souk it connects to is its Ed25519
-keypair — not an account souk issues, see souk/identity.py on the server
-side. Generated once and persisted to disk so restarting this process
-still owns the same agent_ids (a fresh key is a fresh, unrelated identity —
-souk lets it register under the same `name`s without complaint, since names
-aren't exclusive, but it gets *new* agent_ids with no connection to the old
-ones; anything still pointed at the old agent_ids, e.g. another provider's
-sub-agent delegation config, keeps talking to the orphaned identity, not
-this one).
+keypair — not an account souk issues. Generated once and persisted to
+disk so restarting this process is still the same identity: a fresh key
+is a fresh, unrelated provider, and everything addressed to the old one
+(a pinned delegation target, a thread's bound authority) keeps pointing
+at the orphaned identity, not this one. Treat the key file like any
+other credential — back it up, don't commit it.
 
-Losing this file means losing the ability to update those agent
-registrations under their original agent_ids — there's no recovery flow in
-this minimal version, so treat it like any other credential (back it up,
-don't commit it).
+The byte-level truths — what a signature covers, what a chain hop is —
+live upstream in `funduq-contract` now, and this module only re-shapes
+them under the names this repo's providers already import. The helpers
+here work on a raw `cryptography` private key; `funduq_provider_sdk.
+ProviderIdentity` wraps the same operations for code that wants the
+object form (and `SoukProvider` holds one of those).
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
-import time
 from pathlib import Path
+from typing import Any
 
-import jwt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-# Deliberately more generous than SIGNATURE_FRESHNESS_WINDOW_SECONDS
-# used elsewhere (60s) — an actor chain is typically built once at the
-# start of a run and only actually used if/when the agent decides to
-# call a tool that delegates further, which can be well after an LLM's
-# own thinking time, not immediately.
-ACTOR_CHAIN_TTL_SECONDS = 300
+from funduq_contract import extend_chain, new_chain, sign_hop  # noqa: F401 (sign_hop re-exported)
 
 
 def load_or_create_identity(path: str | Path) -> Ed25519PrivateKey:
@@ -52,55 +44,29 @@ def sign(private_key: Ed25519PrivateKey, payload: bytes) -> str:
     return private_key.sign(payload).hex()
 
 
-def registration_signing_payload(agent_names: list[str], timestamp: int) -> bytes:
-    # Must match souk.identity.registration_signing_payload exactly —
-    # souk verifies this signature against the same canonical string.
-    # `timestamp` (unix seconds) must be current — souk rejects anything
-    # outside its freshness window, so a captured signed request can't be
-    # replayed indefinitely (see souk.identity.SIGNATURE_FRESHNESS_WINDOW_SECONDS).
-    # The identity is not in here: the signature is verified against the
-    # public key sent alongside, which is what ties this request to it.
-    return f"{','.join(sorted(agent_names))}:{timestamp}".encode()
+def new_actor_chain(private_key: Ed25519PrivateKey, subject: dict[str, Any] | None = None) -> list[str]:
+    """Starts a fresh actor chain — one hop, whose signer is the head.
 
-
-def _sign_hop(private_key: Ed25519PrivateKey, subject: dict, prev_token: str | None) -> str:
-    now = int(time.time())
-    payload = {
-        "subject": subject,
-        "actorPublicKey": public_key_hex(private_key),
-        "prevHash": hashlib.sha256(prev_token.encode()).hexdigest() if prev_token is not None else None,
-        "iat": now,
-        "exp": now + ACTOR_CHAIN_TTL_SECONDS,
-    }
-    return jwt.encode(payload, private_key, algorithm="EdDSA")
-
-
-def new_actor_chain(private_key: Ed25519PrivateKey, subject: dict) -> list[str]:
-    """Starts a fresh identity chain — see souk.identity.verify_actor_chain
-    for how souk verifies it and why it's a chain, not a single signature.
-
-    `subject` is who this chain is fundamentally about. For a provider
-    calling another agent on its own behalf (e.g.
-    pydantic_ai_agent.sub_agent_tool), that's just itself:
-    `{"type": "agent", "publicKey": public_key_hex(private_key)}`. An
-    "agency" agent that authenticated a human user by its own means (SSO,
-    an internal login, ...) and now wants to make calls on that user's
-    behalf would instead pass e.g.
-    `{"type": "user", "id": "employee_x"}` — souk doesn't verify that
-    claim itself (it has no way to), it only verifies that whoever signs
-    each hop of the chain really holds the key it claims to.
+    Delegates to `funduq_contract.new_chain`, which is the statement of
+    what a hop is (`{actorPublicKey, prevHash}`, and nothing else — no
+    subject, no timestamps: contract revision 1 removed time from hops,
+    and the chain now carries keys only). `subject` is accepted for
+    callers written against the old shape and deliberately ignored: whom
+    a key represents is a separate, opt-in disclosure upstream (a
+    voucher), never a hop field, so there is nowhere honest to put it.
     """
-    return [_sign_hop(private_key, subject, None)]
+    return new_chain(private_key)
 
 
 def extend_actor_chain(private_key: Ed25519PrivateKey, prev_chain: list[str]) -> list[str]:
     """Adds one more hop to a chain this provider *received* as a caller
     (e.g. forwarded to it via A2A/AG-UI metadata) and is now relaying
-    onward — the chain's `subject` (see souk.identity.verify_actor_chain)
-    is read from the last hop as-is, unverified locally; souk is the one
-    that actually checks the whole chain's integrity when this is used.
+    onward. The chain's integrity is souk's to check when it is used;
+    this side only signs its own hop over the predecessor's hash —
+    `funduq_contract.extend_chain`, verbatim.
     """
     if not prev_chain:
-        raise ValueError("extend_actor_chain requires a non-empty prev_chain — use new_actor_chain to originate one")
-    subject = jwt.decode(prev_chain[-1], options={"verify_signature": False})["subject"]
-    return [*prev_chain, _sign_hop(private_key, subject, prev_chain[-1])]
+        raise ValueError(
+            "extend_actor_chain requires a non-empty prev_chain — use new_actor_chain to originate one"
+        )
+    return extend_chain(private_key, prev_chain)

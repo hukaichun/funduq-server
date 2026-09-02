@@ -551,6 +551,39 @@ wheels = [
 ]
 
 [[package]]
+name = "funduq-contract"
+version = "0.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/64/f405ba27076cf6300e7d51b7bcfd2f5599bb2458d395dbb2d8f3bd79eeeb/funduq_contract-0.0.4.tar.gz", hash = "sha256:666f02d4cdce3a654c58a59d72e5a62b20821738206b890f0a7fbce26424599c", size = 33175, upload-time = "2026-08-26T12:29:23.006Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/43/d01a87fa33abfdb699ad983d9c0161d10f5d49702491f3b3eac4b74dd7cd/funduq_contract-0.0.4-py3-none-any.whl", hash = "sha256:b7a743200864bd0f7fc94312817a7821325a18040448fbcd3129e001b2e7c358", size = 16786, upload-time = "2026-08-26T12:29:21.983Z" },
+]
+
+[[package]]
+name = "funduq-provider-sdk"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ag-ui-protocol" },
+    { name = "cryptography" },
+    { name = "funduq-contract" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/6b/a2dd913c2541e0af879e076034d11086d89ce1a88a884c7239e8379ba56c/funduq_provider_sdk-0.0.2.tar.gz", hash = "sha256:0fac0a51f232c45e58fccd2ff173f3dd8d394bffff1c4544e4f953491b781042", size = 59532, upload-time = "2026-08-26T12:29:52.789Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/87/ee/89acacc3b849fc63bf92d0dcc016643769a3b2d0a0d70ff831d22d121039/funduq_provider_sdk-0.0.2-py3-none-any.whl", hash = "sha256:a42fa9c69d6a4951b82d284475404606013bd950369a07635325b9a2d0bdfa18", size = 25970, upload-time = "2026-08-26T12:29:51.624Z" },
+]
+
+[package.optional-dependencies]
+llm = [
+    { name = "openai" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1534,12 +1567,11 @@ name = "souk-client-sdk"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "funduq-provider-sdk", extra = ["llm"] },
     { name = "httpx" },
     { name = "httpx-sse" },
     { name = "litellm" },
     { name = "pydantic" },
-    { name = "souk-llm-provider-sdk" },
-    { name = "souk-provider-sdk" },
     { name = "websockets" },
 ]
 
@@ -1551,62 +1583,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "funduq-provider-sdk", extras = ["llm"], specifier = ">=0.0.2,<0.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx-sse", specifier = ">=0.4" },
     { name = "litellm", specifier = ">=1.95" },
     { name = "pydantic", specifier = ">=2.9" },
-    { name = "souk-llm-provider-sdk", editable = "../AgentSouk/souk-llm-provider-sdk" },
-    { name = "souk-provider-sdk", editable = "../AgentSouk/souk-provider-sdk" },
     { name = "websockets", specifier = ">=13" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8.3" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-]
-
-[[package]]
-name = "souk-llm-provider-sdk"
-version = "0.1.0"
-source = { editable = "../AgentSouk/souk-llm-provider-sdk" }
-dependencies = [
-    { name = "openai" },
-    { name = "souk-provider-sdk" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "openai", specifier = ">=1.50" },
-    { name = "souk-provider-sdk", editable = "../AgentSouk/souk-provider-sdk" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-]
-
-[[package]]
-name = "souk-provider-sdk"
-version = "0.1.0"
-source = { editable = "../AgentSouk/souk-provider-sdk" }
-dependencies = [
-    { name = "ag-ui-protocol" },
-    { name = "cryptography" },
-    { name = "pyjwt", extra = ["crypto"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ag-ui-protocol", specifier = ">=0.1.19" },
-    { name = "cryptography", specifier = ">=42.0" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]
 

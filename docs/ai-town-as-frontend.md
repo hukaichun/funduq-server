@@ -3,7 +3,8 @@
 Status: **evaluation, nothing implemented.** Recorded so the reasoning —
 and the measurements behind it — survive the session that produced it.
 
-Copied from upstream AgentSouk, where it was written before the repo split
+Copied from upstream (now [hukaichun/funduq](https://github.com/hukaichun/funduq),
+then the AgentSouk repo), where it was written before the repo split
 and before gRPC was removed, then updated against this repo at `fdcd1ed`.
 What changed from the upstream text: the provider transport is now
 `WS /ws/provider`, not gRPC (`server-mode.md`); the stall model has since
@@ -466,7 +467,7 @@ The frontend framing needs neither, which is why it is the cheap one.
   docent is a provider, so the town just talks to it
 - delete: `convex/agent/`, and `Agent.tick`'s decision loop
 
-**souk (upstream AgentSouk — core only since the split)**
+**souk (upstream funduq — core only since the split)**
 
 - select `agents.c.metadata` in `repo.list_agents`; add the field to
   `AgentSummary`

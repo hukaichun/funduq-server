@@ -18,7 +18,7 @@ All that happens here is a status code.
 
 from fastapi import APIRouter, Depends, Response
 
-from souk.core import Souk
+from funduq.core import Funduq
 from souk_server.deps import get_souk
 from souk_server.models import HealthResponse, LivenessResponse
 
@@ -34,13 +34,18 @@ async def liveness() -> LivenessResponse:
 
 
 @router.get("/readyz")
-async def readiness(response: Response, souk: Souk = Depends(get_souk)) -> HealthResponse:
-    """503 when souk cannot serve, so a load balancer stops sending traffic
-    rather than sending it into failures. The body says why in every case,
-    including the healthy one — a probe that only prints "unhealthy" makes
-    somebody go and find out.
+async def readiness(response: Response, funduq: Funduq = Depends(get_souk)) -> HealthResponse:
+    """503 when funduq cannot serve, so a load balancer stops sending
+    traffic rather than sending it into failures. The body says why in
+    every case, including the healthy one — a probe that only prints
+    "unhealthy" makes somebody go and find out.
+
+    Ready means the database answers, `schema_current` (the migration
+    this code was built against) holds, and the dispatch loop is turning
+    — `Health.ready` is core's own conjunction of the three. The health
+    sweeps (and their `background_running` fact) no longer exist.
     """
-    health = await souk.health()
+    health = await funduq.health()
     if not health.ready:
         response.status_code = 503
     return HealthResponse(
@@ -49,5 +54,5 @@ async def readiness(response: Response, souk: Souk = Depends(get_souk)) -> Healt
         database_error=health.database_error,
         schema_revision=health.schema_revision,
         expected_schema_revision=health.expected_schema_revision,
-        background_running=health.background_running,
+        dispatching=health.dispatching,
     )

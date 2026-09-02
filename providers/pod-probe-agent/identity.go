@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 )
 
 // Identity is the keypair this provider *is*: it holds the private half, so
@@ -59,12 +58,6 @@ func newNonce() string {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-func sortedCopy(names []string) []string {
-	out := append([]string(nil), names...)
-	sort.Strings(out)
-	return out
 }
 
 func trimSpace(s string) string {

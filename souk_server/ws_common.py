@@ -49,18 +49,11 @@ def parse_frame(message: dict[str, Any]) -> dict[str, Any] | None:
     return frame if isinstance(frame, dict) else None
 
 
-async def receive_hello(websocket: WebSocket) -> tuple[dict[str, Any], str] | None:
+async def receive_hello(websocket: WebSocket) -> dict[str, Any] | None:
     """The handshake's server half, after accept: the first frame, which
-    must be a prompt, well-formed `hello`. Returns `(frame, raw_text)`, or
+    must be a prompt, well-formed `hello`. Returns the parsed frame, or
     None after closing the socket — anything else before hello closes it
     (per docs/server-mode.md), so a caller only ever proceeds or returns.
-
-    The raw text comes back beside the parsed frame because `/ws/provider`
-    signs a digest of it. Re-serializing the parsed dict would not do:
-    key order, separators and unicode escaping are all free choices, so
-    two JSON encoders agreeing on the *value* can disagree on the bytes,
-    and the signature would fail for reasons neither side could see. What
-    was sent is the only thing both sides can hash.
     """
     try:
         message = await asyncio.wait_for(websocket.receive(), timeout=HELLO_TIMEOUT_SECONDS)
@@ -73,23 +66,7 @@ async def receive_hello(websocket: WebSocket) -> tuple[dict[str, Any], str] | No
     if hello is None or hello.get("type") != "hello":
         await websocket.close(code=POLICY_VIOLATION, reason="first frame must be hello")
         return None
-    return hello, message["text"]
-
-
-async def receive_frame(websocket: WebSocket, timeout: float = HELLO_TIMEOUT_SECONDS):
-    """One more frame during a handshake, with the same deadline.
-
-    Returns the parsed frame, or None if the socket closed or sent
-    something unparseable — the caller decides what a missing frame means,
-    because mid-handshake that differs by which frame was expected.
-    """
-    try:
-        message = await asyncio.wait_for(websocket.receive(), timeout=timeout)
-    except asyncio.TimeoutError:
-        return None
-    if message["type"] == "websocket.disconnect":
-        return None
-    return parse_frame(message)
+    return hello
 
 
 async def write_loop(websocket: WebSocket, outbound: asyncio.Queue) -> None:
