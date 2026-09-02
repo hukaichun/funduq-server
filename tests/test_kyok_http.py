@@ -276,7 +276,7 @@ async def test_a_run_with_no_kyok_binding_503s(client, souk, serve):
     served, run_id = await _live_run(souk, serve, "greeter")
     try:
         token = _token(run_id, served.ref())
-        body = json.dumps({"messages": []}).encode()
+        body = json.dumps({"model": "kyok", "messages": []}).encode()
         headers = {**_kyok_headers(token, served.identity._key, body), "content-type": "application/json"}
         resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
         assert resp.status_code == 503
@@ -298,9 +298,71 @@ async def test_a_binding_to_an_unattached_offering_503s(client, souk, serve):
     )
     try:
         token = _token(run_id, served.ref())
-        body = json.dumps({"messages": []}).encode()
+        body = json.dumps({"model": "kyok", "messages": []}).encode()
         headers = {**_kyok_headers(token, served.identity._key, body), "content-type": "application/json"}
         resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
         assert resp.status_code == 503
+    finally:
+        souk.broker.forget(run_id)
+
+
+async def test_a_body_that_is_not_a_chat_completion_request_is_a_400(
+    client, souk, serve, monkeypatch
+):
+    """New at contract revision 11, and it fails *late* on purpose.
+
+    A completion body is validated as OpenAI's own request shape now
+    (`funduq_contract.CompletionBody`, extension keys allowed through
+    verbatim) instead of being relayed as whatever JSON arrived — so a
+    body missing `model`, which every real OpenAI client sends, is a 400
+    with core's own words rather than a puzzling refusal from the far side
+    of somebody else's socket.
+
+    Bound *and* attached is what makes this a statement about the body:
+    the validation sits after both are resolved, so a run with no binding
+    (or a binding to nothing attached) answers 503 first and a test that
+    skipped either would pass without ever reaching the check it names.
+    Hence the stub link — nothing here is testing the socket.
+    """
+    from funduq.kyok import KyokBinding
+    from funduq.models import LlmRef
+
+    class _Attached:
+        public_key = "aa" * 32
+
+        def complete(self, request):  # pragma: no cover - never reached
+            raise AssertionError("a refused body must never reach the link")
+
+    served, run_id = await _live_run(souk, serve, "greeter")
+    offering = LlmRef(provider_key="aa" * 32, name="gpt-nowhere")
+    souk.kyok_relay.bind_run(run_id, KyokBinding(llm_provider=offering))
+    monkeypatch.setattr(
+        type(souk.kyok_relay), "serving", lambda self, ref: _Attached()
+    )
+    try:
+        token = _token(run_id, served.ref())
+
+        # No `model`: valid JSON, plausible-looking, not a chat-completion
+        # request.
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        headers = {
+            **_kyok_headers(token, served.identity._key, body),
+            "content-type": "application/json",
+        }
+        resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
+
+        assert resp.status_code == 400, resp.text
+        assert "chat-completion request" in resp.json()["detail"]
+
+        # Not valid JSON at all is the older, adjacent 400 — same status,
+        # different sentence, and both must reach the caller as words.
+        body = b"{not json"
+        headers = {
+            **_kyok_headers(token, served.identity._key, body),
+            "content-type": "application/json",
+        }
+        resp = await client.post("/kyok/v1/chat/completions", content=body, headers=headers)
+        assert resp.status_code == 400
+        assert "valid JSON" in resp.json()["detail"]
     finally:
         souk.broker.forget(run_id)

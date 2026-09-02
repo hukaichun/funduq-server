@@ -30,15 +30,24 @@ license-files = ["LICENSE"]
 # revision inside the 0.0.x line; docs/contract-changelog.md upstream is
 # the record to read before widening these.
 dependencies = [
-    "funduq>=0.0.4,<0.1",
+    "funduq>=0.0.6,<0.1",
+    # The AG-UI wire model both ends of every run frame validate against.
+    # Pinned with a floor here, and not left to whatever each subproject's
+    # lock happened to resolve: `funduq-contract` floors it at >=0.1, and
+    # 0.1.22 made `RunAgentInput.state` optional-and-omitted-when-unset
+    # while 0.1.19 still requires it — so a gateway on one and a provider
+    # on the other disagree about a frame neither contract revision nor
+    # any test in one process can catch. It cost a full stack run to find
+    # (funduq#243).
+    "ag-ui-protocol>=0.1.22",
     # Upstream states the provider contract itself — identity, the
     # ports, and the provider's own loop, with no transport in it. This
     # gateway builds the socket around exactly that contract. The KYOK
     # side is the same package's `llm` extra (`funduq_provider_sdk.llm`).
-    "funduq-provider-sdk[llm]>=0.0.2,<0.1",
+    "funduq-provider-sdk[llm]>=0.0.7,<0.1",
     # The signing vocabulary both ends verify: connect payloads, actor
     # chains, CONTRACT_REVISION.
-    "funduq-contract>=0.0.4,<0.1",
+    "funduq-contract>=0.0.9,<0.1",
     "fastapi>=0.115",
     # ServingSettings reads SOUK_* from the environment; funduq's own
     # CoreSettings stopped being a settings model, so nothing upstream

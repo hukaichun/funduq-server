@@ -41,11 +41,8 @@ from openai.types.chat import ChatCompletionChunk
 
 from funduq.errors import FunduqError, InvalidRegistration
 from funduq.ids import new_id
-from funduq_provider_sdk.llm import (
-    CONNECTED_LLM_PROVIDER_ATTRS,
-    CompletionRefused,
-    DeliveredCompletion,
-)
+from funduq_contract import DeliveredCompletion
+from funduq_provider_sdk.llm import CompletionRefused
 from souk_server.handshake import WIRE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
@@ -56,7 +53,6 @@ from souk_server.ws_common import (
 
 if TYPE_CHECKING:
     from funduq.core import Funduq
-    from funduq.kyok import CompletionRequest
 
 logger = logging.getLogger("souk.ws_kyok")
 
@@ -81,10 +77,12 @@ class SocketLLMProvider:
     """`funduq.kyok.ConnectedLLMProvider` with a WebSocket underneath.
 
     Duck-typed against core's protocol, like `SocketProvider` beside it,
-    and asserted against upstream's `CONNECTED_LLM_PROVIDER_ATTRS` in the
-    constructor for the same reason: an attribute core expects but this
-    forgets would attach fine and fail inside the relay, three layers
-    from the cause.
+    and asserted against `_PROTOCOL_SURFACE` in the constructor for the
+    same reason: an attribute core expects but this forgets would attach
+    fine and fail inside the relay, three layers from the cause. Upstream
+    withdrew the `CONNECTED_LLM_PROVIDER_ATTRS` list this used to read at
+    revision 11 — the models are the single definition now — but the
+    failure mode it guarded is unchanged, so the surface is named here.
 
     Like `SocketProvider`, deliberately exposes no `sign_connect` — the
     key lives on the far side of the socket, and the ticket, nonce and
@@ -95,9 +93,14 @@ class SocketLLMProvider:
     binding described in the module docstring.
     """
 
+    # The whole of what core reaches for on this object — `public_key` and
+    # `complete`, with no cancel and no abandon (revision 10 withdrew the
+    # one verb that was ever proposed for a caller that stopped listening).
+    _PROTOCOL_SURFACE = ("public_key", "complete")
+
     def __init__(self, public_key: str, outbound: asyncio.Queue) -> None:
         missing = sorted(
-            a for a in CONNECTED_LLM_PROVIDER_ATTRS if not hasattr(type(self), a)
+            a for a in self._PROTOCOL_SURFACE if not hasattr(type(self), a)
         )
         if missing:
             raise TypeError(
@@ -111,15 +114,21 @@ class SocketLLMProvider:
     def public_key(self) -> str:
         return self._public_key
 
-    def complete(self, request: "CompletionRequest") -> AsyncIterator[ChatCompletionChunk]:
+    def complete(self, request: DeliveredCompletion) -> AsyncIterator[ChatCompletionChunk]:
         """Write `request` to the wire and return the stream of its answer.
 
         The frame goes out here, not in the generator, so the request is
         on the wire the moment core holds the iterator — before anything
-        awaits it. The frame is `{"type", "requestId"}` plus the wire form
-        upstream declares (`DeliveredCompletion.from_request(...).
-        model_dump(by_alias=True)` — `actorChain` included now), so
-        neither end hand-writes the field mapping.
+        awaits it.
+
+        **The request IS the wire shape.** Since contract revision 11 core
+        hands over the published `DeliveredCompletion` itself — its own
+        `CompletionRequest` and the SDK's `from_request` translation are
+        both gone — so this dumps what it was given (`by_alias=True`,
+        `actorChain` included) and there is no mapping either end can get
+        wrong. Its `body` is validated as OpenAI's own request shape on the
+        way in, at the door: a body that is not a chat-completion request
+        is a 400 from `KyokAdapter.complete` and never reaches this socket.
         """
         request_id = new_id("kyokreq")
         queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -128,9 +137,7 @@ class SocketLLMProvider:
             {
                 "type": "completionRequest",
                 "requestId": request_id,
-                **DeliveredCompletion.from_request(request).model_dump(
-                    by_alias=True, mode="json"
-                ),
+                **request.model_dump(by_alias=True, mode="json"),
             }
         )
         return self._answer_stream(request_id, queue)

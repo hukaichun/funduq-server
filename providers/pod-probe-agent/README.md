@@ -134,11 +134,18 @@ go test ./...
 `wire_test.go` replays [`docs/wire-vectors.json`](../../docs/wire-vectors.json)
 (handshake version and frame vocabulary) and
 [`docs/upstream-contract-vectors.json`](../../docs/upstream-contract-vectors.json)
-(upstream funduq's payload vectors, vendored at contract revision 7): it
-asserts the connect proof, the welcome verification and the KYOK call
-payload are **byte-identical** to what the gateway and funduq core verify
-against, and that the deterministic Ed25519 signatures match the published
-ones. A missing vector file **fails** the suite rather than skipping — a
+(upstream funduq's payload vectors, vendored at contract revision 16): it
+asserts every published payload — the connect proof, the welcome
+verification, the KYOK call, and the singular-act family (resolve, cancel,
+view) this binary does not sign but must not drift from — is
+**byte-identical** to what the gateway and funduq core verify against, and
+that the deterministic Ed25519 signatures match the published ones. There
+is no kind the replay skips, and an unrecognised one fails: at revision 15
+the delegation certificate was deleted, and at 16 a resolve proof stopped
+signing the clock and started signing the ask
+(`funduq-resolve:{run_id}:{sha256 of the ask ids, sorted and NUL-joined}`),
+which is exactly the kind of change a skipped vector would have hidden.
+A missing vector file **fails** the suite rather than skipping — a
 checkout without the vectors cannot claim the wire is verified. That proves
 the crypto core without running the stack; the live ordering behaviour
 (register-then-run, reconnect-mid-run) is what the compose run exercises.

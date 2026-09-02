@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ import (
 //   - docs/wire-vectors.json: this repo's frame vocabulary + handshake
 //     version.
 //   - docs/upstream-contract-vectors.json: upstream funduq's payload
-//     vectors, vendored verbatim at contract revision 7.
+//     vectors, vendored verbatim at contract revision 16.
 
 func repoRoot(t *testing.T) string {
 	// providers/pod-probe-agent -> repo root
@@ -100,7 +101,15 @@ func TestHandshakeVersionAndVocabulary(t *testing.T) {
 // signature under the published test key. provider-connect is the proof in
 // the hello frame (the ticket sits in the funduq_nonce seat);
 // funduq-connect is the welcome's answer this side verifies; kyok-call is
-// what a KYOK completion call signs.
+// what a KYOK completion call signs; resolution, cancel and view are the
+// singular-act family, which this binary does not sign today but keeps
+// byte-exact so a reshape upstream is caught here.
+//
+// Every kind published at revision 16 is replayed — there is no longer a
+// vector this file skips. `delegation` is gone from the file entirely
+// (revision 15 deleted the certificate and the funduq-delegate tag with
+// it), and `resolution` changed shape at 16: an ask hash where a
+// timestamp used to be.
 func TestContractVectors(t *testing.T) {
 	data := mustRead(t, "docs", "upstream-contract-vectors.json")
 	var cf struct {
@@ -114,13 +123,15 @@ func TestContractVectors(t *testing.T) {
 		Vectors []struct {
 			Kind   string `json:"kind"`
 			Inputs struct {
-				FunduqPublicKey string `json:"funduq_public_key"`
-				FunduqNonce     string `json:"funduq_nonce"`
-				ProviderNonce   string `json:"provider_nonce"`
-				Bearer          string `json:"bearer"`
-				Timestamp       int64  `json:"timestamp"`
-				BodyUTF8        string `json:"body_utf8"`
-				BodyHashHex     string `json:"body_sha256_hex"`
+				FunduqPublicKey string   `json:"funduq_public_key"`
+				FunduqNonce     string   `json:"funduq_nonce"`
+				ProviderNonce   string   `json:"provider_nonce"`
+				Bearer          string   `json:"bearer"`
+				Timestamp       int64    `json:"timestamp"`
+				BodyUTF8        string   `json:"body_utf8"`
+				BodyHashHex     string   `json:"body_sha256_hex"`
+				RunID           string   `json:"run_id"`
+				AskIDs          []string `json:"ask_ids"`
 			} `json:"inputs"`
 			PayloadUTF8  string `json:"payload_utf8"`
 			SignatureHex string `json:"signature_hex"`
@@ -129,8 +140,8 @@ func TestContractVectors(t *testing.T) {
 	if err := json.Unmarshal(data, &cf); err != nil {
 		t.Fatal(err)
 	}
-	if cf.Contract.Revision != 7 {
-		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 7 — re-read the changelog before bumping", cf.Contract.Revision)
+	if cf.Contract.Revision != 16 {
+		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 16 — re-read the changelog before bumping", cf.Contract.Revision)
 	}
 
 	testKey := ed25519.NewKeyFromSeed(mustHex(t, cf.TestKey.PrivateHex))
@@ -150,9 +161,20 @@ func TestContractVectors(t *testing.T) {
 				t.Errorf("kyok-call body hash:\n  got  %s\n  want %s", got, v.Inputs.BodyHashHex)
 			}
 			payload = kyokCallPayload(v.Inputs.Bearer, v.Inputs.Timestamp, v.Inputs.BodyHashHex)
+		case "resolution":
+			// The published ask ids are deliberately out of order
+			// (["tool_b", "int_1"]), so a builder that forgot to sort
+			// fails this line and not some later integration.
+			if len(v.Inputs.AskIDs) < 2 || sort.StringsAreSorted(v.Inputs.AskIDs) {
+				t.Errorf("resolution vector no longer carries unsorted ask ids (%q) — it can no longer catch a builder that skips the sort", v.Inputs.AskIDs)
+			}
+			payload = resolvePayload(v.Inputs.RunID, v.Inputs.AskIDs)
+		case "cancel":
+			payload = cancelPayload(v.Inputs.RunID, v.Inputs.Timestamp)
+		case "view":
+			payload = viewPayload(v.Inputs.RunID, v.Inputs.Timestamp)
 		default:
-			// Vectors this binary neither produces nor verifies
-			// (delegation, resolution, cancel-by-authority, …).
+			t.Errorf("vendored vectors carry an unknown kind %q — read the changelog and either implement it or say here why this binary ignores it", v.Kind)
 			continue
 		}
 		seen[v.Kind] = true
@@ -168,9 +190,68 @@ func TestContractVectors(t *testing.T) {
 			t.Errorf("%s signature:\n  got  %s\n  want %s", v.Kind, got, v.SignatureHex)
 		}
 	}
-	for _, kind := range []string{"provider-connect", "funduq-connect", "kyok-call"} {
+	for _, kind := range []string{"provider-connect", "funduq-connect", "kyok-call", "resolution", "cancel", "view"} {
 		if !seen[kind] {
 			t.Errorf("vendored vectors carry no %q entry — the file is truncated or the kind was renamed", kind)
+		}
+	}
+	if seen["delegation"] {
+		t.Error("a delegation vector is back — the certificate was deleted at revision 15; do not re-implement it without an entry in the changelog saying it returned")
+	}
+}
+
+// TestResolvePayloadCanonicalization pins the two properties the published
+// vector alone cannot show, because it carries exactly one ask set: order
+// must not matter, and the ask set must be all that does.
+func TestResolvePayloadCanonicalization(t *testing.T) {
+	a := string(resolvePayload("run_1", []string{"tool_b", "int_1"}))
+	b := string(resolvePayload("run_1", []string{"int_1", "tool_b"}))
+	if a != b {
+		t.Errorf("ask id order changed the payload:\n  %s\n  %s", a, b)
+	}
+	// The empty set is legal and hashes the empty byte string — the same
+	// sha256 upstream's builder produces for it.
+	empty := string(resolvePayload("run_1", nil))
+	const emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	if want := "funduq-resolve:run_1:" + emptyHash; empty != want {
+		t.Errorf("empty ask set:\n  got  %s\n  want %s", empty, want)
+	}
+	// NUL-joined, not concatenated: two ids must not collide with one.
+	if string(resolvePayload("run_1", []string{"a", "b"})) == string(resolvePayload("run_1", []string{"ab"})) {
+		t.Error("ask ids are being concatenated without the NUL separator")
+	}
+	// The caller's slice is the caller's: sorting in place would reorder
+	// the ask list the caller still has to send alongside the proof.
+	given := []string{"tool_b", "int_1"}
+	resolvePayload("run_1", given)
+	if given[0] != "tool_b" {
+		t.Errorf("resolvePayload sorted the caller's slice in place: %q", given)
+	}
+}
+
+// TestRegisterDeclaresInterjectionCapability holds the per-agent field souk
+// needs at registration. Core overwrites its stored value from what the
+// link declares, so an omission is not "unknown" — it is a claim, and this
+// probe's claim is false.
+func TestRegisterDeclaresInterjectionCapability(t *testing.T) {
+	records := agentRecords([]string{"pod-probe"})
+	if len(records) != 1 {
+		t.Fatalf("expected one record, got %d", len(records))
+	}
+	value, present := records[0]["takesInterjections"]
+	if !present {
+		t.Fatal("register omits takesInterjections; souk would record this agent's capability from a field that is not there")
+	}
+	if value != false {
+		t.Errorf("takesInterjections = %v; the probe never pauses, so it takes none", value)
+	}
+	// Registration forbids extra keys upstream, so a stray field is a
+	// refused registration rather than an ignored one.
+	for field := range records[0] {
+		switch field {
+		case "name", "description", "agentCardExtra", "metadata", "takesInterjections":
+		default:
+			t.Errorf("register sends %q, which Registration (extra=forbid) would refuse", field)
 		}
 	}
 }

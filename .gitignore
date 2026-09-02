@@ -28,3 +28,8 @@ dev_key.pem
 # souk-directory: compiled output + npm deps, regenerate via `npm run build`.
 souk-directory/node_modules/
 souk-directory/dist/
+
+# pod-probe: `go build ./...` drops the linked binary beside the sources.
+# It is 8MB, it is rebuilt by the Dockerfile's builder stage, and it was
+# committed once by accident.
+providers/pod-probe-agent/podprobe

@@ -20,7 +20,7 @@ dependencies = [
     # Imported directly (KyokForwardedProps in main.py) — declared here
     # rather than leaned on transitively through souk-agent-sdk. No [llm]
     # extra: only the props model is used, never the llm module.
-    "funduq-provider-sdk>=0.0.2,<0.1",
+    "funduq-provider-sdk>=0.0.7,<0.1",
     "pydantic-ai[ag-ui]>=0.0.49",
     "pydantic-settings>=2.6",
     "pyyaml>=6.0",

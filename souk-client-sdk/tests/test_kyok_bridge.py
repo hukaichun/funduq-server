@@ -438,7 +438,10 @@ async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
                     "llmName": "kyok",
                     "context": {"voucher": "v1"},
                     "actorChain": ["ab" * 32],
-                    "body": {"messages": []},
+                    # The body is OpenAI's own request shape now
+                    # (funduq_contract.CompletionBody), so `model` is
+                    # required and unknown keys ride through verbatim.
+                    "body": {"model": "gpt-4", "messages": []},
                 }
             )
             frame = await gateway.next_frame()
@@ -469,8 +472,17 @@ async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch
         _bridge, task = await _connected_bridge(gateway, api_base="http://llm.local")
         try:
             body = {
+                "model": "gpt-4",
                 "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"type": "function"}],
+                # A real OpenAI tool: the body is validated as OpenAI's
+                # own request shape now, so a stub shaped only roughly
+                # like one is a malformed request, not a lenient pass.
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "ping", "parameters": {"type": "object"}},
+                    }
+                ],
                 "temperature": 0.5,
             }
             await gateway.push(
@@ -517,7 +529,7 @@ async def test_an_llm_failure_becomes_one_error_frame(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": []},
+                    "body": {"model": "gpt-4", "messages": []},
                 }
             )
             frame = await gateway.next_frame()
@@ -553,7 +565,7 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": [{"role": "user", "content": "slow"}]},
+                    "body": {"model": "gpt-4", "messages": [{"role": "user", "content": "slow"}]},
                 }
             )
             await gateway.push(
@@ -563,7 +575,7 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": [{"role": "user", "content": "fast"}]},
+                    "body": {"model": "gpt-4", "messages": [{"role": "user", "content": "fast"}]},
                 }
             )
             # The fast one answers while the slow one is still held open.

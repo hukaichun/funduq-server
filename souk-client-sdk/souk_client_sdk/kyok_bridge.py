@@ -403,9 +403,22 @@ class KyokBridge:
         # The frame is the declared envelope (`DeliveredCompletion.
         # model_dump(by_alias=True)` on souk's side, actorChain included)
         # plus type/requestId; rebuilding is one validate, not a field
-        # mapping.
+        # mapping. `funduq.kyok.CompletionRequest` and
+        # `DeliveredCompletion.from_request` are gone (revision 11) —
+        # this model *is* the wire shape, and its `body` is OpenAI's own
+        # request TypedDict with extension keys allowed through verbatim.
+        #
+        # `type` and `requestId` are this transport's own vocabulary, not
+        # the envelope's, and every crossing shape forbids unknown fields
+        # — so they come off before the validate rather than being handed
+        # to a model that would rightly refuse them.
+        payload = {
+            key: value
+            for key, value in frame.items()
+            if key not in ("type", "requestId")
+        }
         try:
-            delivered = DeliveredCompletion.model_validate(frame)
+            delivered = DeliveredCompletion.model_validate(payload)
         except ValidationError as e:
             logger.warning("kyok bridge: malformed completionRequest %s: %s", request_id, e)
             outbound.put_nowait(

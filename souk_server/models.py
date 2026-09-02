@@ -10,9 +10,12 @@ was the real protocol.
 The signed registration/deletion request bodies are gone with their
 routes: registration and deletion moved onto the provider sockets, where
 the open link is the credential (see ws_provider.py / ws_kyok.py).
-`AgentRegistration` survives because the shape of one roster entry is
-still this layer's to validate — it now describes an element of the
-`register` frame's `agents` list, camelCase on the wire.
+`AgentRegistration` is gone too, for the same reason one level down:
+`funduq_contract.Registration` is the single definition of a roster entry
+now, imported by both ends of every wire that carries one, and a local
+model of the same shape could only ever agree with itself. The `register`
+frame validates into upstream's model directly (ws_provider.
+_parse_registration).
 """
 
 from __future__ import annotations
@@ -46,21 +49,6 @@ class TicketResponse(BaseModel):
 
     ticket: str
     funduq_public_key: str
-
-
-class AgentRegistration(BaseModel):
-    """One agent in a `register` frame. camelCase on the wire
-    (`agentCardExtra`), snake_case toward core — the same field list as
-    upstream's `REGISTRATION_FIELDS`, compared in a test."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-    name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-    description: str = ""
-    agent_card_extra: dict[str, Any] = Field(default_factory=dict)
-    # souk-internal, not exposed via the public A2A Agent Card — see
-    # agents.metadata in funduq's schema.
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentRosterEntry(BaseModel):

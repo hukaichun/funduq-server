@@ -39,11 +39,43 @@ from sse_starlette.sse import EventSourceResponse
 from funduq.core import Funduq
 from funduq.errors import AgentNotFound
 from funduq.models import AgentRef
+from funduq.pause import outstanding_asks
 from funduq.protocols.agui import AGUIAdapter, EventStream, ThreadSnapshot
 from souk_server.deps import get_souk, resolve_ref
 from souk_server.models import CreateThreadRequest, CreateThreadResponse
 
 router = APIRouter()
+
+
+async def _with_outstanding_asks(funduq: Funduq, snapshot: dict) -> dict:
+    """Add a paused active run's outstanding ask ids to a thread snapshot.
+
+    This read path exists for exactly the caller a pause strands: the SSE
+    stream closed when the run paused, and the caller comes back here to
+    find out what happened. Since contract revision 16 the answer it needs
+    is not just "paused" but *what it is waiting on* — a resolve proof
+    signs the ask ids themselves
+    (`funduq-resolve:{run_id}:{sha256 of the sorted, NUL-joined ids}`), so
+    a caller that cannot enumerate them cannot build a proof at all and
+    the pause is unanswerable.
+
+    Core's snapshot summarises the active run as `{run_id, status}`; the
+    ids live on the run's metadata, so this fetches the run rather than
+    inventing a field for core to carry. Absent when there is nothing
+    outstanding, so the key's presence means something.
+    """
+    active = snapshot.get("active_run")
+    if not active:
+        return snapshot
+    run = await funduq.get_run(active["run_id"])
+    if run is None:
+        return snapshot
+    asks = outstanding_asks(run.metadata or {})
+    if asks:
+        # Sorted, matching the canonical order `resolve_payload` hashes in
+        # — one fewer thing for a signer to get wrong.
+        active["outstanding_asks"] = sorted(asks)
+    return snapshot
 
 
 def encode_event(event: Any) -> str:
@@ -80,11 +112,14 @@ async def get_thread_snapshot(thread_id: str, funduq: Funduq = Depends(get_souk)
     """Lets a caller catch up on a thread without a live stream — e.g. after
     its original AG-UI SSE connection closed because the run it was watching
     paused, and it needs to know what has happened since.
+
+    A paused active run also says what it is waiting on, under
+    `active_run.outstanding_asks` — see `_with_outstanding_asks`.
     """
     snapshot = await funduq.get_thread_snapshot(thread_id)
     if snapshot is None:
         raise AgentNotFound(f"thread '{thread_id}' not found")
-    return snapshot
+    return await _with_outstanding_asks(funduq, snapshot)
 
 
 @router.get("/threads/{thread_id}/tree")

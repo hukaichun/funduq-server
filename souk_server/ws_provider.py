@@ -28,6 +28,13 @@ frames carry no signature: the link is the credential, proved once when
 it opened, and what that asks of this transport is the ordinary thing —
 an open link stays the party that opened it (one read loop, one
 identity, established here and never rebound).
+
+**One field joined the register frame** at contract revision 12:
+`takesInterjections`, per agent. It is the only thing this side can
+answer core's `takes_interjections(agent_name)` from — a required call
+that is *not* on the `ConnectedProvider` protocol, so a connection
+without it opens perfectly well and raises three layers deep at the
+first registration. See `SocketProvider.takes_interjections`.
 """
 
 from __future__ import annotations
@@ -36,17 +43,19 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
 
+import re
+
+import funduq_contract
 from funduq.errors import FunduqError, InvalidRegistration
 from funduq.models import AgentRef
 from pydantic import ValidationError
-from funduq_provider_sdk import CONNECTED_PROVIDER_ATTRS, DeliveredRun, Refusal
-from funduq_provider_sdk.contract import LINK_QUERY_METHODS, REGISTRATION_FIELDS
+from funduq_provider_sdk import DeliveredRun, FunduqLink, Refusal
 from souk_server.handshake import WIRE_VERSION
-from souk_server.models import AgentRegistration
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     close_frame,
@@ -71,13 +80,23 @@ router = APIRouter()
 # leave a wait with no bound at all if funduq ever offers without one.
 ACK_TIMEOUT_SECONDS = 30.0
 
-# What a provider may ask funduq, and it is deliberately short. Upstream's
-# `contract.LINK_QUERY_METHODS` states the rule: this is not a mirror of
-# funduq's API, because every method admitted here is one more frame type
-# every transport has to carry. Read from upstream rather than retyped, so
-# a method added there without a frame here fails a test instead of a
-# provider.
-QUERY_METHODS = frozenset(LINK_QUERY_METHODS)
+# What a provider may ask funduq, and it is deliberately short: this is
+# not a mirror of funduq's API, because every method admitted here is one
+# more frame type every transport has to carry. Upstream withdrew the
+# `LINK_QUERY_METHODS` constant at revision 11 — the models are the single
+# definition now and there is no list left to read — so the one query is
+# named here and checked against the link ABC that declares it, which is
+# the surface that would actually grow a second one.
+QUERY_METHODS = frozenset({"thread_messages"})
+assert QUERY_METHODS <= FunduqLink.__abstractmethods__, (
+    "a query this wire carries is no longer a FunduqLink verb"
+)
+
+# Agent names go in URLs on every road this gateway serves, so the shape is
+# this layer's to police. Core validates none of it (upstream's
+# `Registration` has no pattern), and a name with a slash or a space in it
+# would register happily and then be unaddressable.
+_AGENT_NAME = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # How often a live socket re-asks whether funduq still lists the agents it
 # registered. The condition it catches is rare and permanent, so noticing
@@ -105,10 +124,16 @@ class SocketProvider:
     So the members below are duck-typed against funduq's own
     `ConnectedProvider` protocol rather than inherited. That loses the
     fails-at-construction property a base class gave, which is why the
-    constructor asserts against `CONNECTED_PROVIDER_ATTRS` instead: funduq
-    sizes a capacity bucket from `max_concurrent_runs`, and a connection
-    that forgets it attaches perfectly well and then fails inside the
-    broker, three layers from the cause.
+    constructor asserts against `_PROTOCOL_SURFACE` instead: funduq sizes a
+    capacity bucket from `max_concurrent_runs`, and a connection that
+    forgets it attaches perfectly well and then fails inside the broker,
+    three layers from the cause. Upstream withdrew the
+    `CONNECTED_PROVIDER_ATTRS` list this used to read; the lesson it
+    encoded outlived it, so the surface is named here — and it is wider
+    than `broker.ConnectedProvider` declares, because
+    **`takes_interjections` is not on the protocol at all** and core calls
+    it inside `register_agents`. A connection without it type-checks, opens
+    and then raises `AttributeError` at the first registration.
 
     Deliberately exposes no `sign_connect`: core would otherwise mint a
     ticket and sign on this object's behalf, and this object cannot sign —
@@ -119,8 +144,20 @@ class SocketProvider:
     Holds no per-run state beyond the acks it is waiting on — every frame
     names its run, and funduq keeps the only routing table — plus
     `registered_names`, the roster this link last published, which the
-    registration watcher reads.
+    registration watcher reads, and `_interjections`, the per-agent
+    capability that roster declared.
     """
+
+    # The whole of what funduq reaches for on this object. Not read off
+    # `broker.ConnectedProvider`: a Protocol's members are not enumerable
+    # in a way worth trusting, and `takes_interjections` is not on it.
+    _PROTOCOL_SURFACE = (
+        "public_key",
+        "max_concurrent_runs",
+        "deliver",
+        "cancel",
+        "takes_interjections",
+    )
 
     def __init__(
         self, public_key: str, outbound: asyncio.Queue, max_concurrent_runs: int | None
@@ -129,7 +166,7 @@ class SocketProvider:
         # `max_concurrent_runs` are properties, so asking `self` would run
         # their getters against fields this constructor has not assigned
         # yet and report every one of them missing.
-        missing = sorted(a for a in CONNECTED_PROVIDER_ATTRS if not hasattr(type(self), a))
+        missing = sorted(a for a in self._PROTOCOL_SURFACE if not hasattr(type(self), a))
         if missing:
             raise TypeError(f"{type(self).__name__} is not a ConnectedProvider: missing {missing}")
         self._public_key = public_key
@@ -137,6 +174,11 @@ class SocketProvider:
         self._outbound = outbound
         self._acks: dict[str, asyncio.Future[bool | Refusal]] = {}
         self.registered_names: set[str] = set()
+        # Runs this connection has accepted whose first report has not
+        # landed yet. See `claim_settling` — this is the whole state the
+        # ordering guard needs, and it empties itself.
+        self.accepted_unreported: set[str] = set()
+        self._interjections: dict[str, bool] = {}
 
     @property
     def public_key(self) -> str:
@@ -146,31 +188,58 @@ class SocketProvider:
     def max_concurrent_runs(self) -> int | None:
         return self._max_concurrent_runs
 
-    async def deliver(self, run: Any) -> bool | Refusal:
+    def declare_interjections(self, registrations: list[funduq_contract.Registration]) -> None:
+        """Record what this roster said about interjections, per agent.
+
+        Called before `register_agents`, because core asks during it. The
+        table is replaced rather than merged: `register` carries the FULL
+        roster, so an agent dropped from it has no declaration any more,
+        exactly as it has no live name.
+        """
+        self._interjections = {r.name: bool(r.takes_interjections) for r in registrations}
+
+    def takes_interjections(self, agent_name: str) -> bool:
+        """Whether the remote link declared this agent able to take an
+        interjection — a run arriving on a thread whose active run it
+        names.
+
+        Core calls this inside `register_agents` and **overwrites**
+        whatever the incoming `Registration` said, so that the agent card's
+        declaration is derived from the serving party rather than typed by
+        an author. Over a wire the serving party is on the other end of the
+        socket, and the `register` frame's `takesInterjections` is the only
+        thing this side can honestly answer from: the in-process link reads
+        the runtime's hook, and this reads what the runtime put on the
+        wire. An agent this link never published gets `False` — declaring a
+        capability for a name nobody registered would be a guess.
+        """
+        return self._interjections.get(agent_name, False)
+
+    async def deliver(self, run: DeliveredRun) -> bool | Refusal:
         """Write this run to the wire and wait for the answer.
 
-        The frame is `{"type": "run"}` plus the wire form upstream
-        declares — `DeliveredRun.from_claimed(...).model_dump(by_alias=
-        True)` — so this gateway does not hand-write the mapping and the
-        far side rebuilds with `model_validate` instead of picking fields.
-        `from_claimed` also owns the validation rule: input that does not
-        parse as `RunAgentInput` is a permanent `Refusal`, answered here
-        without ever touching the wire (funduq built the input, so this
-        firing means a core bug or a version skew — either way permanent).
+        The frame is `{"type": "run"}` plus the published envelope: since
+        contract revision 11 `deliver` *receives* the `DeliveredRun`, so
+        there is no translation left to do and no claimed-run shape to
+        validate — funduq built and validated the model before offering it.
+
+        **Dumped `by_alias=True` and never `exclude_none`.** `RunAgentInput`
+        has required fields that are legitimately null (`state`,
+        `forwardedProps`); stripping them yields a `runInput` the far side
+        cannot rebuild, and a perfectly good run comes back as a permanent
+        refusal. (The opposite rule holds for AG-UI *events* — see
+        api_agui.encode_event — and the two pull against each other, which
+        is why each says so where it is written.)
 
         Answering late is the same as declining, whichever deadline ran
         out: the ack arrives for a run nobody is waiting on any more, and
         `ack` drops it. funduq keeps the run either way.
         """
-        try:
-            delivered = DeliveredRun.from_claimed(run)
-        except ValidationError as e:
-            return Refusal(f"input does not validate as RunAgentInput: {e}")
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[bool | Refusal] = loop.create_future()
         self._acks[run.run_id] = waiter
         self._outbound.put_nowait(
-            {"type": "run", **delivered.model_dump(by_alias=True, mode="json")}
+            {"type": "run", **run.model_dump(by_alias=True, mode="json")}
         )
         try:
             return await asyncio.wait_for(waiter, timeout=ACK_TIMEOUT_SECONDS)
@@ -185,25 +254,50 @@ class SocketProvider:
         finally:
             self._acks.pop(run.run_id, None)
 
-    def ack(self, run_id: str, accepted: bool, reason: str | None = None) -> None:
-        """A declined ack carrying a `reason` is a *permanent* refusal — the
-        provider saying re-offering can never succeed (an input that does
-        not parse, most importantly). funduq fails the run with the reason
-        recorded verbatim and stops re-offering; a bare decline stays what
-        it always was, \"full right now\". The wire says so with one
-        optional field because the port says so with one optional type
-        (`funduq_provider_sdk.Refusal`, read duck-typed by the broker)."""
-        waiter = self._acks.get(run_id)
-        if waiter is not None and not waiter.done():
-            if not accepted and isinstance(reason, str) and reason:
-                waiter.set_result(Refusal(reason))
-            else:
-                waiter.set_result(accepted)
+    def ack(self, verdict: funduq_contract.Verdict) -> bool:
+        """Answer one outstanding offer, and say whether anyone was waiting.
 
-    def cancel(self, run_id: str) -> None:
-        """Ask, and do not wait. funduq decides the outcome from what the
-        run's stream does next, not from anything this returns."""
+        A `refused` verdict is *permanent* — the provider saying re-offering
+        can never succeed (an input that does not parse, most importantly).
+        funduq fails the run with the reason recorded verbatim and stops
+        re-offering; `declined` stays what it always was, "full right now".
+        The port says so with one optional type
+        (`funduq_provider_sdk.Refusal`, read duck-typed by the broker), and
+        `funduq_contract.Verdict` is where the three names are written down.
+
+        **A verdict for nothing is normal, not an error.** Upstream
+        withdrew `accept_late_ack` at revision 11: an answer arriving after
+        the delivery window matches nothing and is answered false. funduq
+        has already taken the run back and will offer it again.
+        """
+        waiter = self._acks.get(verdict.id)
+        if waiter is None or waiter.done():
+            return False
+        if verdict.verdict == "refused":
+            # Keyword, not positional: `Refusal` is a pydantic model in
+            # funduq_contract now (it was a one-argument dataclass), and a
+            # positional call raises inside this socket's read loop —
+            # which reads as a provider that went quiet, not as a bad
+            # constructor.
+            waiter.set_result(Refusal(reason=verdict.reason or "refused"))
+        else:
+            accepted = verdict.verdict == "accepted"
+            if accepted:
+                self.accepted_unreported.add(verdict.id)
+            waiter.set_result(accepted)
+        return True
+
+    async def cancel(self, run_id: str) -> bool:
+        """Ask, and do not wait for an outcome.
+
+        The return is a **receipt** — "the ask is on the wire" — never a
+        result: funduq decides the outcome from what the run's stream does
+        next. Returning `None` (which this used to do) logs a warning on
+        every cancel since revision 11, and would be a lie in the other
+        direction if it tried to mean more.
+        """
         self._outbound.put_nowait({"type": "cancel", "runId": run_id})
+        return True
 
     def fail_pending(self) -> None:
         """The socket is gone: nothing can answer these offers."""
@@ -332,27 +426,49 @@ def _hello_error(hello: dict[str, Any]) -> str | None:
                 f"v{WIRE_VERSION}, the ticket handshake. Upgrade souk-agent-sdk."
             )
         return f"unsupported wire version {version!r}; this souk speaks v{WIRE_VERSION}"
-    if not isinstance(hello.get("publicKey"), str) or not hello["publicKey"]:
-        return "hello needs a publicKey"
-    if not isinstance(hello.get("ticket"), str) or not hello["ticket"]:
-        return "hello needs a ticket — POST /tickets issues one"
-    if not isinstance(hello.get("nonce"), str) or not hello["nonce"]:
-        return "hello needs a nonce"
-    if not isinstance(hello.get("proof"), str) or not hello["proof"]:
-        return "hello needs a proof signed over the ticket"
-    max_runs = hello.get("maxConcurrentRuns")
-    if max_runs is not None and not isinstance(max_runs, int):
-        return "maxConcurrentRuns must be an integer"
+    # Presence and emptiness first, by name, because those are the
+    # mistakes worth a sentence. What survives that goes through
+    # `funduq_contract.Connect` — the published shape of this exchange —
+    # so the types are policed by the model both ends already share
+    # rather than by an isinstance ladder that can drift from it. The one
+    # difference is spelling: our v4 hello has carried `nonce` since
+    # before the model named the field `providerNonce`, and the wire
+    # vocabulary does not change in this round.
+    for field, message in (
+        ("publicKey", "hello needs a publicKey"),
+        ("ticket", "hello needs a ticket — POST /tickets issues one"),
+        ("nonce", "hello needs a nonce"),
+        ("proof", "hello needs a proof signed over the ticket"),
+    ):
+        value = hello.get(field)
+        if not isinstance(value, str) or not value:
+            return message
+    try:
+        funduq_contract.Connect(
+            publicKey=hello["publicKey"],
+            ticket=hello["ticket"],
+            providerNonce=hello["nonce"],
+            proof=hello["proof"],
+            maxConcurrentRuns=hello.get("maxConcurrentRuns"),
+        )
+    except ValidationError as e:
+        return f"hello is not a valid connect: {e}"
     return None
 
 
-def _parse_registration(frame: dict[str, Any]) -> list[dict[str, Any]]:
-    """The `register` frame's agents, in the snake_case shape core takes.
+def _parse_registration(frame: dict[str, Any]) -> list[funduq_contract.Registration]:
+    """The `register` frame's agents, as the models core now takes.
 
-    Validated here with the same model the old HTTP body used, so a
-    malformed entry is answered with a message naming the field rather
-    than a stack trace from inside core. The field list is upstream's
-    `REGISTRATION_FIELDS`; the model and it are compared in a test.
+    `funduq_contract.Registration` is the single definition of this shape
+    — both ends import it — and it is `extra="forbid"`, so a misspelt key
+    is caught at the door with a message naming the field instead of
+    travelling intact and being dropped in silence by a reader that cannot
+    tell a typo from an omission. The local `AgentRegistration` that used
+    to stand here was a second model of the same thing; it is gone.
+
+    Two things the model does not police and this layer must: `agents`
+    being a non-empty list at all, and the name being URL-shaped — every
+    road this gateway serves puts an agent name in a path segment.
     """
     agents = frame.get("agents")
     if not isinstance(agents, list) or not agents:
@@ -362,11 +478,82 @@ def _parse_registration(frame: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(entry, dict):
             raise ValueError("each agent must be an object")
         try:
-            registration = AgentRegistration.model_validate(entry)
+            registration = funduq_contract.Registration.model_validate(entry)
         except ValidationError as e:
             raise ValueError(f"invalid agent registration: {e}") from None
-        parsed.append(registration.model_dump())
+        if not _AGENT_NAME.match(registration.name):
+            raise ValueError(
+                f"invalid agent name {registration.name!r}: "
+                "names are 1-128 characters of [A-Za-z0-9_-]"
+            )
+        parsed.append(registration)
     return parsed
+
+
+CLAIM_SETTLE_SECONDS = 0.5
+
+
+async def claim_settling(
+    report: "Callable[[], bool]", provider: "SocketProvider", run_id: str
+) -> bool:
+    """Report upward, allowing for a claim that has not landed yet.
+
+    **The window this closes is real and was found by running the stack, not
+    by reading.** Since contract revision 11 funduq offers a `DeliveredRun`
+    and records the claim only *after* `deliver` returns — before then, the
+    run is held by nobody. Our `deliver` returns by having this socket's read
+    loop resolve its future, and that read loop is then free to handle the
+    very next frame. A provider that answers `accepted` and starts streaming
+    in the same breath — which an SDK-less one does, because nothing tells it
+    not to — therefore lands its first events inside funduq's own claim
+    window, and every one of them is refused as "reported for a run nobody
+    holds". Measured: exactly one event-loop turn, but only on this machine,
+    on this day, against SQLite; one turn is not a number to build on.
+
+    So the first report of an accepted run waits for the claim rather than
+    assuming it. Bounded by `CLAIM_SETTLE_SECONDS`, and only for a run *this*
+    connection accepted and has not successfully reported yet — a report for
+    anything else is refused immediately, as it always was, because that is
+    a provider talking about work it does not hold.
+
+    The retry costs one "nobody holds" line in funduq's log per run, which is
+    the honest trace of a wait that really happened.
+    """
+    if report():
+        provider.accepted_unreported.discard(run_id)
+        return True
+    if run_id not in provider.accepted_unreported:
+        return False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CLAIM_SETTLE_SECONDS
+    while loop.time() < deadline:
+        await asyncio.sleep(0.005)
+        if report():
+            provider.accepted_unreported.discard(run_id)
+            return True
+    provider.accepted_unreported.discard(run_id)
+    return False
+
+
+def _parse_verdict(frame: dict[str, Any]) -> funduq_contract.Verdict:
+    """One inbound `ack` frame as the contract's own three-valued verdict.
+
+    The v4 wire spells an offer's answer as `accepted` plus an optional
+    `reason` and correlates by `runId`; upstream's `Verdict` spells it as
+    one of three names correlated by the request's `id`. Translating here
+    rather than carrying two vocabularies means the *meaning* — that a
+    reasoned no is a different answer from a bare no — has one definition,
+    the model's, and the frame stays what every shipped provider sends.
+    """
+    reason = frame.get("reason")
+    accepted = bool(frame.get("accepted", True))
+    return funduq_contract.Verdict(
+        id=frame.get("runId"),
+        verdict="accepted"
+        if accepted
+        else ("refused" if isinstance(reason, str) and reason else "declined"),
+        reason=reason if isinstance(reason, str) and reason else None,
+    )
 
 
 @router.websocket("/ws/provider")
@@ -435,13 +622,20 @@ async def provider_socket(websocket: WebSocket) -> None:
                 # a caller error on an authenticated link, not a breach.
                 try:
                     agents = _parse_registration(parsed)
-                    registration = await funduq.register_agents(
+                    # Before the call, not after: core asks
+                    # `takes_interjections` *inside* register_agents, and
+                    # this is the only place the answer exists.
+                    provider.declare_interjections(agents)
+                    registered = await funduq.register_agents(
                         provider, agents, provider_name=parsed.get("providerName")
                     )
                 except (FunduqError, ValueError) as e:
                     outbound.put_nowait({"type": "error", "message": str(e)})
                 else:
-                    names = sorted(registration.agents)
+                    # `register_agents` answers a plain {name: AgentRef}
+                    # mapping since revision 11 (it was a dataclass with an
+                    # `.agents` field).
+                    names = sorted(registered)
                     provider.registered_names = set(names)
                     outbound.put_nowait({"type": "registered", "names": names})
             elif kind == "deleteAgent":
@@ -460,18 +654,37 @@ async def provider_socket(websocket: WebSocket) -> None:
                     provider.registered_names.discard(name)
                     outbound.put_nowait({"type": "deleted", "name": name})
             elif kind == "ack":
-                provider.ack(
-                    run_id,
-                    bool(parsed.get("accepted", True)),
-                    parsed.get("reason"),
-                )
+                try:
+                    verdict = _parse_verdict(parsed)
+                except ValidationError as e:
+                    outbound.put_nowait(
+                        {"type": "error", "message": f"invalid ack: {e}"}
+                    )
+                    continue
+                # The answer to "did anyone hear that" is deliberately
+                # dropped: a verdict that matches nothing is normal — the
+                # window ran out and funduq took the run back — and
+                # answering an error frame for it would teach every
+                # provider to log a scare on its own slow morning.
+                provider.ack(verdict)
             elif kind == "event":
-                if not funduq.report_event(run_id, parsed.get("event"), claimed_by=public_key):
+                event = parsed.get("event")
+                landed = await claim_settling(
+                    lambda: funduq.report_event(run_id, event, claimed_by=public_key),
+                    provider,
+                    run_id,
+                )
+                if not landed:
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "event refused"}
                     )
             elif kind == "finish":
-                if not funduq.finish_run(run_id, claimed_by=public_key):
+                landed = await claim_settling(
+                    lambda: funduq.finish_run(run_id, claimed_by=public_key),
+                    provider,
+                    run_id,
+                )
+                if not landed:
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "finish refused"}
                     )

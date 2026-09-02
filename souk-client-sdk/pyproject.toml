@@ -26,7 +26,16 @@ dependencies = [
     # payloads. The old two SDK packages merged; the LLM half is the
     # `llm` extra (`funduq_provider_sdk.llm`). Apache-2.0, like this
     # package.
-    "funduq-provider-sdk[llm]>=0.0.2,<0.1",
+    "funduq-provider-sdk[llm]>=0.0.7,<0.1",
+    # The AG-UI wire model both ends of every run frame validate against.
+    # Pinned with a floor here, and not left to whatever each subproject's
+    # lock happened to resolve: `funduq-contract` floors it at >=0.1, and
+    # 0.1.22 made `RunAgentInput.state` optional-and-omitted-when-unset
+    # while 0.1.19 still requires it — so a gateway on one and a provider
+    # on the other disagree about a frame neither contract revision nor
+    # any test in one process can catch. It cost a full stack run to find
+    # (funduq#243).
+    "ag-ui-protocol>=0.1.22",
 ]
 
 [dependency-groups]

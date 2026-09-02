@@ -24,12 +24,15 @@ SOUK_DATABASE_URL (a `postgresql+psycopg://…` DSN) before invoking
 pytest; funduq's schema and queries are dialect-neutral, so both
 backends exercise the same semantics.
 
-Settings are constructed explicitly here — `CoreSettings` is a plain
-BaseModel now, and reading the environment is something a caller asks
-for by name (`CoreSettings.from_env()`), which these tests deliberately
-do not. `identity_private_key` is required (providers pin it), and it is
-a fixed key rather than a generated one: a test that asserts what a
-provider pinned needs the same funduq to be the same funduq across runs.
+Settings are constructed explicitly here, which is now the only way:
+`CoreSettings.from_env` was removed at contract revision 14 and core
+reads no environment at all. The gateway does that reading instead
+(`souk_server.config.core_settings_from_env`), and these tests
+deliberately do not go through it — a test that read the environment
+would answer differently on somebody's laptop. `identity_private_key` is
+required (providers pin it), and it is a fixed key rather than a
+generated one: a test that asserts what a provider pinned needs the same
+funduq to be the same funduq across runs.
 
 Tests aren't wrapped in a rolled-back transaction: funduq's repo
 functions commit internally throughout, so a single outer transaction
@@ -58,6 +61,7 @@ from funduq.core import Funduq
 from funduq.identity import provider_fingerprint
 from funduq.migrate import migrate as funduq_migrate
 from funduq.models import AgentRef
+from funduq_contract import Registration
 from funduq_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
 from souk_server.handshake import WIRE_VERSION, new_nonce
 from souk_server.server import create_app
@@ -267,7 +271,10 @@ async def attach(souk: Funduq):
         # its output silently.
         link = InProcessLink(souk, runtime)
         await souk.attach_provider(link)
-        await souk.register_agents(link, [{"name": n} for n in names])
+        # `Registration` models end to end since revision 11: core reads
+        # `.name` off each entry, so a dict raises AttributeError rather
+        # than being coerced.
+        await souk.register_agents(link, [Registration(name=n) for n in names])
         return runtime
 
     yield _attach
@@ -307,7 +314,9 @@ async def register(souk: Funduq):
         link = InProcessLink(souk, runtime)
         await souk.attach_provider(link)
         await souk.register_agents(
-            link, [{"name": n, **agent_extra} for n in names], provider_name=provider_name
+            link,
+            [Registration.model_validate({"name": n, **agent_extra}) for n in names],
+            provider_name=provider_name,
         )
         souk.detach_provider(identity.public_key, link)
         await runtime.aclose()

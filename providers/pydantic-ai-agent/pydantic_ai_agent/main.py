@@ -171,7 +171,16 @@ def make_run_stream(
                 async for event in adapter.run_stream(deps=deps, model=kyok_model):
                     # by_alias=True: AG-UI's wire format is camelCase
                     # (messageId, rawEvent, ...), not the Python field names.
-                    await combined.put(event.model_dump(mode="json", by_alias=True))
+                    # exclude_none=True: an *event* is dumped stripped, the
+                    # opposite of a frame's RunAgentInput (whose `state` and
+                    # `forwardedProps` are legitimately null and must
+                    # survive). Leaving nulls in here injects
+                    # `timestamp: null` / `rawEvent: null` into the caller's
+                    # stream — see upstream's contract changelog rev 11,
+                    # "the dump rule, stated once because it is two rules".
+                    await combined.put(
+                        event.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    )
             except Exception:
                 logger.exception("agent run failed for run_id=%s", run_input.get("runId"))
             finally:

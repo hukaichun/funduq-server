@@ -190,6 +190,13 @@ async def _echo_run_stream(run_input) -> Any:
     yield {"type": "RUN_FINISHED", "runId": run_input.run_id}
 
 
+async def _never_ending_run_stream(run_input) -> Any:
+    """Stays the thread's active run, so a second run on that thread is
+    either an interjection or queued behind it."""
+    yield {"type": "RUN_STARTED", "runId": run_input.run_id}
+    await asyncio.sleep(3600)
+
+
 @contextlib.asynccontextmanager
 async def _connected(gateway: StubGateway, provider: SoukProvider):
     """A connected provider whose runtime is running.
@@ -333,9 +340,13 @@ async def test_a_welcome_whose_answer_does_not_verify_is_refused_before_register
 
 async def test_registration_rides_the_link_unsigned_and_carries_the_whole_card(tmp_path):
     """After the verified welcome, the roster goes up as one `register`
-    frame — name, description, agentCardExtra, metadata per agent,
-    camelCase on the wire — and nothing in it is signed: the key was
-    proved when the link opened."""
+    frame — name, description, agentCardExtra, metadata,
+    takesInterjections per agent, camelCase on the wire — and nothing in
+    it is signed: the key was proved when the link opened.
+
+    The camelCase is `Registration`'s own aliases now (revision 11's
+    models), not a hand-written key mapping, and the whole frame is one
+    `model_dump(by_alias=True)` per agent."""
     async with StubGateway() as gateway:
         provider = _provider(
             gateway,
@@ -360,11 +371,97 @@ async def test_registration_rides_the_link_unsigned_and_carries_the_whole_card(t
                         "description": "repeats things",
                         "agentCardExtra": {"skills": [{"id": "echoing"}]},
                         "metadata": {"tier": "demo"},
+                        "takesInterjections": False,
                     }
                 ],
                 "providerName": "Echo Stall",
             }
             assert "signature" not in gateway.register
+
+
+async def test_the_register_frame_declares_each_agents_interjection_capability(tmp_path):
+    """`takesInterjections` per agent, and *per agent* is the point: the
+    gateway answers core's `connection.takes_interjections(name)` from
+    what this frame said, so one flag for the link would declare an agent
+    with no hook interruptible and have the refusal come at delivery time
+    instead of never being offered.
+
+    The value comes from `ProviderRuntime.takes_interjections(name)` — a
+    **method** since revision 11. Read as an attribute it is a bound
+    method, which is truthy, which would set this True for every agent
+    here and pass every test that only checked the field's presence."""
+
+    async def interjectable(run_input, addressed_run_id) -> Any:
+        yield {"type": "RUN_STARTED", "runId": run_input.run_id}
+
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [
+                AgentHandle(name="plain", run_stream=_echo_run_stream),
+                AgentHandle(
+                    name="listens",
+                    run_stream=_echo_run_stream,
+                    interject_stream=interjectable,
+                ),
+            ],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            declared = {
+                agent["name"]: agent["takesInterjections"]
+                for agent in gateway.register["agents"]
+            }
+            assert declared == {"plain": False, "listens": True}
+            # The same answer the link gives when asked directly.
+            assert provider.takes_interjections("listens") is True
+            assert provider.takes_interjections("plain") is False
+
+
+async def test_an_interjection_to_an_agent_without_a_hook_is_a_permanent_refusal(tmp_path):
+    """The runtime answers a `Refusal`, not `False`, and the difference is
+    everything: `False` leaves the run queued for a re-offer that can only
+    fail again, while the refusal's reason travels on the ack and souk
+    fails the run once. A `Refusal` is truthy, so relaying `bool(verdict)`
+    would have acked it *accepted* and then never sent an event."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="stuck", run_stream=_never_ending_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            await gateway.push(
+                {
+                    "type": "run",
+                    "runId": "r1",
+                    "threadId": "t1",
+                    "agentName": "stuck",
+                    "runInput": _input("r1"),
+                }
+            )
+            assert (await gateway.next_frame()) == {
+                "type": "ack",
+                "runId": "r1",
+                "accepted": True,
+            }
+            # r1 is live on the thread once its first event is out.
+            assert (await gateway.next_frame())["type"] == "event"
+            interjection = _input("r2")
+            interjection["forwardedProps"] = {"addressedRunId": "r1"}
+            await gateway.push(
+                {
+                    "type": "run",
+                    "runId": "r2",
+                    "threadId": "t1",
+                    "agentName": "stuck",
+                    "runInput": interjection,
+                }
+            )
+            ack = await gateway.next_frame()
+            assert ack["runId"] == "r2"
+            assert ack["accepted"] is False
+            assert "interjections" in ack["reason"]
 
 
 async def test_a_refused_registration_raises_with_souks_reason(tmp_path):
@@ -586,6 +683,52 @@ async def test_a_dropped_socket_does_not_end_the_run_and_its_frames_flush_after_
             with contextlib.suppress(asyncio.CancelledError):
                 await conn2
             await provider.runtime.aclose(cancel_in_flight=True)
+
+
+async def test_a_verdict_that_missed_the_window_is_answered_false_and_the_run_re_offered(tmp_path):
+    """`accept_late_ack` is gone (revision 11): an ack arriving after
+    souk's 5s delivery window matches nothing and is answered false.
+
+    That is breakage being reported, not a protocol error — so this side
+    must not treat it as one. souk takes the run back and offers *the same
+    run* again, and a provider that had actually taken it simply accepts
+    again; a provider that tore the socket down on the error frame would
+    reconnect into the same race instead."""
+    async with StubGateway() as gateway:
+        provider = _provider(
+            gateway,
+            [AgentHandle(name="echo", run_stream=_echo_run_stream)],
+            identity_key_path=str(tmp_path / "k.key"),
+        )
+        async with _connected(gateway, provider):
+            run_frame = {
+                "type": "run",
+                "runId": "r1",
+                "threadId": "t1",
+                "agentName": "echo",
+                "runInput": _input("r1"),
+            }
+            await gateway.push(run_frame)
+            first = [await gateway.next_frame() for _ in range(4)]
+            assert [f["type"] for f in first] == ["ack", "event", "event", "finish"]
+
+            # souk had already taken the run back: the verdict matched no
+            # outstanding offer and is answered false.
+            await gateway.push(
+                {
+                    "type": "error",
+                    "runId": "r1",
+                    "message": "no offer of r1 is outstanding (verdict answered false)",
+                }
+            )
+
+            # Still serving, and the re-offer of the same run is accepted
+            # again rather than met with silence.
+            await gateway.push(run_frame)
+            reack = await gateway.next_frame()
+            assert reack["type"] == "ack"
+            assert reack["runId"] == "r1"
+            assert reack["accepted"] is True
 
 
 # --- queries: request/response over a one-way wire --------------------------

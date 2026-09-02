@@ -287,7 +287,7 @@ async def test_full_round_trip_non_streaming(souk, serve):
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm, context={"voucher": "v1"})
     try:
-        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({"model": "kyok", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
             # Attached before the agent calls: resolution is per call and
@@ -337,7 +337,7 @@ async def test_full_round_trip_streaming(souk, serve):
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm)
     try:
-        body = json.dumps({"messages": [], "stream": True}).encode()
+        body = json.dumps({"model": "kyok", "messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
@@ -373,7 +373,7 @@ async def test_an_error_frame_fails_the_completion_fast(souk, serve):
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm)
     try:
-        body = json.dumps({"messages": [], "stream": True}).encode()
+        body = json.dumps({"model": "kyok", "messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as ws:
@@ -420,7 +420,7 @@ async def test_a_structured_refusal_reaches_the_agent_intact(souk, serve):
     for run_id, stream in (("run_refused_stream", True), ("run_refused_plain", False)):
         served, token, run_id = await _live(serve, souk, llm)
         try:
-            body = json.dumps({"messages": [], "stream": stream}).encode()
+            body = json.dumps({"model": "kyok", "messages": [], "stream": stream}).encode()
             async with _client(souk) as client:
                 async with aconnect_ws("http://test/ws/kyok", client) as ws:
                     socket = _LlmSocket(ws, llm_identity)
@@ -476,7 +476,7 @@ async def test_one_socket_multiplexes_concurrent_completions(souk, serve):
                 await socket.connect(souk, ["gpt-test"])
 
                 async def agent_call(prompt: str) -> str:
-                    body = json.dumps({"messages": [{"role": "user", "content": prompt}]}).encode()
+                    body = json.dumps({"model": "kyok", "messages": [{"role": "user", "content": prompt}]}).encode()
                     resp = await client.post(
                         "/kyok/v1/chat/completions",
                         content=body,
@@ -522,7 +522,7 @@ async def test_an_answer_is_only_accepted_on_the_socket_the_request_was_delivere
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm)
     try:
-        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({"model": "kyok", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
             async with aconnect_ws("http://test/ws/kyok", client) as holder_ws:
@@ -579,7 +579,7 @@ async def test_a_later_attach_takes_over_the_offering_and_the_old_teardown_spare
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm)
     try:
-        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        body = json.dumps({"model": "kyok", "messages": [{"role": "user", "content": "hi"}]}).encode()
 
         async with _client(souk) as client:
             old_attached = asyncio.Event()
@@ -635,7 +635,7 @@ async def test_a_dropped_socket_fails_its_in_flight_completions_fast(souk, serve
     llm = LlmRef(provider_key=llm_identity.public_key, name="gpt-test")
     served, token, run_id = await _live(serve, souk, llm)
     try:
-        body = json.dumps({"messages": [], "stream": True}).encode()
+        body = json.dumps({"model": "kyok", "messages": [], "stream": True}).encode()
 
         async with _client(souk) as client:
 

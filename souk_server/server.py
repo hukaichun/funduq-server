@@ -18,8 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry, ws_kyok, ws_provider
-from funduq.config import CoreSettings
-from souk_server.config import ServingSettings
+from souk_server.config import ServingSettings, core_settings_from_env
 from funduq.core import Funduq
 from souk_server.deps import install_error_handlers
 from souk_server.mcp_docent import create_docent, transport_security_for
@@ -109,11 +108,12 @@ def create_app(funduq: Funduq, serving: ServingSettings | None = None) -> FastAP
 
 
 async def _serve() -> None:
-    # `CoreSettings.from_env()` by name: constructing settings from the
-    # process environment is a decision this entry point makes, not a
-    # default core smuggles in (FUNDUQ_* variables; identity and signing
-    # secret are required).
-    funduq = Funduq(CoreSettings.from_env())
+    # Core reads no environment at all since contract revision 14
+    # (`CoreSettings.from_env` is gone), so the read is this entry point's
+    # — souk_server.config.core_settings_from_env, over the same FUNDUQ_*
+    # names this repo has always documented. Identity and signing secret
+    # are required and their absence fails here, at startup.
+    funduq = Funduq(core_settings_from_env())
     serving = ServingSettings()
     app = create_app(funduq, serving)
 

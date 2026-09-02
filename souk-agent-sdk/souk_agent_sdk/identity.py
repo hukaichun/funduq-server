@@ -2,7 +2,7 @@
 keypair — not an account souk issues. Generated once and persisted to
 disk so restarting this process is still the same identity: a fresh key
 is a fresh, unrelated provider, and everything addressed to the old one
-(a pinned delegation target, a thread's bound authority) keeps pointing
+(a thread's bound authority, a chain hop already signed) keeps pointing
 at the orphaned identity, not this one. Treat the key file like any
 other credential — back it up, don't commit it.
 

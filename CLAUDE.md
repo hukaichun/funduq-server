@@ -98,6 +98,38 @@ catches all of it; "verified end to end" is a claim about one path.
   finalise a fixture from a different task than it set up in, which a
   cancel scope cannot survive.
 
+## Upstream's contract (currently revision 16)
+
+The pin is `funduq` 0.0.6, `funduq-provider-sdk[llm]` 0.0.7,
+`funduq-contract` 0.0.9. Read
+[upstream's `docs/contract-changelog.md`](https://github.com/hukaichun/funduq/blob/main/docs/contract-changelog.md)
+before moving it: it says what an implementation must change, which
+commit subjects cannot. Four things here bite in ways a green suite does
+not always catch first:
+
+- **Two dump rules that pull opposite ways.** A frame envelope is dumped
+  `by_alias=True` and **never** `exclude_none` (`RunAgentInput`'s
+  `state`/`forwardedProps` are legitimately null, and stripping them
+  makes a good run come back as a *permanent refusal*); a typed AG-UI
+  event is dumped **with** `exclude_none=True` (or `timestamp: null` and
+  `rawEvent: null` land in the caller's stream). Upstream's codec used to
+  enforce both and was withdrawn at revision 11 — nothing does now, so
+  `docs/server-mode.md` is where the rules live.
+- **Envelopes are flat and the models forbid extras.** A frame is
+  `{"type": "run", **DeliveredRun}`, so strip `type` (and `requestId` on
+  a `completionRequest`) before `model_validate`, or the frame fails
+  validation on the field that routed it.
+- **`takes_interjections` is not on the `ConnectedProvider` protocol**,
+  and core calls it inside `register_agents`. A connection missing it
+  type-checks, attaches, and raises `AttributeError` three layers deep at
+  the first registration — which is why `SocketProvider` asserts its own
+  surface at construction. On the SDK side it is a **method**, not a
+  property: read as an attribute it is a truthy bound method, i.e. every
+  agent silently declared interjection-capable.
+- **Core reads no environment** (`CoreSettings.from_env` gone at revision
+  14). `souk_server/config.py:core_settings_from_env()` is the only
+  reader of `FUNDUQ_*` now; an empty string there means unset.
+
 ## Design invariants
 
 Breaking one has caused a real bug here or upstream.

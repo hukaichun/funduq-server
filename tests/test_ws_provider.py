@@ -37,6 +37,7 @@ import pytest
 from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
+import funduq_contract
 from funduq_provider_sdk import verify_signature
 from souk_server import ws_provider
 from souk_server.handshake import WIRE_VERSION, funduq_connect_payload, new_nonce
@@ -559,7 +560,7 @@ async def test_a_cancel_reaches_the_socket_the_identity_has_open(souk):
 
 
 async def test_a_dropped_socket_fails_the_run_it_was_holding_and_a_reconnect_serves_afresh(souk):
-    """What reconnect-mid-run means under funduq 0.0.4, asserted rather
+    """What reconnect-mid-run means under funduq 0.0.6, asserted rather
     than assumed: a socket that drops while *holding* a claimed run has
     that run failed at once — took work, never ended it, the broker's
     `abandoned` fact — because "the party holding it is still here" is the
@@ -841,3 +842,248 @@ async def test_an_unknown_query_method_is_refused_by_name(souk):
             frame = await socket.recv()
             assert frame["queryId"] == "q9"
             assert "list_agents" in frame["error"]
+
+
+# --- interjections: a capability the link declares, per agent ----------------
+
+
+async def test_takes_interjections_is_answered_per_agent_and_honoured_at_registration(
+    souk, client
+):
+    """Contract revision 12's field, over a wire.
+
+    `takes_interjections(agent_name)` is **required** on every object
+    handed to `attach_provider` and is *not* on the `ConnectedProvider`
+    protocol, so omitting it type-checks perfectly and raises
+    AttributeError inside the first `register_agents` — three layers from
+    the cause. Core calls it per agent and *overwrites* whatever the
+    incoming `Registration` said, so that the card's declaration is
+    derived from the serving party rather than typed by an author.
+
+    Over a wire the serving party is on the far end of this socket, so
+    what this side can honestly answer from is the `register` frame's
+    `takesInterjections` — asserted here both directly (the answer per
+    name) and through its consequence: funduq writes the interjection
+    extension's URI onto the card of the agent that declared it, and onto
+    no other.
+    """
+    identity = Identity()
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, souk, identity)
+            await socket.send(
+                {
+                    "type": "register",
+                    "agents": [
+                        {"name": "interruptible", "takesInterjections": True},
+                        {"name": "singleminded", "takesInterjections": False},
+                        # Omitted entirely: the field is optional and an
+                        # entry without it behaves exactly as before.
+                        {"name": "silent"},
+                    ],
+                }
+            )
+            assert (await socket.recv())["type"] == "registered"
+
+            from funduq.models import AgentRef
+
+            cards = {
+                name: (
+                    await souk.get_agent(AgentRef(provider_key=identity.public_key, name=name))
+                ).agent_card
+                for name in ("interruptible", "singleminded", "silent")
+            }
+
+    extension = "https://github.com/hukaichun/funduq/ext/interjection/v1"
+    assert extension in cards["interruptible"].get("extensions", [])
+    assert extension not in cards["singleminded"].get("extensions", [])
+    assert extension not in cards["silent"].get("extensions", [])
+
+
+async def test_the_connection_answers_takes_interjections_for_the_roster_it_last_published(
+    souk,
+):
+    """The unit half of the rule above, because the consequence alone
+    cannot show the *shape* of the answer.
+
+    `register` carries the FULL roster, so the declarations go with it: an
+    agent dropped from a later register has no declaration any more,
+    exactly as it has no live name. And a name this link never published
+    answers False rather than raising — declaring a capability for
+    somebody else's agent would be a guess, and core asks this method
+    without checking first.
+    """
+    from souk_server.ws_provider import SocketProvider
+
+    provider = SocketProvider("ab" * 32, asyncio.Queue(), None)
+    provider.declare_interjections(
+        [
+            funduq_contract.Registration(name="interruptible", takesInterjections=True),
+            funduq_contract.Registration(name="singleminded"),
+        ]
+    )
+
+    assert provider.takes_interjections("interruptible") is True
+    assert provider.takes_interjections("singleminded") is False
+    assert provider.takes_interjections("never-registered") is False
+
+    provider.declare_interjections([funduq_contract.Registration(name="singleminded")])
+    assert provider.takes_interjections("interruptible") is False
+
+
+# --- the two receipts the broker now reads -----------------------------------
+
+
+async def test_cancel_is_a_receipt_that_the_ask_is_on_the_wire(souk):
+    """`cancel` became `async` and returns `bool` at revision 11 — a
+    receipt that the ask arrived, never an outcome. Returning None (what
+    this used to do) logs a warning on every cancel, and returning an
+    outcome would be a claim about a provider this side never observed."""
+    from souk_server.ws_provider import SocketProvider
+
+    outbound: asyncio.Queue = asyncio.Queue()
+    provider = SocketProvider("ab" * 32, outbound, None)
+
+    assert await provider.cancel("run_x") is True
+    assert outbound.get_nowait() == {"type": "cancel", "runId": "run_x"}
+
+
+async def test_a_verdict_for_a_run_nobody_is_waiting_on_is_answered_false_quietly(souk):
+    """Offer lateness is not a path any more. `accept_late_ack` and the
+    `answered_late` counter were withdrawn at revision 11: an answer
+    arriving after the delivery window matches nothing and is answered
+    false, because funduq has already taken the run back and will offer it
+    again — a provider that really had it accepts the same run a second
+    time and loses nothing.
+
+    So the socket must stay quiet about it. An error frame here would
+    teach every provider to log a scare on its own slow morning, for a
+    condition the protocol calls normal.
+    """
+    identity = Identity()
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, souk, identity, "greeter")
+
+            await socket.send(
+                {"type": "ack", "runId": "run_long_gone", "accepted": True}
+            )
+            await socket.expect_nothing()
+
+            # …and the same for a reasoned refusal of a run nobody holds.
+            await socket.send(
+                {"type": "ack", "runId": "run_long_gone", "accepted": False, "reason": "no"}
+            )
+            await socket.expect_nothing()
+
+            # The socket is still a working one.
+            await socket.register("greeter")
+
+
+async def test_an_ack_naming_no_run_at_all_is_answered_by_name(souk):
+    """The one ack the contract's own `Verdict` catches for us: it
+    correlates by an id, and a frame carrying none is a caller mistake
+    worth a sentence rather than a silent drop."""
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, souk, Identity(), "greeter")
+
+            await socket.send({"type": "ack", "accepted": True})
+
+            frame = await socket.recv()
+            assert frame["type"] == "error"
+            assert "ack" in frame["message"]
+
+
+async def test_events_sent_in_the_same_breath_as_the_ack_are_not_lost(souk, monkeypatch):
+    """Accept and stream without pausing — and keep every event.
+
+    An SDK-less provider answers `accepted` and starts reporting in the
+    same breath, because nothing on this wire tells it to wait. Since
+    contract revision 11 funduq records the claim only after `deliver`
+    returns, and `deliver` returns by this socket's read loop resolving a
+    future — so those first events can arrive while the run is still held
+    by nobody, and without `claim_settling` they come back "event refused"
+    and the caller's stream loses its opening. Found by running the full
+    stack; the gateway suite passed with the hole in it, because every
+    other test acks and then awaits something.
+
+    The window is one event-loop turn wide against SQLite on a quiet
+    machine, which is far too narrow to reproduce by racing it here — a
+    test that tried would pass for the wrong reason on a fast day and flake
+    on a slow one. So the window is *held open*: the first report of this
+    run is refused the way funduq refuses one it has not claimed yet, and
+    the guard has to notice and come back. Disable `claim_settling` and
+    this test fails.
+    """
+    from funduq.models import AgentRef
+
+    real_report = souk.report_event
+    refused: set[str] = set()
+
+    def report_once_too_early(run_id, event, *, claimed_by):
+        """Refuse exactly the first report of each run, as an unlanded
+        claim does — every later one behaves normally."""
+        if run_id not in refused:
+            refused.add(run_id)
+            return False
+        return real_report(run_id, event, claimed_by=claimed_by)
+
+    monkeypatch.setattr(souk, "report_event", report_once_too_early)
+
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            identity = Identity()
+            socket = await _handshake(ws, souk, identity, "greeter")
+            ref = AgentRef(provider_key=identity.public_key, name="greeter")
+            handle = await souk.start_run(ref, {"messages": []})
+
+            frame = await socket.recv()
+            assert frame["type"] == "run"
+            run_id = frame["runId"]
+
+            await socket.send({"type": "ack", "runId": run_id, "accepted": True})
+            await socket.send(
+                {
+                    "type": "event",
+                    "runId": run_id,
+                    "event": {
+                        "type": "RUN_STARTED",
+                        "threadId": frame["threadId"],
+                        "runId": run_id,
+                    },
+                }
+            )
+
+            # The event survived a claim that had not landed when it arrived…
+            await socket.expect_nothing()
+            assert run_id in refused
+
+            # …and the run is live and finishable, not stranded.
+            await socket.send({"type": "finish", "runId": run_id})
+            await socket.expect_nothing()
+            assert (await souk.get_run(handle.run_id)).status not in {"queued", "running"}
+
+
+async def test_a_report_for_a_run_this_socket_never_accepted_is_refused_at_once(souk):
+    """The guard waits only for a claim it is owed.
+
+    `claim_settling` exists for the run this connection just said yes to;
+    anything else is a provider talking about work it does not hold, and
+    that answer is immediate. Without this the guard would be a half-second
+    of patience handed to every stray frame.
+    """
+    async with _provider_client(souk) as client:
+        async with _connect(client) as ws:
+            socket = await _handshake(ws, souk, Identity(), "greeter")
+
+            await socket.send(
+                {
+                    "type": "event",
+                    "runId": "run_never_offered_here",
+                    "event": {"type": "RUN_STARTED", "threadId": "t", "runId": "x"},
+                }
+            )
+
+            frame = await socket.recv()
+            assert frame["type"] == "error" and frame["message"] == "event refused"

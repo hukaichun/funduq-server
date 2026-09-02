@@ -42,7 +42,7 @@ def test_the_payload_vectors_pointer_names_a_file_that_exists_at_the_pinned_revi
     here rather than as a skip there."""
     vendored = DOCS.parent / VECTORS["payload_vectors"]
     payload_vectors = json.loads(vendored.read_text())
-    assert payload_vectors["contract"]["revision"] == funduq_contract.CONTRACT_REVISION == 7
+    assert payload_vectors["contract"]["revision"] == funduq_contract.CONTRACT_REVISION == 16
 
 
 def test_the_frame_vocabulary_is_the_dispatched_one():
@@ -50,22 +50,23 @@ def test_the_frame_vocabulary_is_the_dispatched_one():
     assert set(VECTORS["frames"]["kyok_socket_inbound"]) == ws_kyok.INBOUND_FRAME_TYPES
 
 
-def test_the_registration_fields_are_upstreams():
-    """The register frame's per-agent fields are `REGISTRATION_FIELDS` —
-    a field added upstream without this gateway's frame model learning it
-    would be silently dropped on the way into core."""
-    from funduq_provider_sdk.contract import REGISTRATION_FIELDS
+def test_the_register_frames_agent_shape_is_upstreams_registration():
+    """The `register` frame's per-agent shape is
+    `funduq_contract.Registration` itself — the model both ends import,
+    not a local restatement of it — so what this file documents is read
+    off the model rather than typed beside it.
 
-    from souk_server.models import AgentRegistration
-
-    assert set(AgentRegistration.model_fields) == set(REGISTRATION_FIELDS)
-
-
-def test_the_wire_carries_every_query_the_link_declares():
-    """`contract.LINK_QUERY_METHODS` is upstream's list of what a provider
-    may ask. A method added there without a frame here would compile, pass
-    every test, and fail at a provider — so this is the one place the two
-    are compared."""
-    from funduq_provider_sdk.contract import LINK_QUERY_METHODS
-
-    assert set(ws_provider.QUERY_METHODS) == set(LINK_QUERY_METHODS)
+    The pair of tests that used to stand here compared a local model and a
+    local constant against `REGISTRATION_FIELDS` / `LINK_QUERY_METHODS`.
+    Both constants were withdrawn at revision 11 for the reason this test
+    embodies: with one definition there is nothing left for a field list
+    to police.
+    """
+    documented = {f.rstrip("?") for f in VECTORS["frames"]["register_agent_entry"]}
+    on_the_wire = {
+        field.alias or name
+        for name, field in funduq_contract.Registration.model_fields.items()
+    }
+    assert documented == on_the_wire
+    # The one field this round adds, named rather than merely counted.
+    assert "takesInterjections" in on_the_wire

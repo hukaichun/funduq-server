@@ -25,7 +25,35 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from funduq_provider_sdk import ProviderIdentity
 from httpx_sse import aconnect_sse
+
+
+def resolution_proof(
+    identity: ProviderIdentity, run_id: str, ask_ids: list[str]
+) -> dict[str, str]:
+    """The proof that answers a paused run's asks: `{publicKey, signature}`.
+
+    Contract revision 16: a resolve proof signs the *ask*, not the clock.
+    The signed bytes are `funduq-resolve:{run_id}:{sha256 hex of the ask
+    ids, sorted and NUL-joined}` — canonicalization lives in
+    `funduq_contract.resolve_payload` and nowhere else, so both sides
+    derive the same bytes from the same set. Order does not matter here:
+    sorting is the builder's job, not the caller's.
+
+    Consequently there is **no timestamp and no freshness window** on this
+    one proof, unlike cancel and view: a later pause has new ask ids, so
+    the signature never verifies against any ask but the one it was signed
+    for, and replay against that same ask is consumed by the reopen's own
+    status guard.
+
+    `ask_ids` must be everything the run is still waiting on — see
+    `SoukClient.last_outstanding_asks`. A subset does not verify.
+    """
+    return {
+        "publicKey": identity.public_key,
+        "signature": identity.sign_resolution(run_id, ask_ids),
+    }
 
 
 class AgentNotFound(Exception):
@@ -76,6 +104,13 @@ class SoukClient:
         self.timeout = timeout
         self.last_thread_id: str | None = None
         self.last_run_id: str | None = None
+        # What the last run this client streamed is still waiting on, if it
+        # paused — its interrupt / tool-call ids, in core's one ask id
+        # space. Surfaced because since contract revision 16 a caller
+        # *cannot resolve a paused run without them*: the resolve proof
+        # signs exactly this set (see `resolution_proof`), so a client that
+        # only reported "it paused" left the caller unable to answer.
+        self.last_outstanding_asks: list[str] = []
 
     async def roster(self) -> list[Agent]:
         """Everyone this souk lists, whether or not anybody is serving them."""
@@ -143,6 +178,7 @@ class SoukClient:
         metadata: dict[str, Any] | None = None,
         resume: list[dict[str, Any]] | None = None,
         addressed_run_id: str | None = None,
+        resolution: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """POSTs a RunAgentInput to `/agui/{provider}/{name}` and yields each
         AG-UI event as it streams back. Pass `thread_id` from a previous
@@ -174,6 +210,13 @@ class SoukClient:
         `last_run_id`): it rides as `forwardedProps.addressedRunId`, and
         souk delivers the message into that run instead of starting a new
         turn. Interjection is caller-declared, never inferred.
+
+        `resolution`, if given, is the proof that this caller may answer a
+        paused run bound to an actor chain — `{publicKey, signature}` from
+        `resolution_proof(identity, run_id, ask_ids)`, riding
+        `metadata.resolution` where souk reads it. Build it over
+        `last_outstanding_asks` from the stream that paused; a run on an
+        unbound thread needs none.
         """
         if thread_id is None:
             thread_id = await self.create_thread(agent)
@@ -194,6 +237,8 @@ class SoukClient:
         }
         if message:
             body["messages"] = [{"id": str(uuid4()), "role": role, "content": message}]
+        if resolution is not None:
+            metadata = {**(metadata or {}), "resolution": resolution}
         if metadata is not None:
             body["metadata"] = metadata
         if resume is not None:
@@ -211,9 +256,41 @@ class SoukClient:
                 # standard AG-UI place to learn them, not a souk-invented
                 # side channel.
                 self.last_thread_id = thread_id
+                # The ask id space core pauses on, tracked as the stream
+                # goes by: tool calls announced and not answered, plus the
+                # interrupts the RUN_FINISHED outcome names. Mirrors
+                # funduq.pause's `unanswered_tool_calls` /
+                # `outstanding_asks` — the ids a resolve proof must sign.
+                announced: list[str] = []
+                answered: set[str] = set()
+                interrupts: list[str] = []
+                self.last_outstanding_asks = []
                 async for sse in event_source.aiter_sse():
                     event = json.loads(sse.data)
-                    if event.get("type") == "RUN_STARTED":
+                    kind = event.get("type")
+                    if kind == "RUN_STARTED":
                         self.last_thread_id = event.get("threadId", thread_id)
                         self.last_run_id = event.get("runId")
+                    elif kind == "TOOL_CALL_START":
+                        announced.append(event["toolCallId"])
+                    elif kind == "TOOL_CALL_RESULT":
+                        answered.add(event["toolCallId"])
+                    elif kind == "RUN_FINISHED":
+                        outcome = event.get("outcome")
+                        if isinstance(outcome, dict) and outcome.get("type") == "interrupt":
+                            interrupts = [
+                                ask
+                                for ask in (
+                                    interrupt.get("toolCallId") or interrupt.get("id")
+                                    for interrupt in outcome.get("interrupts") or []
+                                )
+                                if ask
+                            ]
+                            outstanding = [
+                                ask for ask in announced if ask not in answered
+                            ]
+                            outstanding += [
+                                ask for ask in interrupts if ask not in outstanding
+                            ]
+                            self.last_outstanding_asks = outstanding
                     yield event

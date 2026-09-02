@@ -16,7 +16,7 @@ This repo is the *serving* half. Upstream — [funduq](https://github.com/hukaic
 
 Two consequences worth knowing before touching anything:
 
-- **The wire contract is authored here, and so are both sides of it.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, the ticket handshake. The SDKs that implement that spec live in this repo too ([`souk-agent-sdk/`](souk-agent-sdk) for providers, [`souk-client-sdk/`](souk-client-sdk) for callers and their KYOK bridges): upstream keeps no network code at all, client side included. The signed payloads inside the frames are upstream's, vendored as [`docs/upstream-contract-vectors.json`](docs/upstream-contract-vectors.json).
+- **The wire contract is authored here, and so are both sides of it.** [`docs/server-mode.md`](docs/server-mode.md) is the spec of record — single HTTP port, WebSocket relays for providers and KYOK bridges, the ticket handshake. The SDKs that implement that spec live in this repo too ([`souk-agent-sdk/`](souk-agent-sdk) for providers, [`souk-client-sdk/`](souk-client-sdk) for callers and their KYOK bridges): upstream keeps no network code at all, client side included. The signed payloads inside the frames are upstream's, pinned at **contract revision 16** and vendored as [`docs/upstream-contract-vectors.json`](docs/upstream-contract-vectors.json). Upstream withdrew its own frame vocabulary and protocol machines at revision 11 — over a wire the provider-initiated calls are plain request/response — so the orderings on this wire are stated and tested here; what it publishes instead is every crossing shape as a pydantic model.
 - **funduq core arrives from PyPI** (`funduq`, version-pinned in `pyproject.toml`). This repo contains no domain logic — it lifts headers, frames responses, binds sockets, and hands everything else to core.
 
 ---
@@ -72,11 +72,11 @@ graph TD
 
 ## Configuration
 
-Two env families now — [.env.example](.env.example) documents both (nothing auto-loads it; it's for `export` / compose). The prefixes mirror the project boundary:
+Two env families now — [.env.example](.env.example) documents both (nothing auto-loads it; it's for `export` / compose). The prefixes mirror the project boundary — and since contract revision 14 core reads no environment at all (`CoreSettings.from_env` is gone), so **the gateway reads both families**: the names and defaults are unchanged, the reading moved to the half of the system that was always allowed to know about deployments.
 
 | Layer | Variables | Examples |
 |---|---|---|
-| **Core** (`CoreSettings`, upstream — read explicitly via `CoreSettings.from_env()`) | database, domain policy, keys | `FUNDUQ_DATABASE_URL` (unset = zero-config SQLite `./funduq.db`), `FUNDUQ_DB_SCHEMA`, `FUNDUQ_TOKEN_SIGNING_SECRET` (**required**), `FUNDUQ_IDENTITY_PRIVATE_KEY` (**required** — the funduq's own Ed25519 identity; providers pin it, so it must be stable across restarts and replicas) |
+| **Core** (`CoreSettings`, upstream — read **here**, by `souk_server.config.core_settings_from_env()`) | database, domain policy, keys | `FUNDUQ_DATABASE_URL` (unset = zero-config SQLite `./funduq.db`), `FUNDUQ_DB_SCHEMA`, `FUNDUQ_TOKEN_SIGNING_SECRET` (**required**), `FUNDUQ_IDENTITY_PRIVATE_KEY` (**required** — the funduq's own Ed25519 identity; providers pin it, so it must be stable across restarts and replicas), plus the optional broker waits `FUNDUQ_UNSERVED_TIMEOUT_SECONDS` / `FUNDUQ_DELIVER_TIMEOUT_SECONDS` / `FUNDUQ_UNDELIVERED_WINDOW_SECONDS` |
 | **Serving** (`ServingSettings`, here) | everything that only means something once there's a socket | `SOUK_HTTP_PORT`, `SOUK_PUBLIC_HTTP_URL`, `SOUK_CORS_ALLOW_ORIGINS`, `SOUK_HTTP_TLS_CERT_PATH`/`_KEY_PATH` |
 
 ---

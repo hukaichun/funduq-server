@@ -26,6 +26,7 @@ from mcp import Client
 
 from funduq.identity import provider_fingerprint
 from funduq.models import AgentSummary
+from funduq_contract import Registration
 from funduq_provider_sdk import InProcessLink, ProviderRuntime
 from souk_server.mcp_docent import (
     _seen_ago,
@@ -62,7 +63,11 @@ async def _register(souk, new_identity, provider_name: str, *agents: dict) -> st
     runtime.start()
     link = InProcessLink(souk, runtime)
     await souk.attach_provider(link)
-    await souk.register_agents(link, list(agents), provider_name=provider_name)
+    await souk.register_agents(
+        link,
+        [Registration.model_validate(a) for a in agents],
+        provider_name=provider_name,
+    )
     souk.detach_provider(identity.public_key, link)
     await runtime.aclose()
     return identity.public_key

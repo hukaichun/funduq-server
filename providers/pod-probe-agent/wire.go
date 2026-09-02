@@ -4,19 +4,21 @@
 // and must not need the gateway, souk core, or any Python installed to
 // come alive. Every payload here is cross-checked byte-for-byte in
 // wire_test.go against the vendored upstream vectors
-// (docs/upstream-contract-vectors.json, contract revision 7).
+// (docs/upstream-contract-vectors.json, contract revision 16).
 package main
 
 import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,6 +59,47 @@ func funduqConnectPayload(ticket, providerNonce string) []byte {
 // usable past the freshness window (funduq_contract.kyok_call_payload).
 func kyokCallPayload(bearer string, timestamp int64, bodyHash string) []byte {
 	return []byte(fmt.Sprintf("funduq-kyok-call:%s:%d:%s", bearer, timestamp, bodyHash))
+}
+
+// The three singular-act payloads. This probe signs none of them today —
+// it never pauses, so nothing resolves it, and a cancel reaches it as an
+// unsigned frame on the already-authenticated link. They live here anyway
+// because they are the family this binary's other payloads belong to, and
+// wire_test.go replays all three against the published vectors: if
+// upstream reshapes one, this binary finds out at `go test` rather than
+// the first time somebody writes a Go authority against it.
+//
+// Two shapes, and the difference is the whole of contract revision 16.
+
+// resolvePayload is what an authority signs to answer a paused run's
+// outstanding asks: `funduq-resolve:{run_id}:{hash}`, where hash is the
+// lowercase hex sha256 of the ask ids sorted and joined with a single NUL
+// byte (no trailing NUL; the empty set hashes the empty byte string).
+// Canonicalization lives here and nowhere else, exactly as it does in
+// upstream's builder — a caller hands over the ids it was told it was
+// waiting on, in whatever order they arrived. There is no timestamp and
+// no freshness window: the ids ARE the binding, since a later pause has
+// different ones, and replay against the same ask is consumed by the
+// status-guarded reopen. Sorting is byte-wise, which for UTF-8 is the
+// same order Python's sorted() gives over code points.
+func resolvePayload(runID string, askIDs []string) []byte {
+	sorted := append([]string(nil), askIDs...)
+	sort.Strings(sorted)
+	digest := sha256.Sum256([]byte(strings.Join(sorted, "\x00")))
+	return []byte("funduq-resolve:" + runID + ":" + hex.EncodeToString(digest[:]))
+}
+
+// cancelPayload is what an authority signs to ask that a run stop, and
+// viewPayload what a party on the run's chain signs to read a bound one.
+// Both stay in the timestamp family — the 60s freshness window still
+// applies to them — under their own tags, so no signature from one family
+// is ever mistakable for another's.
+func cancelPayload(runID string, timestamp int64) []byte {
+	return []byte(fmt.Sprintf("funduq-cancel:%s:%d", runID, timestamp))
+}
+
+func viewPayload(runID string, timestamp int64) []byte {
+	return []byte(fmt.Sprintf("funduq-view:%s:%d", runID, timestamp))
 }
 
 // fetchTicket is the out-of-band half of the handshake: POST /tickets
@@ -242,6 +285,14 @@ func agentRecords(names []string) []map[string]any {
 		records = append(records, map[string]any{
 			"name":        name,
 			"description": "Read-only state probe living inside a pod: reports file build/modify times, directory listings, bounded file reads, process and env facts. Cannot write, exec, or change anything.",
+			// Per-agent, and required of every link since contract
+			// revision 12: souk answers core's takes_interjections(name)
+			// from what we declare here and overwrites the stored value
+			// with it, so an omission is not "unknown" — it is this
+			// agent's card claiming the capability or disclaiming it.
+			// The probe runs to completion and never pauses, so there is
+			// no stream for an interjection to reach: false, always.
+			"takesInterjections": false,
 		})
 	}
 	return records

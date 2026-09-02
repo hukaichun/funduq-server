@@ -69,7 +69,7 @@ async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, ser
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post(
                 "/kyok/v1/chat/completions",
-                content=json.dumps({"messages": []}).encode(),
+                content=json.dumps({"model": "kyok", "messages": []}).encode(),
                 headers={"Authorization": f"Bearer {token}", "content-type": "application/json"},
                 auth=KyokSigningAuth(served.identity._key),
             )

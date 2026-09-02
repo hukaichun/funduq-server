@@ -15,19 +15,56 @@ dispatcher runs — never a JSON-RPC error inside a 200), and
 accepted. And `CancelTaskRequest.metadata` must pass through whole —
 the cancel-authority proof rides in it, and a gateway that drops the
 field silently refuses every cancel on a bound thread.
+
+**The proofs are the rest of this file**, and both moved this round.
+Reading a chain-bound run needs a view proof (contract revision 13), and
+A2A read requests carry no caller data at all, so it rides the
+`X-Funduq-View` header and reaches core through the handler's
+`view_metadata_of` hook. Answering a paused one needs a resolve proof
+that signs the *asks* rather than the clock (revision 16), which only
+works if the door tells a caller what those asks are — so a paused run
+carries them under `funduq/outstandingAsks`. Every proof here is signed
+with the real payload builders, never a hand-written string: a test that
+retyped the bytes could agree with itself while disagreeing with core.
 """
 
 from __future__ import annotations
 
+import json
+import time
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import func, select
 
 from funduq import repo
 from funduq.errors import ThreadQueueFull
 from funduq.protocols.a2a import A2AAdapter
 from funduq.schema import runs
+from funduq_contract import (
+    cancel_payload,
+    extend_chain,
+    new_chain,
+    resolve_payload,
+    view_payload,
+)
+from souk_server.api_a2a import OUTSTANDING_ASKS_METADATA_KEY
 
 
-def _v03_send(text: str, *, context_id: str | None = None, metadata: dict | None = None) -> dict:
+def _now() -> int:
+    """A real clock, because view and cancel proofs still carry one and
+    core still enforces a 60-second window on both. Only *resolve* stopped
+    signing time this round."""
+    return int(time.time())
+
+
+def _v03_send(
+    text: str,
+    *,
+    context_id: str | None = None,
+    task_id: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
     message: dict = {
         "role": "user",
         "parts": [{"kind": "text", "text": text}],
@@ -35,10 +72,74 @@ def _v03_send(text: str, *, context_id: str | None = None, metadata: dict | None
     }
     if context_id is not None:
         message["contextId"] = context_id
+    if task_id is not None:
+        message["taskId"] = task_id
     params: dict = {"message": message}
     if metadata is not None:
         params["metadata"] = metadata
     return {"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": params}
+
+
+class _Party:
+    """One key on a chain, able to sign what that key is allowed to sign."""
+
+    def __init__(self) -> None:
+        self.key = Ed25519PrivateKey.generate()
+
+    @property
+    def public_key(self) -> str:
+        return self.key.public_key().public_bytes_raw().hex()
+
+    def sign(self, payload: bytes) -> str:
+        return self.key.sign(payload).hex()
+
+    def view_header(self, run_id: str, timestamp: int) -> dict[str, str]:
+        """The `X-Funduq-View` header this gateway defines: compact JSON,
+        the proof upstream's `view_payload` states, nothing else."""
+        return {
+            "X-Funduq-View": json.dumps(
+                {
+                    "publicKey": self.public_key,
+                    "timestamp": timestamp,
+                    "signature": self.sign(view_payload(run_id, timestamp)),
+                },
+                separators=(",", ":"),
+            )
+        }
+
+    def resolution(self, run_id: str, ask_ids: list[str]) -> dict[str, str]:
+        """A resolve proof: `{publicKey, signature}` and **no timestamp**.
+        Revision 16 took the clock out — the signature binds the exact
+        asks being answered, so a later pause's new ids are what makes it
+        single-purpose, and there is no freshness window left to miss."""
+        return {
+            "publicKey": self.public_key,
+            "signature": self.sign(resolve_payload(run_id, ask_ids)),
+        }
+
+
+async def _bound_paused_run(souk, session, served, *, chain: list[str], head: str, asks: list[str]):
+    """A paused run on a thread bound to `chain`.
+
+    Built through repo rather than by sending: a run that really pauses
+    needs a provider to pause it, and what these tests are about is the
+    door in front of the pause, not the pause itself. Through the legal
+    status transitions, because the status machine refuses a jump straight
+    from queued to input-required — correctly.
+    """
+    thread_id = await repo.create_thread(session, served.ref(), head_key=head)
+    created = await repo.create_run(
+        session, thread_id, served.ref(), "a2a", {}, head_key=head, actor_chain=chain
+    )
+    await repo.mark_run_status(session, created["run_id"], "running")
+    await repo.mark_run_status(
+        session,
+        created["run_id"],
+        "input-required",
+        metadata={"interrupts": [{"id": ask} for ask in asks]},
+    )
+    await session.commit()
+    return thread_id, created["run_id"]
 
 
 async def test_the_card_is_served_by_pair_and_says_where_the_rpc_is(client, register):
@@ -144,7 +245,20 @@ async def test_a_v10_client_speaks_the_native_vocabulary_with_the_header(client,
             "jsonrpc": "2.0",
             "id": "2",
             "method": "SendMessage",
-            "params": {"message": {"role": "ROLE_USER", "parts": [{"text": "hi"}]}},
+            "params": {
+                "message": {
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}],
+                    # Required, and upstream's handler is what says
+                    # so: `validate_request_params` policed nothing in
+                    # the hand-rolled handler this replaced, so a
+                    # message with no id used to travel straight into
+                    # core. It is now InvalidParams, before any adapter
+                    # call — which is what a real v1.0 client already
+                    # sends anyway.
+                    "messageId": "m1",
+                }
+            },
         },
     )
 
@@ -240,7 +354,20 @@ async def test_thread_queue_full_escapes_as_a_429_that_says_retry(
             "jsonrpc": "2.0",
             "id": "3",
             "method": "SendMessage",
-            "params": {"message": {"role": "ROLE_USER", "parts": [{"text": "hi"}]}},
+            "params": {
+                "message": {
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}],
+                    # Required, and upstream's handler is what says
+                    # so: `validate_request_params` policed nothing in
+                    # the hand-rolled handler this replaced, so a
+                    # message with no id used to travel straight into
+                    # core. It is now InvalidParams, before any adapter
+                    # call — which is what a real v1.0 client already
+                    # sends anyway.
+                    "messageId": "m1",
+                }
+            },
         },
     )
 
@@ -254,12 +381,19 @@ async def test_cancel_passes_the_request_metadata_through_whole(
 ):
     """A run on a thread that bound an authority at birth can only be
     stopped by one of that thread's authorities, and the proof rides in
-    `CancelTaskRequest.metadata` (`metadata.cancel`, with `resolution` /
-    `delegation` beside it). A2A's cancel carries no message, so request
-    metadata is the one place it can be — a gateway that drops the field
-    silently refuses every cancel on a bound thread. Captured at the
-    adapter boundary, because what matters is exactly what core is
-    handed."""
+    `CancelTaskRequest.metadata` (`metadata.cancel`, with `resolution`
+    beside it). A2A's cancel carries no message, so request metadata is
+    the one place it can be — a gateway that drops the field silently
+    refuses every cancel on a bound thread. Captured at the adapter
+    boundary, because what matters is exactly what core is handed.
+
+    Two shapes here moved with contract revisions 15 and 16, and the
+    absences are the assertion: **no `delegation` key**, because the
+    session delegation certificate is gone and a grant is the
+    authenticating seat's policy now; and **the resolve proof carries no
+    timestamp**, because it signs the ask ids it answers rather than the
+    clock. Cancel keeps its timestamp — that family did not move.
+    """
     seen: dict = {}
 
     async def capture(self, agent, task_id, *, metadata=None):
@@ -271,8 +405,7 @@ async def test_cancel_passes_the_request_metadata_through_whole(
     served = await register("greeter")
     authority = {
         "cancel": {"signature": "ab" * 32, "timestamp": 1234, "publicKey": "cd" * 32},
-        "resolution": {"note": "operator"},
-        "delegation": {"delegatePublicKey": "ef" * 32},
+        "resolution": {"publicKey": "cd" * 32, "signature": "12" * 32},
     }
 
     resp = await client.post(
@@ -288,3 +421,227 @@ async def test_cancel_passes_the_request_metadata_through_whole(
     assert resp.status_code == 200
     assert seen["task_id"] == "run_bound"
     assert seen["metadata"] == authority
+    assert "delegation" not in seen["metadata"]
+    assert "timestamp" not in seen["metadata"]["resolution"]
+
+
+# --- the view proof: reading a chain-bound run ------------------------------
+
+
+async def test_a_bound_run_read_without_a_view_proof_reads_as_absent(
+    client, register, session, souk
+):
+    """Contract revision 13's exposure, from this door's side. A run whose
+    thread bound a chain is not public any more: a read carrying no view
+    proof is answered *absent*, not refused, because existence is part of
+    what is guarded — a 403 would confirm the run to somebody who may not
+    see it.
+
+    The same read with a proof from the head succeeds, which is what makes
+    the first answer a decision rather than a broken route.
+    """
+    head = _Party()
+    served = await register("approver")
+    chain = new_chain(head.key)
+    _, run_id = await _bound_paused_run(
+        souk, session, served, chain=chain, head=head.public_key, asks=["ask_1"]
+    )
+    get_task = {"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}}
+
+    bare = await client.post(f"/a2a/{served.path()}/rpc", json=get_task)
+
+    assert bare.status_code == 200
+    assert "result" not in bare.json(), bare.text
+
+    proven = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json=get_task,
+        headers=head.view_header(run_id, _now()),
+    )
+
+    assert proven.json()["result"]["id"] == run_id
+
+
+async def test_a_malformed_view_header_is_absence_and_never_a_500(
+    client, register, session, souk
+):
+    """Garbage in the header must not become a stack trace. Passing
+    nothing is the designed answer: a caller holding a broken proof learns
+    exactly what a caller holding none does, which is the whole point of
+    answering absence."""
+    head = _Party()
+    served = await register("approver")
+    _, run_id = await _bound_paused_run(
+        souk, session, served, chain=new_chain(head.key), head=head.public_key, asks=["ask_1"]
+    )
+
+    for header in ("not json at all", "[]", '{"publicKey": "nope"}', ""):
+        resp = await client.post(
+            f"/a2a/{served.path()}/rpc",
+            json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
+            headers={"X-Funduq-View": header},
+        )
+        assert resp.status_code == 200, (header, resp.text)
+        assert "result" not in resp.json(), (header, resp.text)
+
+
+async def test_a_mid_chain_hop_may_view_the_run_it_may_not_cancel(
+    client, register, session, souk
+):
+    """The read circle is wider than the act circle, and one key proves
+    both halves at once. `mid` is on the chain but is not its head — the
+    responsibility flowed through it, so it may *look*; cancelling stays
+    with the head and the serving provider, so the same key signing the
+    same run is refused there.
+
+    Two different payload families do this, which is why it is one test:
+    if the gateway ever handed the view proof to the cancel door or the
+    other way round, exactly one of these assertions would flip.
+    """
+    head, mid = _Party(), _Party()
+    served = await register("approver")
+    chain = extend_chain(mid.key, new_chain(head.key))
+    _, run_id = await _bound_paused_run(
+        souk, session, served, chain=chain, head=head.public_key, asks=["ask_1"]
+    )
+    now = _now()
+
+    seen = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
+        headers=mid.view_header(run_id, now),
+    )
+    assert seen.json()["result"]["id"] == run_id, seen.text
+
+    refused = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "10",
+            "method": "tasks/cancel",
+            "params": {
+                "id": run_id,
+                "metadata": {
+                    "cancel": {
+                        "publicKey": mid.public_key,
+                        "timestamp": now,
+                        "signature": mid.sign(cancel_payload(run_id, now)),
+                    }
+                },
+            },
+        },
+    )
+    assert "result" not in refused.json(), refused.text
+
+
+# --- the resolve proof: answering a paused run ------------------------------
+
+
+async def test_a_paused_run_says_what_it_is_waiting_on(client, register, session, souk):
+    """The one genuinely new capability this round. A resolve proof signs
+    the asks it answers, so a caller that cannot enumerate them has no
+    proof to build — the pause would be unanswerable by anyone who was not
+    already watching the stream that announced it. A2A has no field for
+    them, so this door puts them on the Task's metadata."""
+    head = _Party()
+    served = await register("approver")
+    _, run_id = await _bound_paused_run(
+        souk,
+        session,
+        served,
+        chain=new_chain(head.key),
+        head=head.public_key,
+        asks=["ask_1", "ask_2"],
+    )
+
+    resp = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
+        headers=head.view_header(run_id, _now()),
+    )
+
+    task = resp.json()["result"]
+    # Sorted, the order `resolve_payload` canonicalizes in.
+    assert task["metadata"][OUTSTANDING_ASKS_METADATA_KEY] == ["ask_1", "ask_2"]
+
+
+async def test_a_resolution_signing_the_right_asks_is_accepted(
+    client, register, session, souk
+):
+    """Signed over exactly what the pause said it was waiting on, by the
+    chain's head — and the run reopens. This is the road the ask ids above
+    exist to make walkable, driven end to end."""
+    head = _Party()
+    served = await register("approver")
+    chain = new_chain(head.key)
+    thread_id, run_id = await _bound_paused_run(
+        souk, session, served, chain=chain, head=head.public_key, asks=["ask_1", "ask_2"]
+    )
+
+    resp = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json=_v03_send(
+            "approved",
+            context_id=thread_id,
+            task_id=run_id,
+            # The chain rides along because writing to a bound thread is
+            # itself scoped to its head — the resolve proof answers the
+            # *ask*, it does not grant membership of the conversation.
+            metadata={
+                "actorChain": chain,
+                "resolution": head.resolution(run_id, ["ask_1", "ask_2"]),
+            },
+        ),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert "error" not in resp.json(), resp.text
+    # The same run continuing, not a new one queued behind it.
+    assert resp.json()["result"]["id"] == run_id
+    reopened = await repo.get_run(session, run_id)
+    assert reopened.status != "input-required"
+
+
+@pytest.mark.parametrize(
+    "asks",
+    [
+        pytest.param(["ask_1"], id="a-subset-of-the-open-asks"),
+        pytest.param(["ask_1", "ask_2", "ask_3"], id="one-ask-too-many"),
+        pytest.param(["ask_9"], id="asks-from-some-other-pause"),
+    ],
+)
+async def test_a_resolution_signing_the_wrong_asks_is_refused(
+    client, register, session, souk, asks
+):
+    """The instance binding, from the outside. A proof is for one pause
+    and one set of asks: signing a stale set, a partial set, or somebody
+    else's is refused, and the run stays paused. There is no timestamp to
+    get wrong here — this is what replaced the freshness window, and it is
+    stricter, because a later pause has ids no old signature ever saw."""
+    head = _Party()
+    served = await register("approver")
+    chain = new_chain(head.key)
+    thread_id, run_id = await _bound_paused_run(
+        souk, session, served, chain=chain, head=head.public_key, asks=["ask_1", "ask_2"]
+    )
+
+    resp = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        json=_v03_send(
+            "approved",
+            context_id=thread_id,
+            task_id=run_id,
+            # A caller that is otherwise entirely in order: the right
+            # chain, the right head, the right thread. The only thing
+            # wrong is which asks the signature covers, so that is the
+            # only thing this can be failing on.
+            metadata={
+                "actorChain": chain,
+                "resolution": head.resolution(run_id, asks),
+            },
+        ),
+    )
+
+    assert "result" not in resp.json(), resp.text
+    still_paused = await repo.get_run(session, run_id)
+    assert still_paused.status == "input-required"

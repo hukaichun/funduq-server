@@ -32,7 +32,9 @@ from funduq.errors import (
     ThreadOwnershipMismatch,
     ThreadQueueFull,
 )
+from funduq.identity import InvalidCancel, InvalidResolution, InvalidView
 from funduq.models import AgentRef
+from funduq.repo import ThreadMembershipRequired
 from funduq_contract import InvalidChain
 from souk_server.config import ServingSettings
 
@@ -70,6 +72,23 @@ _STATUS = {
     # A tampered actor chain (`funduq_contract.InvalidChain`, which
     # replaced core's InvalidActorChain) is refused at the door.
     InvalidChain: 401,
+    # The singular acts on a chain-bound run, refused for want of a proof
+    # from one of its authorities. They are plain ValueErrors upstream, so
+    # without these rows an unproven cancel or an unproven resolve reaches
+    # a caller as a 500 — a server fault for a caller mistake, and one
+    # that says nothing about what to send instead. `InvalidView` is here
+    # for completeness only: the read doors answer an unproven view as
+    # absence and never raise it outward (see api_a2a).
+    InvalidCancel: 401,
+    InvalidResolution: 401,
+    InvalidView: 401,
+    # Writing to a thread bound to a responsibility segment when you are
+    # neither its head nor its serving provider. A bare `Exception`
+    # upstream — not even a ValueError — so it is the likeliest of these
+    # to reach a caller as a 500. 403 rather than 401: the caller
+    # identified itself perfectly well (its chain verified), it simply is
+    # not a member of this conversation.
+    ThreadMembershipRequired: 403,
     InvalidRunInput: 400,
     # Backpressure: the thread's buffer is full and the request was NOT
     # accepted — say retry, never accept-then-expire. (The A2A door maps

@@ -128,6 +128,7 @@ if __name__ == "__main__":
 | 🎫 **Ticket Handshake & Mutual Identity** | Fetches a single-use ticket over `POST /tickets`, signs a proof that *names the souk it means to reach*, and verifies souk's counter-signature on the `welcome` before treating the link open. Pass `souk_public_key` to pin the souk; a mismatch is refused **before anything is signed** (`SoukIdentityMismatch`, a `WrongFunduq`). |
 | 🔄 **Automatic Reconnection & Re-Registration** | A dropped socket ends nothing: the runtime keeps running, queued frames flush on the next connection, and every reconnect performs the full ceremony again — fresh ticket, fresh handshake, fresh `register` — without dropping in-flight runs. |
 | ⚡ **One Socket, Server-Driven** | Holds a single outbound WebSocket (`/ws/provider`); the *server* runs the offer loop and pushes runs — input included — as they're claimed. Idle costs one quiet connection, and new work arrives in one push, not one poll cycle. |
+| 💬 **Interjections** | An `AgentHandle` with an `interject_stream` hook takes messages addressed to a run already in flight; the capability is derived from the hook and declared per agent as `takesInterjections` in the `register` frame, so the agent card cannot claim what the router would not honour. An agent without one refuses the interjection, and the caller learns it cannot be interrupted. |
 | ⛔ **Task Preemption & Cancellation** | On Souk's `cancel` frame, cancels that run's task — propagating `asyncio.CancelledError` into in-flight LLM/tool calls, not merely between yields. Souk *asks*; complying is this client's choice. |
 | 🎛️ **Concurrency Throttling** | `max_concurrent_runs=N` prevents GPU/LLM rate-limit saturation by letting Souk queue surplus work server-side. The ack stays three-valued: accepted, declined-because-full, or permanently refused with a reason. |
 | ⏸️ **Human-in-the-Loop (HITL)** | Intercepts AG-UI native `interrupt` outcomes to pause runs resumbably (`status='input-required'`). |
@@ -154,7 +155,7 @@ sequenceDiagram
     Souk-->>Agent: welcome (funduqPublicKey, answer)
     Note over Agent: answer verified over funduq_connect_payload(ticket, nonce)<br/>— WrongFunduq if it does not prove the key
 
-    Agent->>Souk: register {agents: [{name, description, agentCardExtra, metadata}]}
+    Agent->>Souk: register {agents: [{name, description, agentCardExtra, metadata, takesInterjections}]}
     Souk-->>Agent: registered {names} — unsigned: the link is the proof
 
     Note over Souk: Souk drives the offer loop on this worker's behalf,<br/>within the declared maxConcurrentRuns budget
@@ -194,8 +195,7 @@ Every `run_stream` generator must yield events adhering to AG-UI specifications:
 An agent can delegate sub-tasks to other agents registered on Souk using `a2a_client` (speaking a2a-sdk 1.1's JSON-RPC wire — `SendStreamingMessage`, `A2A-Version: 1.0`):
 
 ```python
-from souk_agent_sdk.a2a_client import call_agent_streaming
-from souk_agent_sdk.identity import extend_actor_chain, new_actor_chain
+from souk_agent_sdk.a2a_client import call_agent_streaming, get_task
 
 # Delegate a streaming task to a sub-agent
 async for update in call_agent_streaming(
@@ -205,7 +205,23 @@ async for update in call_agent_streaming(
     actor_chain=actor_chain,              # Multi-hop identity chain
 ):
     print("Sub-agent update:", update)
+
+# Reading a task later needs a *view proof* when its thread is bound to a
+# chain (contract revision 13): pass this provider's identity and the
+# read is signed for it. Without one, a bound run answers "not found" —
+# existence is part of what is guarded, so the read does not error, it
+# simply finds nothing.
+task = await get_task(
+    "http://localhost:8000/a2a/<provider>/<agent>/rpc",
+    task_id,
+    identity=provider.identity,
+)
 ```
+
+The non-streaming `call_agent` is the same call answered with the settled
+`Task`, and carries A2A's two honoured configuration fields:
+`return_immediately` (answer with the Task as it stands — souk's queued
+lane makes `submitted` a state with real duration) and `history_length`.
 
 ---
 
@@ -215,7 +231,7 @@ async for update in call_agent_streaming(
 > **Identity Key Persistence**
 > The provider's identity is defined by its **Ed25519 keypair** (`souk_identity.key`).
 > - Reconnecting with the same key keeps this provider *being* the same provider — the pair `(public key, agent name)` is the address everything else points at.
-> - If `souk_identity.key` is lost, a regenerated key is a *new, separate identity*: anything pinned to the old key (a delegation target, a thread's bound authority) keeps pointing at the orphan.
+> - If `souk_identity.key` is lost, a regenerated key is a *new, separate identity*: anything pinned to the old key (a thread's bound authority, a chain hop already signed) keeps pointing at the orphan.
 > - **Always back up `souk_identity.key` in production environments!**
 
 ---

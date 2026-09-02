@@ -14,8 +14,9 @@ only channel capacity has, and why nothing here counts anything.
 
 Nothing bearer-shaped is involved, and nothing replayable either. The
 link opens on upstream's ticket handshake (funduq's
-docs/writing-a-transport.md; the gateway repo's docs/server-mode.md is
-the frame spec): the provider fetches a single-use ticket over HTTP
+docs/provider-link.md is the settled design; the gateway repo's
+docs/server-mode.md is the frame spec): the provider fetches a
+single-use ticket over HTTP
 (`POST /tickets`), signs a proof that *names the funduq it means to
 reach*, and connects with two frames — hello, welcome. The welcome
 carries funduq's counter-signature over the ticket and this side's
@@ -44,7 +45,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import websockets
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from funduq_provider_sdk import (
     AgentHandle,
     DeliveredRun,
@@ -52,6 +53,7 @@ from funduq_provider_sdk import (
     HandleProvider,
     ProviderIdentity,
     ProviderRuntime,
+    Refusal,
     WrongFunduq,
     funduq_connect_payload,
     new_nonce,
@@ -80,6 +82,36 @@ HANDSHAKE_VERSION = 4
 # database read on the far side of a socket, and the failure it guards is
 # a lost frame, not a slow one.
 QUERY_TIMEOUT_SECONDS = 30.0
+
+
+def dump_envelope(shape: BaseModel) -> dict[str, Any]:
+    """A crossing shape (`DeliveredRun`, `Registration`, …) as its frame.
+
+    `by_alias=True` and **never** `exclude_none`. `RunAgentInput` has
+    required fields that are legitimately null — `state`,
+    `forwardedProps` — and a stripped envelope fails `model_validate` on
+    the far side, which turns a perfectly good run into a *permanent*
+    refusal. The withdrawn codec used to enforce this; nothing upstream
+    does now, so it is stated here, once, and tested.
+    """
+    return shape.model_dump(by_alias=True, mode="json")
+
+
+def dump_event(event: Any) -> Any:
+    """One AG-UI event as it goes on the wire — `exclude_none=True`, the
+    opposite rule to `dump_envelope` above and just as load-bearing.
+
+    An AG-UI event is *relayed to the caller's stream*, and AG-UI's
+    optional fields (`timestamp`, `rawEvent`) dumped as explicit nulls
+    are injected into somebody else's event stream. Both halves pull
+    opposite ways, which is exactly why neither is left to a caller.
+
+    Anything that is not a pydantic model — a plain dict from an agent
+    that builds its own events — is passed through untouched.
+    """
+    if isinstance(event, BaseModel):
+        return event.model_dump(by_alias=True, exclude_none=True, mode="json")
+    return event
 
 
 class SoukIdentityMismatch(WrongFunduq):
@@ -174,24 +206,44 @@ class SoukProvider(FunduqLink):
     def max_concurrent_runs(self) -> int | None:
         return self.runtime.max_concurrent_runs
 
-    async def offer(self, run: DeliveredRun) -> bool:
-        """souk offers a run. Never called on this side — a socket
-        provider is offered work by a `run` frame, which `_offer` below
+    async def deliver(self, run: DeliveredRun) -> bool | Refusal:
+        """souk hands a run down. Never called on this side — a socket
+        provider is handed work by a `run` frame, which `_offer` below
         turns into `runtime.deliver`. It exists because `FunduqLink` names
-        both directions and this is the half a wire routes differently."""
+        both directions and this is the half a wire routes differently.
+
+        Three-valued, as upstream's link is: `True` accepted, `False` a
+        transient decline (full right now — the run stays souk's), and a
+        `Refusal` a permanent one.
+        """
         return await self.runtime.deliver(run)
 
-    def cancel(self, run_id: str) -> None:
+    def takes_interjections(self, agent_name: str) -> bool:
+        """Whether the named agent takes interjections — a **method**, per
+        contract revision 12's runtime. Read as an attribute it would be a
+        bound method, which is truthy, which would declare every agent
+        interjection-capable and never fail loudly."""
+        return self.runtime.takes_interjections(agent_name)
+
+    async def cancel(self, run_id: str) -> bool:
         """souk is asking for a run to stop. A request, and this provider
         complies — the runtime cancels the task, which is the only way to
         interrupt an arbitrary async generator. Reached from the `cancel`
-        frame; souk never calls it directly on this side of a wire."""
+        frame; souk never calls it directly on this side of a wire.
+
+        The `True` is a receipt that the ask arrived, never an outcome:
+        the run ends when the agent's generator ends, and `finish` is what
+        says so. Returning `None` here logs a warning on every cancel.
+        """
         self.runtime.cancel(run_id)
+        return True
 
     # ---- provider → souk
 
     async def report_event(self, run_id: str, event: Any) -> None:
-        self._outbound.put_nowait({"type": "event", "runId": run_id, "event": event})
+        self._outbound.put_nowait(
+            {"type": "event", "runId": run_id, "event": dump_event(event)}
+        )
 
     async def finish_run(self, run_id: str) -> None:
         self._outbound.put_nowait({"type": "finish", "runId": run_id})
@@ -380,16 +432,31 @@ class SoukProvider(FunduqLink):
         `error` frame with the socket still open, and is raised so the
         reconnect loop retries rather than idling registered-as-nothing.
         """
-        # `as_registration` is upstream's statement of what a card is
-        # (name + description, agent_card_extra/metadata only when
-        # non-empty); this only re-spells its keys camelCase, which is
-        # every wire frame's casing here.
-        wire_key = {"agent_card_extra": "agentCardExtra"}
+        # `as_registration()` returns upstream's `Registration` *model* now
+        # (revision 11), so the camelCase re-spelling this used to do by
+        # hand is the model's own aliases — one dump, no field mapping.
+        #
+        # `takesInterjections` is re-derived from the runtime rather than
+        # taken from the model, because the runtime is what actually
+        # routes an interjection: it asks the provider for the agent's
+        # hook, and a card that claimed more than the router would honour
+        # is exactly the lie revision 12 removed. On the gateway side core
+        # calls `connection.takes_interjections(name)` and overwrites what
+        # the Registration carried; this frame is where a *remote* link
+        # gets to answer that question at all.
         frame: dict[str, Any] = {
             "type": "register",
             "agents": [
-                {wire_key.get(key, key): value for key, value in reg.items()}
-                for reg in (agent.as_registration() for agent in self.agents.values())
+                dump_envelope(
+                    agent.as_registration().model_copy(
+                        update={
+                            "takes_interjections": self.runtime.takes_interjections(
+                                agent.name
+                            )
+                        }
+                    )
+                )
+                for agent in self.agents.values()
             ],
         }
         if self.provider_name is not None:
@@ -428,8 +495,16 @@ class SoukProvider(FunduqLink):
                     elif kind == "queryResult":
                         self._resolve_query(frame)
                     elif kind == "cancel":
-                        self.cancel(frame.get("runId"))
+                        await self.cancel(frame.get("runId"))
                     elif kind == "error":
+                        # Not a path to handle, and deliberately not fatal.
+                        # The commonest one is a verdict that missed the
+                        # delivery window (5s upstream): souk had already
+                        # taken the run back, so the ack matched nothing
+                        # and was answered false. That is breakage being
+                        # reported, not a protocol error — souk simply
+                        # offers the same run again and this side accepts
+                        # it again, which is why the socket stays up.
                         logger.warning("souk rejected a frame: %s", frame)
                     else:
                         logger.warning("unexpected frame from souk, ignoring: %s", frame)
@@ -467,11 +542,16 @@ class SoukProvider(FunduqLink):
         # model_dump(by_alias=True)` on souk's side, rebuilt here with
         # `model_validate`. No field mapping on either end; a frame that
         # does not validate is a permanent refusal, because the same bytes
-        # re-offered can never do better — the rule `DeliveredRun.
-        # from_claimed` states in-process, met at this transport's rebuild
-        # step. The reason rides the ack, which keeps it three-valued.
+        # re-offered can never do better. The reason rides the ack, which
+        # keeps it three-valued.
+        #
+        # `type` is the transport's own vocabulary and not the envelope's,
+        # and every crossing shape forbids unknown fields since revision
+        # 11 — so it is dropped rather than handed to a model that would
+        # (correctly) refuse it.
+        payload = {key: value for key, value in frame.items() if key != "type"}
         try:
-            delivered = DeliveredRun.model_validate(frame)
+            delivered = DeliveredRun.model_validate(payload)
         except ValidationError as e:
             reason = f"frame does not validate as a DeliveredRun: {e}"
             logger.warning("refusing run %s: %s", run_id, reason)
@@ -479,9 +559,24 @@ class SoukProvider(FunduqLink):
                 {"type": "ack", "runId": run_id, "accepted": False, "reason": reason}
             )
             return
-        accepted = await self.offer(delivered)
+        verdict = await self.deliver(delivered)
+        if isinstance(verdict, Refusal):
+            # A permanent refusal from the runtime — today, an interjection
+            # addressed to an agent that takes none. Its reason travels, so
+            # souk fails the run instead of re-offering bytes that can
+            # never be accepted.
+            logger.info("refusing run %s: %s", run_id, verdict.reason)
+            self._outbound.put_nowait(
+                {
+                    "type": "ack",
+                    "runId": run_id,
+                    "accepted": False,
+                    "reason": verdict.reason,
+                }
+            )
+            return
         self._outbound.put_nowait(
-            {"type": "ack", "runId": run_id, "accepted": bool(accepted)}
+            {"type": "ack", "runId": run_id, "accepted": bool(verdict)}
         )
 
     async def _write_loop(self, ws) -> None:
