@@ -13,6 +13,14 @@ souk core, no Python. That is the point of it being here: it is the third
 reference provider and the second independent implementation of the wire, so
 anywhere the spec is loose or wrong, this binary is what surfaces it.
 
+The connection is wire v4's three steps: fetch a single-use ticket and
+souk's public key out of band (`POST /tickets` — the pin is checked here,
+before anything is signed), open the socket with a two-frame handshake
+(`hello` carrying a proof that *names* that key, `welcome` carrying souk's
+verified counter-signature), then publish the roster on the open link with
+a `register` frame and serve runs once souk echoes `registered`. Every
+reconnect is the full ceremony again — the roster lives on the link.
+
 ## Why this exists
 
 The motivating story: a colleague debugging a service in production goes
@@ -59,8 +67,12 @@ changes anything.
   through souk's `/kyok/v1` relay and paid for with the *caller's* key, each
   call signed afresh with this agent's identity. The binary holds no model
   credential.
-- **Pinned souk.** `SOUK_PUBLIC_KEY` pins the souk's identity; the agent
-  refuses to hand its proof to anything else answering the URL.
+- **Pinned souk.** `SOUK_PUBLIC_KEY` pins the souk's identity, checked
+  against the key `POST /tickets` presents *before anything is signed* — a
+  proof for a substitute souk is never even computed. Pinned or not, the
+  proof names the key the ticket answer presented, and the welcome's
+  counter-signature is verified under that same key before the link is
+  treated as open.
 - **Ephemeral identity by default.** With no volume, a fresh Ed25519 identity
   is minted each start — a restarted pod is a new stall, and its old roster
   row ages out. Mount a volume at `/data` to keep one stable.
@@ -120,9 +132,20 @@ go test ./...
 ```
 
 `wire_test.go` replays [`docs/wire-vectors.json`](../../docs/wire-vectors.json)
-and upstream's `contract-vectors.json`: it asserts the handshake,
-registration and KYOK payloads are **byte-identical** to what the gateway and
-souk core verify against, and that the deterministic Ed25519 signatures match
-the published ones. That proves the crypto core without running the stack;
-the live ordering behaviour (welcome-then-run, reconnect-mid-run) is what the
-compose run exercises.
+(handshake version and frame vocabulary) and
+[`docs/upstream-contract-vectors.json`](../../docs/upstream-contract-vectors.json)
+(upstream funduq's payload vectors, vendored at contract revision 17): it
+asserts every published payload — the connect proof, the welcome
+verification, the KYOK call, and the singular-act family (resolve, cancel,
+view) this binary does not sign but must not drift from — is
+**byte-identical** to what the gateway and funduq core verify against, and
+that the deterministic Ed25519 signatures match the published ones. There
+is no kind the replay skips, and an unrecognised one fails: at revision 15
+the delegation certificate was deleted, and at 16 a resolve proof stopped
+signing the clock and started signing the ask
+(`funduq-resolve:{run_id}:{sha256 of the ask ids, sorted and NUL-joined}`),
+which is exactly the kind of change a skipped vector would have hidden.
+A missing vector file **fails** the suite rather than skipping — a
+checkout without the vectors cannot claim the wire is verified. That proves
+the crypto core without running the stack; the live ordering behaviour
+(register-then-run, reconnect-mid-run) is what the compose run exercises.

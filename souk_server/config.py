@@ -2,15 +2,82 @@
 exposed on a network.
 
 Deliberately a separate class in a separate distribution from
-`souk.config.CoreSettings`. Core never reads any of this — it cannot, it does
-not depend on this package — which is what makes "core knows a database and
-nothing else" a property of the packaging rather than of everyone's
-discipline. Both are still `pydantic-settings` models reading the same
-`SOUK_*` environment variables, so a deployment configures one process the
-way it always did.
+`funduq.config.CoreSettings`. Core never reads any of this — it cannot, it
+does not depend on this package — which is what makes "core knows a
+database and nothing else" a property of the packaging rather than of
+everyone's discipline. This serving layer keeps the `SOUK_*` prefix a
+deployment already sets.
+
+**Core's environment is now read here too.** `CoreSettings.from_env` was
+removed at contract revision 14 and core reads no environment at all:
+configuration is an argument, and a deployment that keeps it in the
+environment reads it itself. That deployment is this gateway, so
+`core_settings_from_env` below is where the `FUNDUQ_*` names live now. The
+names did not change, so compose and `.env.example` keep working
+unchanged — what changed is which package does the reading, which is the
+honest place for it: reading an environment is a serving decision, and it
+was always odd that the network-free half of the system owned one.
 """
 
+from __future__ import annotations
+
+import os
+from collections.abc import Mapping
+
+from funduq.config import CoreSettings
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The `FUNDUQ_*` name for each `CoreSettings` field this gateway reads,
+# paired with the parser that turns a string into the field's type. Written
+# out rather than derived from the model's field names: the environment is
+# a published surface (docs/server-mode.md, .env.example, compose), so a
+# field renamed upstream must be a visible edit here, not a silently
+# renamed variable in everybody's deployment.
+_CORE_ENV: tuple[tuple[str, str, type], ...] = (
+    ("database_url", "FUNDUQ_DATABASE_URL", str),
+    ("db_schema", "FUNDUQ_DB_SCHEMA", str),
+    ("token_signing_secret", "FUNDUQ_TOKEN_SIGNING_SECRET", str),
+    ("identity_private_key", "FUNDUQ_IDENTITY_PRIVATE_KEY", str),
+    ("stale_hidden_window_seconds", "FUNDUQ_STALE_HIDDEN_WINDOW_SECONDS", int),
+    ("thread_queue_limit", "FUNDUQ_THREAD_QUEUE_LIMIT", int),
+    ("provider_quality_tolerance", "FUNDUQ_PROVIDER_QUALITY_TOLERANCE", int),
+    # The broker's three waits became settings fields at revision 14 (the
+    # last live item of the #181 adopter review this repo filed). Optional
+    # everywhere: an operator who never sets them gets core's own defaults,
+    # which are the same single definitions `RunBroker` builds itself from.
+    ("unserved_timeout_seconds", "FUNDUQ_UNSERVED_TIMEOUT_SECONDS", float),
+    ("deliver_timeout_seconds", "FUNDUQ_DELIVER_TIMEOUT_SECONDS", float),
+    ("undelivered_window_seconds", "FUNDUQ_UNDELIVERED_WINDOW_SECONDS", float),
+)
+
+
+def core_settings_from_env(environ: Mapping[str, str] | None = None) -> CoreSettings:
+    """`CoreSettings` from the `FUNDUQ_*` environment this gateway documents.
+
+    Only names actually present are passed, so every field keeps core's own
+    default and there is no second copy of any default here. **An empty
+    string is unset**, not an empty value: a compose file with
+    `FUNDUQ_DB_SCHEMA=` in it means "I did not set this", and passing `""`
+    through would hand core a schema named the empty string. That is the
+    one interpretation this function makes, and it is the one an operator
+    means.
+
+    `token_signing_secret` and `identity_private_key` are required by
+    `CoreSettings` and are not defaulted here; their absence surfaces as a
+    pydantic ValidationError naming them, at startup, which is where a
+    missing identity should be found.
+    """
+    environ = os.environ if environ is None else environ
+    values: dict[str, object] = {}
+    for field, name, parse in _CORE_ENV:
+        raw = environ.get(name, "")
+        if raw == "":
+            continue
+        try:
+            values[field] = parse(raw)
+        except ValueError as e:
+            raise ValueError(f"{name} is not a valid {parse.__name__}: {raw!r}") from e
+    return CoreSettings(**values)
 
 
 class ServingSettings(BaseSettings):

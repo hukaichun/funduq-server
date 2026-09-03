@@ -1,32 +1,26 @@
 """WS /ws/kyok: the socket an LLM provider connects out on.
 
-The party on the far end changed, and this file changed with it. This
-socket used to carry an anonymous "bridge" that rendezvoused with souk
-over a caller-minted sessionId — the only actor in the system with no
-identity, which upstream's KYOK redesign names as the root of every
-failure that design had (AgentSouk/docs/keep-your-own-key.md, "History").
-The answering party is now an **LLM provider**: a first-class provider
-kind with the same Ed25519 identity machinery as an agent provider. It
-registers model offerings (`POST /llm-providers/register`, payload prefix
-`souk-register-llm`), then connects here and attaches as the live server
-for the offerings it names — `attach_llm_provider`, the mirror of
-`attach_provider` rule for rule, registration enforced the same way.
-
-So this socket now opens exactly like `/ws/provider`: the same four-frame
-mutual challenge-response (see handshake.py), with `modelNames` in the
-hello where the provider socket says `agentNames`. The signed digest of
-the hello binds the claimed names; fresh nonces on both sides make a
-recorded exchange worthless.
+The answering party is an **LLM provider**: a first-class provider kind
+with the same Ed25519 identity machinery as an agent provider. It opens
+this socket exactly like `/ws/provider` — the v4 ticket handshake, two
+frames (see handshake.py), minus `maxConcurrentRuns`, which the
+completion relay has no use for — and then publishes its model offerings
+*on the open link* with a `register` frame (`{"models": [...],
+"metadata"?}`), the mirror of the agent socket's. The old signed
+`POST /llm-providers/register` road is gone upstream; the link is the
+credential now. `deleteModel` removes an offering's record, refused by
+core while a live run is bound to it.
 
 What flows afterwards is the completion relay, inverted from the old
 poll: core resolves a run's binding to an attached link per call
 (`KyokAdapter.complete`) and calls `complete()` on it; this file writes
-that request down the socket as a `completionRequest` frame and feeds
-`chunk`/`done`/`error` frames back as the `ChatCompletionChunk` stream
-core is iterating. One socket serves concurrent completions, multiplexed
-by `requestId`.
+that request down the socket as a `completionRequest` frame — the
+`DeliveredCompletion` envelope, which now carries `actorChain` — and
+feeds `chunk`/`done`/`error` frames back as the `ChatCompletionChunk`
+stream core is iterating. One socket serves concurrent completions,
+multiplexed by `requestId`.
 
-What survived from the old socket, because it was the security fix worth
+What survived every redesign, because it was the security fix worth
 keeping: **an answer is accepted only on the connection its request was
 delivered to.** Membership in this connection's in-flight table — not
 anything a frame carries — is what authorizes an answer, so a requestId
@@ -45,25 +39,20 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, WebSocket
 from openai.types.chat import ChatCompletionChunk
 
-from souk.errors import InvalidRegistration, LlmProviderNotFound
-from souk.ids import new_id
-from souk_llm_provider_sdk import (
-    CONNECTED_LLM_PROVIDER_ATTRS,
-    CompletionRefused,
-    DeliveredCompletion,
-)
-from souk_server.handshake import HANDSHAKE_VERSION
+from funduq.errors import FunduqError, InvalidRegistration
+from funduq.ids import new_id
+from funduq_contract import DeliveredCompletion
+from funduq_provider_sdk.llm import CompletionRefused
+from souk_server.handshake import WIRE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     parse_frame,
     receive_hello,
     write_loop,
 )
-from souk_server.ws_provider import collect_connect_proof
 
 if TYPE_CHECKING:
-    from souk.core import Souk
-    from souk.kyok import CompletionRequest
+    from funduq.core import Funduq
 
 logger = logging.getLogger("souk.ws_kyok")
 
@@ -78,29 +67,40 @@ CHUNK_GAP_TIMEOUT_SECONDS = 120.0
 
 # What this socket accepts after the handshake — read by the dispatch and
 # published in docs/wire-vectors.json, asserted equal in tests.
-INBOUND_FRAME_TYPES = frozenset({"chunk", "done", "error"})
+INBOUND_FRAME_TYPES = frozenset({"register", "deleteModel", "chunk", "done", "error"})
 
 # Sentinel closing one completion's answer queue.
 _DONE = object()
 
 
 class SocketLLMProvider:
-    """`souk.kyok.ConnectedLLMProvider` with a WebSocket underneath.
+    """`funduq.kyok.ConnectedLLMProvider` with a WebSocket underneath.
 
     Duck-typed against core's protocol, like `SocketProvider` beside it,
-    and asserted against upstream's `CONNECTED_LLM_PROVIDER_ATTRS` in the
-    constructor for the same reason: an attribute core expects but this
-    forgets would attach fine and fail inside the relay, three layers
-    from the cause.
+    and asserted against `_PROTOCOL_SURFACE` in the constructor for the
+    same reason: an attribute core expects but this forgets would attach
+    fine and fail inside the relay, three layers from the cause. Upstream
+    withdrew the `CONNECTED_LLM_PROVIDER_ATTRS` list this used to read at
+    revision 11 — the models are the single definition now — but the
+    failure mode it guarded is unchanged, so the surface is named here.
+
+    Like `SocketProvider`, deliberately exposes no `sign_connect` — the
+    key lives on the far side of the socket, and the ticket, nonce and
+    proof from the hello go to `attach_llm_provider` explicitly.
 
     Holds one queue per in-flight completion, keyed by the requestId this
     side minted. That table is connection-scoped on purpose — it *is* the
     binding described in the module docstring.
     """
 
+    # The whole of what core reaches for on this object — `public_key` and
+    # `complete`, with no cancel and no abandon (revision 10 withdrew the
+    # one verb that was ever proposed for a caller that stopped listening).
+    _PROTOCOL_SURFACE = ("public_key", "complete")
+
     def __init__(self, public_key: str, outbound: asyncio.Queue) -> None:
         missing = sorted(
-            a for a in CONNECTED_LLM_PROVIDER_ATTRS if not hasattr(type(self), a)
+            a for a in self._PROTOCOL_SURFACE if not hasattr(type(self), a)
         )
         if missing:
             raise TypeError(
@@ -114,15 +114,21 @@ class SocketLLMProvider:
     def public_key(self) -> str:
         return self._public_key
 
-    def complete(self, request: "CompletionRequest") -> AsyncIterator[ChatCompletionChunk]:
+    def complete(self, request: DeliveredCompletion) -> AsyncIterator[ChatCompletionChunk]:
         """Write `request` to the wire and return the stream of its answer.
 
         The frame goes out here, not in the generator, so the request is
         on the wire the moment core holds the iterator — before anything
-        awaits it. The frame is `{"type", "requestId"}` plus the wire form
-        upstream declares (`DeliveredCompletion.from_request(...).
-        model_dump(by_alias=True)`), so neither end hand-writes the field
-        mapping any more.
+        awaits it.
+
+        **The request IS the wire shape.** Since contract revision 11 core
+        hands over the published `DeliveredCompletion` itself — its own
+        `CompletionRequest` and the SDK's `from_request` translation are
+        both gone — so this dumps what it was given (`by_alias=True`,
+        `actorChain` included) and there is no mapping either end can get
+        wrong. Its `body` is validated as OpenAI's own request shape on the
+        way in, at the door: a body that is not a chat-completion request
+        is a 400 from `KyokAdapter.complete` and never reaches this socket.
         """
         request_id = new_id("kyokreq")
         queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -131,9 +137,7 @@ class SocketLLMProvider:
             {
                 "type": "completionRequest",
                 "requestId": request_id,
-                **DeliveredCompletion.from_request(request).model_dump(
-                    by_alias=True, mode="json"
-                ),
+                **request.model_dump(by_alias=True, mode="json"),
             }
         )
         return self._answer_stream(request_id, queue)
@@ -185,74 +189,67 @@ class SocketLLMProvider:
 
 
 def _hello_error(hello: dict[str, Any]) -> str | None:
-    """What an LLM provider's hello must carry to be worth challenging.
-
-    Same checks and same ordering rationale as the provider socket's:
-    version first, by name; nothing signed until the frame is worth it.
-    """
+    """What an LLM provider's hello must carry. Same checks and the same
+    ordering rationale as the provider socket's — version first, by name —
+    minus `maxConcurrentRuns`, which this socket does not speak."""
     version = hello.get("version")
-    if version != HANDSHAKE_VERSION:
+    if version != WIRE_VERSION:
         if version is None:
             return (
-                "hello has no version: this souk speaks handshake "
-                f"v{HANDSHAKE_VERSION}, a mutual challenge-response"
+                "hello has no version: this souk speaks wire "
+                f"v{WIRE_VERSION}, the ticket handshake"
             )
-        return f"unsupported handshake version {version!r}; this souk speaks v{HANDSHAKE_VERSION}"
-    if not isinstance(hello.get("publicKey"), str):
+        return f"unsupported wire version {version!r}; this souk speaks v{WIRE_VERSION}"
+    if not isinstance(hello.get("publicKey"), str) or not hello["publicKey"]:
         return "hello needs a publicKey"
+    if not isinstance(hello.get("ticket"), str) or not hello["ticket"]:
+        return "hello needs a ticket — POST /tickets issues one"
     if not isinstance(hello.get("nonce"), str) or not hello["nonce"]:
         return "hello needs a nonce"
-    names = hello.get("modelNames")
-    if not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
-        return "modelNames must be a non-empty list of strings"
+    if not isinstance(hello.get("proof"), str) or not hello["proof"]:
+        return "hello needs a proof signed over the ticket"
     return None
 
 
 @router.websocket("/ws/kyok")
 async def kyok_socket(websocket: WebSocket) -> None:
-    souk: "Souk" = websocket.app.state.souk
+    funduq: "Funduq" = websocket.app.state.souk
 
     await websocket.accept()
-    received = await receive_hello(websocket)
-    if received is None:
+    hello = await receive_hello(websocket)
+    if hello is None:
         return
-    hello, _hello_raw = received
 
     problem = _hello_error(hello)
     if problem:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    exchange = await collect_connect_proof(websocket, souk, hello)
-    if exchange is None:
-        return
-    challenge, proof = exchange
-
     public_key = hello["publicKey"]
-    model_names = hello["modelNames"]
-
     outbound: asyncio.Queue = asyncio.Queue()
     link = SocketLLMProvider(public_key, outbound)
-    # Before attaching, for the same reason the provider socket queues its
-    # welcome first: attaching makes this link resolvable, and a
-    # completion could be delivered inside `attach_llm_provider`'s own
-    # awaits. Nothing is written until the writer task starts, so a failed
-    # attach still closes without ever sending this.
-    outbound.put_nowait({"type": "welcome"})
     try:
-        # Registration and the connect proof are both core's to enforce —
-        # a model name this key never registered, or a proof that does
-        # not answer the live challenge, is refused here.
-        await souk.attach_llm_provider(
+        answer = await funduq.attach_llm_provider(
             link,
-            model_names,
-            challenge=challenge,
+            ticket=hello["ticket"],
             provider_nonce=hello["nonce"],
-            proof=proof,
+            proof=hello["proof"],
         )
-    except (LlmProviderNotFound, InvalidRegistration, ValueError) as e:
+    except (InvalidRegistration, ValueError) as e:
         await websocket.close(code=POLICY_VIOLATION, reason=str(e))
         return
+
+    # funduq's half of the handshake, relayed — see ws_provider for why it
+    # is queued before the read loop can process anything. No completion
+    # can precede it either: an attached link serving no offerings resolves
+    # nothing until its first register frame.
+    outbound.put_nowait(
+        {
+            "type": "welcome",
+            "funduqPublicKey": funduq.identity_public_key,
+            "answer": answer,
+        }
+    )
 
     writer = asyncio.create_task(write_loop(websocket, outbound))
     try:
@@ -265,12 +262,55 @@ async def kyok_socket(websocket: WebSocket) -> None:
                 outbound.put_nowait({"type": "error", "message": "unparseable frame"})
                 continue
             ftype = frame.get("type")
-            request_id = frame.get("requestId")
             if ftype not in INBOUND_FRAME_TYPES:
                 outbound.put_nowait(
                     {"type": "error", "message": f"unknown frame type {ftype!r}"}
                 )
                 continue
+            if ftype == "register":
+                models = frame.get("models")
+                metadata = frame.get("metadata")
+                if not (
+                    isinstance(models, list)
+                    and models
+                    and all(isinstance(m, str) and m for m in models)
+                ):
+                    outbound.put_nowait(
+                        {"type": "error", "message": "register needs a non-empty 'models' list of strings"}
+                    )
+                    continue
+                if metadata is not None and not isinstance(metadata, dict):
+                    outbound.put_nowait(
+                        {"type": "error", "message": "metadata must be an object"}
+                    )
+                    continue
+                try:
+                    registered = await funduq.register_llm_providers(
+                        link, models, metadata
+                    )
+                except (FunduqError, ValueError) as e:
+                    outbound.put_nowait({"type": "error", "message": str(e)})
+                else:
+                    outbound.put_nowait(
+                        {"type": "registered", "names": sorted(registered)}
+                    )
+                continue
+            if ftype == "deleteModel":
+                name = frame.get("name")
+                if not isinstance(name, str) or not name:
+                    outbound.put_nowait(
+                        {"type": "error", "message": "deleteModel needs a name"}
+                    )
+                    continue
+                try:
+                    await funduq.delete_llm_offering(link, name)
+                except FunduqError as e:
+                    outbound.put_nowait({"type": "error", "name": name, "message": str(e)})
+                else:
+                    outbound.put_nowait({"type": "deleted", "name": name})
+                continue
+
+            request_id = frame.get("requestId")
             if not isinstance(request_id, str):
                 outbound.put_nowait(
                     {"type": "error", "message": "frame needs a requestId"}
@@ -317,9 +357,10 @@ async def kyok_socket(websocket: WebSocket) -> None:
                     }
                 )
     finally:
-        # Named by connection, so a key that already re-attached on a
-        # fresh socket keeps its replacement serving through this cleanup.
-        souk.detach_llm_provider(public_key, link)
+        # Connection-scoped, so the teardown of a replaced socket cannot
+        # take down the link that already re-attached and took over the
+        # offering.
+        funduq.detach_llm_provider(public_key, link)
         link.fail_pending()
         writer.cancel()
         with contextlib.suppress(asyncio.CancelledError):

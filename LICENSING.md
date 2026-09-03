@@ -10,7 +10,7 @@ build against** is Apache-2.0.
 | `souk-client-sdk/` | Apache-2.0 | [LICENSE](souk-client-sdk/LICENSE) |
 | `agent-template/` | Apache-2.0 | [LICENSE](agent-template/LICENSE) |
 | `providers/*` | Apache-2.0 | e.g. [LICENSE](providers/pydantic-ai-agent/LICENSE) |
-| `AgentSouk/` (submodule) | Apache-2.0 | souk core, licensed upstream |
+| upstream `funduq` / `funduq-provider-sdk` / `funduq-contract` | Apache-2.0 | installed from PyPI, licensed upstream — nothing of theirs is vendored here but the contract vectors, which are test data |
 
 The root `LICENSE` is the repository default; a directory with its own
 `LICENSE` is governed by that one instead.
@@ -38,15 +38,15 @@ AGPL there would protect nothing and deter everyone.
 
 And nobody has to use any of them. The wire is documented in
 [docs/server-mode.md](docs/server-mode.md) and the provider contract is
-stated upstream in `souk-provider-sdk`; a provider written from those owes
-this repository nothing at all. The SDKs are a convenience, and a
+stated upstream in `funduq-provider-sdk` and `funduq-contract`'s vectors;
+a provider written from those owes this repository nothing at all. The SDKs are a convenience, and a
 convenience with a licence attached is not one.
 
 ## Direction of travel
 
 Apache-2.0 composes into an AGPL-3.0 work; the reverse does not. So the
-gateway may depend on souk core and on these SDKs, and the licence sits on
-the side of the boundary where it has to. Nothing here changes souk core,
+gateway may depend on funduq core and on these SDKs, and the licence sits
+on the side of the boundary where it has to. Nothing here changes funduq,
 which is Apache-2.0 upstream and stays that way.
 
 *Not legal advice — this file describes the intent behind the choice. The

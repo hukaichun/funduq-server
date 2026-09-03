@@ -1,41 +1,44 @@
 """Test fixtures for the gateway's test suite.
 
-Deliberately a copy of souk/tests/conftest.py rather than an import of it:
-these are two independent distributions (see CONTRIBUTING.md's "no shared
-workspace"), and a test-only dependency from the gateway back into souk's
-test package would be the first thread of exactly the coupling the split
-exists to remove. What is shared is a database and a schema, not fixtures.
+Deliberately parallel to upstream funduq's own conftest rather than an
+import of it: these are two independent distributions, and a test-only
+dependency from the gateway back into upstream's test package would be
+the first thread of exactly the coupling the split exists to remove.
+What is shared is a database, a schema and a wire, not fixtures.
 
 Two things are the gateway's own. `client` is an ASGI client over
 `create_app`, which is the whole reason these tests live here. And
-`serve`/`register` hand back the `AgentRef` *and* the fingerprint, because
-an agent is `(provider_key, name)` now and this layer puts the short form
-of that pair in a URL — a test that talks to a route needs both halves.
+`serve`/`register` hand back the `AgentRef` *and* the fingerprint,
+because an agent is `(provider_key, name)` and this layer puts the short
+form of that pair in a URL — a test that talks to a route needs both
+halves.
 
-`Identity` subclasses `souk_provider_sdk.ProviderIdentity` rather than
-reimplementing the signing against `cryptography`, which the old copy did
-because souk did not depend on the SDK. This gateway does — `ws_provider`
-builds on `SoukConnection` — so reimplementing what a provider signs would
-mean the tests could agree with themselves while disagreeing with every
-real provider.
+`Identity` subclasses `funduq_provider_sdk.ProviderIdentity` rather than
+reimplementing the signing against `cryptography`: this gateway depends
+on the SDK, so reimplementing what a provider signs would mean the tests
+could agree with themselves while disagreeing with every real provider.
 
-Runs against SQLite by default — zero configuration, no database to stand
-up first. The same suite runs against Postgres by exporting SOUK_DATABASE_URL
-(a `postgresql+psycopg://…` DSN) before invoking pytest; souk's schema and
-queries are dialect-neutral (see souk/schema.py, souk/repo.py), so both
-backends exercise the same semantics. See CONTRIBUTING.md for the Postgres
-setup.
+Runs against SQLite by default — zero configuration, no database to
+stand up first. The same suite runs against Postgres by exporting
+SOUK_DATABASE_URL (a `postgresql+psycopg://…` DSN) before invoking
+pytest; funduq's schema and queries are dialect-neutral, so both
+backends exercise the same semantics.
 
-Settings are constructed explicitly here (see souk/core.py) rather than
-arranged in `os.environ` before the first souk import — that ordering
-constraint is exactly what injecting settings removed.
+Settings are constructed explicitly here, which is now the only way:
+`CoreSettings.from_env` was removed at contract revision 14 and core
+reads no environment at all. The gateway does that reading instead
+(`souk_server.config.core_settings_from_env`), and these tests
+deliberately do not go through it — a test that read the environment
+would answer differently on somebody's laptop. `identity_private_key` is
+required (providers pin it), and it is a fixed key rather than a
+generated one: a test that asserts what a provider pinned needs the same
+funduq to be the same funduq across runs.
 
-Tests aren't wrapped in a rolled-back transaction: souk.repo's functions
-call session.commit() internally throughout (e.g. register_agents,
-create_run), so a single outer transaction can't cleanly contain a whole
-test. The schema is applied once per session via `souk.migrate()` (the
-same packaged chain a real deployment runs), and rows are cleared
-between tests.
+Tests aren't wrapped in a rolled-back transaction: funduq's repo
+functions commit internally throughout, so a single outer transaction
+can't cleanly contain a whole test. The schema is applied once per
+session via `funduq.migrate.migrate()` (the same packaged chain a real
+deployment runs), and rows are cleared between tests.
 """
 
 from __future__ import annotations
@@ -53,13 +56,14 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from souk.config import CoreSettings
-from souk.core import Souk
-from souk.migrate import migrate as souk_migrate
-from souk.identity import provider_fingerprint
-from souk.models import AgentRef
-from souk_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
-from souk_server.handshake import HANDSHAKE_VERSION, new_nonce
+from funduq.config import CoreSettings
+from funduq.core import Funduq
+from funduq.identity import provider_fingerprint
+from funduq.migrate import migrate as funduq_migrate
+from funduq.models import AgentRef
+from funduq_contract import Registration
+from funduq_provider_sdk import InProcessLink, ProviderIdentity, ProviderRuntime
+from souk_server.handshake import WIRE_VERSION, new_nonce
 from souk_server.server import create_app
 
 TEST_SIGNING_SECRET = "test-signing-secret"
@@ -83,10 +87,10 @@ _TABLES_CHILD_FIRST = (
 
 
 # A fixed key rather than a generated one: a test that asserts what a
-# provider pinned needs the same souk to be the same souk across runs, and
-# generating one per session would make "is this the souk I meant" a
+# provider pinned needs the same funduq to be the same funduq across runs,
+# and generating one per session would make "is this the funduq I meant" a
 # question with no stable answer to write down.
-TEST_SOUK_IDENTITY = "11" * 32
+TEST_FUNDUQ_IDENTITY = "11" * 32
 
 
 @pytest.fixture(scope="session")
@@ -94,16 +98,13 @@ def settings() -> CoreSettings:
     return CoreSettings(
         database_url=DATABASE_URL,
         token_signing_secret=TEST_SIGNING_SECRET,
-        identity_private_key=TEST_SOUK_IDENTITY,
-        # Nothing about the proof to configure any more: upstream removed
-        # the opt-out, so every attach — both sockets, and the in-process
-        # links the fixtures use — answers a live challenge or is refused.
+        identity_private_key=TEST_FUNDUQ_IDENTITY,
     )
 
 
 @pytest.fixture(scope="session")
-def souk(settings: CoreSettings) -> Souk:
-    return Souk(settings)
+def souk(settings: CoreSettings) -> Funduq:
+    return Funduq(settings)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -115,14 +116,13 @@ def _schema(settings: CoreSettings) -> None:
     if url.get_backend_name() == "sqlite" and url.database:
         for suffix in ("", "-wal", "-shm"):
             Path(url.database + suffix).unlink(missing_ok=True)
-    # Through the chain packaged inside souk — the one way a souk database
-    # gets built, per upstream's packaged-migrations change; no path to an
-    # alembic.ini outside the package, no env-var relay.
-    souk_migrate(settings.database_url)
+    # Through the chain packaged inside the funduq wheel — the one way a
+    # funduq database gets built; no alembic.ini anywhere in this repo.
+    funduq_migrate(settings.database_url)
 
 
 @pytest.fixture(autouse=True)
-async def _dispatching(souk: Souk) -> AsyncIterator[None]:
+async def _dispatching(souk: Funduq) -> AsyncIterator[None]:
     """The broker's dispatch loop, for every test.
 
     `create_app`'s lifespan is what starts it in a real process, and
@@ -138,7 +138,7 @@ async def _dispatching(souk: Souk) -> AsyncIterator[None]:
 
 
 @pytest.fixture(autouse=True)
-async def _clean_db(souk: Souk) -> AsyncIterator[None]:
+async def _clean_db(souk: Funduq) -> AsyncIterator[None]:
     is_postgres = souk.engine.sync_engine.dialect.name == "postgresql"
     async with souk.engine.begin() as conn:
         if is_postgres:
@@ -152,14 +152,28 @@ async def _clean_db(souk: Souk) -> AsyncIterator[None]:
     yield
 
 
+@pytest.fixture(autouse=True)
+async def _fresh_pool(souk: Funduq) -> AsyncIterator[None]:
+    """Dispose the engine's pool after every test.
+
+    The Funduq is session-scoped and pytest-asyncio gives each test its
+    own event loop, so a pooled aiosqlite connection checked out under
+    one test's loop can resurface under the next — and answers with
+    "no active connection" from a loop that no longer exists. Observed
+    as a once-in-ten flake; disposing between tests makes every
+    connection loop-local by construction."""
+    yield
+    await souk.engine.dispose()
+
+
 @pytest.fixture
-async def session(souk: Souk) -> AsyncIterator[AsyncSession]:
+async def session(souk: Funduq) -> AsyncIterator[AsyncSession]:
     async with souk.session() as s:
         yield s
 
 
 @pytest.fixture
-async def client(souk: Souk) -> AsyncIterator[AsyncClient]:
+async def client(souk: Funduq) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=create_app(souk))
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
@@ -168,11 +182,11 @@ async def client(souk: Souk) -> AsyncIterator[AsyncClient]:
 class Identity(ProviderIdentity):
     """A throwaway keypair that signs the way a real provider does.
 
-    Everything souk verifies is `ProviderIdentity`'s. `sign_connect` is the
-    exception and belongs here: opening a socket is a serving act, so the
-    payload is this gateway's (see ws_provider.connect_signing_payload) and
-    upstream neither defines it nor exposes a general `sign` to build it
-    with — the same gap souk-agent-sdk works around, and AgentSouk#43.
+    Everything funduq verifies is `ProviderIdentity`'s: `sign_connect`
+    builds the connect proof over `provider_connect_payload(funduq_key,
+    ticket, nonce)` (the SDK's signature names the second seat
+    `funduq_nonce`; the ticket rides in it — funduq chose the ticket, so
+    it *is* the verifier-chosen freshness).
     """
 
     def __init__(self) -> None:
@@ -183,53 +197,20 @@ class Identity(ProviderIdentity):
     def fingerprint(self) -> str:
         return provider_fingerprint(self.public_key)
 
-    def sign_chain_hop(self, subject: dict, prev_token: str | None = None, exp_offset: int = 300) -> str:
-        """One actor-chain hop. `exp_offset` can be negative to build an
-        already-expired one, for souk.identity.verify_actor_chain's per-hop
-        exp handling."""
-        return self.sign_hop(subject, prev_token, ttl=exp_offset)
-
-    def register_body(self, agents: list[dict], **extra) -> dict:
-        signature, timestamp = self.sign_registration([a["name"] for a in agents])
-        return {
-            "public_key": self.public_key,
-            "signature": signature,
-            "timestamp": timestamp,
-            "agents": agents,
-            **extra,
-        }
-
-    def sign_llm_registration(self, names: list[str]) -> tuple[str, int]:
-        """Signature+timestamp for registering LLM offerings — through the
-        SDK an actual LLM provider ships, for the shipped-signer reason:
-        this suite's hand-written payloads catch core drifting, and this
-        catches the SDK drifting from both."""
-        from souk_llm_provider_sdk import sign_llm_registration
-
-        return sign_llm_registration(self, names)
-
-    def hello(self, names: list[str], **extra) -> dict:
-        """Frame one. No signature in it — the proof comes later, over a
-        nonce souk chooses, which is the whole of what changed."""
+    def hello(self, souk: Funduq, **extra) -> dict:
+        """A complete, honest v4 hello: ticket from funduq (the in-process
+        stand-in for `POST /tickets`), proof computed before connecting —
+        the two-frame handshake's whole provider half."""
+        ticket = souk.issue_ticket(self.public_key)
+        nonce = new_nonce()
         return {
             "type": "hello",
-            "version": HANDSHAKE_VERSION,
+            "version": WIRE_VERSION,
             "publicKey": self.public_key,
-            "agentNames": sorted(names),
-            "nonce": new_nonce(),
+            "ticket": ticket,
+            "nonce": nonce,
+            "proof": self.sign_connect(souk.identity_public_key, ticket, nonce),
             **extra,
-        }
-
-    def proof(
-        self, names: list[str], provider_nonce: str, souk_nonce: str, souk_key: str | None = None
-    ) -> dict:
-        """Frame three — the SDK's `sign_connect`, which is the whole point
-        of v2: no local payload, no hello digest, the names bound in.
-        `souk_key` is the recipient v3 binds — the challenge frame's
-        `soukPublicKey`, empty/None for a souk with no identity."""
-        return {
-            "type": "proof",
-            "signature": self.sign_connect(souk_key or "", souk_nonce, provider_nonce, names),
         }
 
 
@@ -243,9 +224,9 @@ class Served:
     """What `serve`/`register` hand back: everything a test needs to talk
     about the provider it just stood up, including how to address it.
 
-    `ref` is what souk takes, `fingerprint` is what goes in a URL — the same
-    identity in two forms, and a test that has to derive one from the other
-    is a test that has taken a position on which is authoritative.
+    `ref` is what funduq takes, `fingerprint` is what goes in a URL — the
+    same identity in two forms, and a test that has to derive one from the
+    other is a test that has taken a position on which is authoritative.
     """
 
     identity: Identity
@@ -270,13 +251,14 @@ class Served:
 
 
 @pytest.fixture
-async def attach(souk: Souk):
-    """Attach a provider the way a real one arrives: the SDK's runtime, with
-    an adapter in front of it that souk can hand a run to.
+async def attach(souk: Funduq):
+    """Attach a provider the way a real one arrives: the SDK's runtime,
+    with an in-process link funduq can hand a run to — opened first,
+    published on second, the order the handshake now has.
 
     Every runtime is stopped when the test ends. The `souk` fixture is
-    session-scoped, so one left running stays registered with the broker and
-    takes the next test's runs.
+    session-scoped, so one left running stays registered with the broker
+    and takes the next test's runs.
     """
     started: list[ProviderRuntime] = []
 
@@ -287,7 +269,12 @@ async def attach(souk: Souk):
         # Constructing the link is what joins it to the runtime, so it has
         # to happen before any work arrives — a runtime with no link drops
         # its output silently.
-        await souk.attach_provider(InProcessLink(souk, runtime), list(names))
+        link = InProcessLink(souk, runtime)
+        await souk.attach_provider(link)
+        # `Registration` models end to end since revision 11: core reads
+        # `.name` off each entry, so a dict raises AttributeError rather
+        # than being coerced.
+        await souk.register_agents(link, [Registration(name=n) for n in names])
         return runtime
 
     yield _attach
@@ -296,14 +283,14 @@ async def attach(souk: Souk):
 
 
 class EchoAgent:
-    """A provider that answers with one short message and remembers who
-    called it."""
+    """A provider that answers with one short message and remembers the
+    chain it was handed."""
 
     def __init__(self) -> None:
-        self.seen_caller: dict | None = None
+        self.seen_chain: list | None = None
 
     async def run_stream(self, agent_name: str, run_input):
-        self.seen_caller = (run_input.forwarded_props or {}).get("caller")
+        self.seen_chain = (run_input.forwarded_props or {}).get("actorChain")
         ids = {"threadId": run_input.thread_id, "runId": run_input.run_id}
         yield {"type": "RUN_STARTED", **ids}
         yield {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}
@@ -313,40 +300,42 @@ class EchoAgent:
 
 
 @pytest.fixture
-async def register(souk: Souk):
-    """Register agents without attaching anything — for the cases that are
-    about souk knowing a name, not about anybody serving it. Which is most
-    of this suite: an offline agent is a state the gateway has routes for.
+async def register(souk: Funduq):
+    """Registered and then offline — reached the only way it can be now:
+    publish on an open link, then close the link. Which is most of this
+    suite: an offline agent is a state the gateway has routes for.
     """
 
-    async def _register(*names: str, **agent_extra) -> Served:
+    async def _register(*names: str, provider_name: str | None = None, **agent_extra) -> Served:
         names = names or ("agent",)
         identity = Identity()
-        signature, timestamp = identity.sign_registration(list(names))
+        runtime = ProviderRuntime(identity, EchoAgent())
+        runtime.start()
+        link = InProcessLink(souk, runtime)
+        await souk.attach_provider(link)
         await souk.register_agents(
-            identity.public_key,
-            signature,
-            timestamp,
-            [{"name": n, **agent_extra} for n in names],
+            link,
+            [Registration.model_validate({"name": n, **agent_extra}) for n in names],
+            provider_name=provider_name,
         )
+        souk.detach_provider(identity.public_key, link)
+        await runtime.aclose()
         return Served(identity, None, None, tuple(names))
 
     return _register
 
 
 @pytest.fixture
-async def serve(souk: Souk, attach, register):
-    """Register a provider's agents and attach it, in one step.
-
-    Both halves, because they are always done together and neither is
-    optional: registration is what makes the names souk's to serve, and
-    attaching is what makes them reachable.
-    """
+async def serve(souk: Funduq, attach):
+    """Open a link and publish agents on it, in one step — registration is
+    what makes the names funduq's to serve, and it happens on the link
+    that will serve them."""
 
     async def _serve(provider=None, *names: str, **kwargs) -> Served:
         provider = EchoAgent() if provider is None else provider
-        served = await register(*names)
-        runtime = await attach(served.identity, provider, served.names, **kwargs)
-        return Served(served.identity, provider, runtime, served.names)
+        names = names or ("agent",)
+        identity = Identity()
+        runtime = await attach(identity, provider, names, **kwargs)
+        return Served(identity, provider, runtime, tuple(names))
 
     return _serve

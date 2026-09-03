@@ -37,15 +37,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Registration is idempotent and cheap; do it once up front, then let
-	// the connect loop reconnect for the life of the pod. A dropped socket
-	// ends nothing on souk's side — reconnecting with a fresh hello and
-	// carrying on is the whole recovery, and the reconnect delay keeps a
+	// Registration lives on the link now: every connect is the full
+	// ceremony — a fresh ticket, a fresh handshake, a fresh register frame.
+	// A dropped socket ends nothing on souk's side — reconnecting and
+	// re-registering is the whole recovery, and the reconnect delay keeps a
 	// souk that is briefly down from being hammered.
-	if err := register(ctx, cfg.soukHTTPURL, id, []string{cfg.agentName}, cfg.providerName); err != nil {
-		logf("initial registration failed (%v); will retry on connect", err)
-	}
-
 	backoff := time.Second
 	for ctx.Err() == nil {
 		if err := connectOnce(ctx, cfg, id, brain); err != nil {
@@ -65,10 +61,15 @@ func main() {
 }
 
 func connectOnce(ctx context.Context, cfg config, id *Identity, brain *Brain) error {
-	// Re-register on each connect: a souk that restarted forgot this
-	// provider, and attach refuses a name core has no record of. Cheap, and
-	// it makes a reconnect after a souk restart just work.
-	_ = register(ctx, cfg.soukHTTPURL, id, []string{cfg.agentName}, cfg.providerName)
+	// The out-of-band half first: a single-use ticket and souk's public
+	// key from POST /tickets. A pinned key is checked in there, BEFORE
+	// anything is signed — a proof for the wrong souk is never computed.
+	ticketCtx, cancelTicket := context.WithTimeout(ctx, 30*time.Second)
+	ticket, funduqKey, err := fetchTicket(ticketCtx, cfg.soukHTTPURL, id.PublicHex(), cfg.soukPubKey)
+	cancelTicket()
+	if err != nil {
+		return fmt.Errorf("ticket: %w", err)
+	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	ws, _, err := websocket.Dial(dialCtx, cfg.wsURL(), nil)
@@ -82,14 +83,22 @@ func connectOnce(ctx context.Context, cfg config, id *Identity, brain *Brain) er
 	defer ws.CloseNow()
 
 	conn := &SoukConn{
-		id:         id,
-		soukPubKey: cfg.soukPubKey,
-		agentNames: []string{cfg.agentName},
-		maxRuns:    cfg.maxRuns,
-		ws:         ws,
+		id:           id,
+		funduqKey:    funduqKey,
+		ticket:       ticket,
+		agentNames:   []string{cfg.agentName},
+		providerName: cfg.providerName,
+		maxRuns:      cfg.maxRuns,
+		ws:           ws,
 	}
 	if err := conn.handshake(ctx); err != nil {
 		return fmt.Errorf("handshake: %w", err)
+	}
+	// Registration moved onto the authenticated link: nothing is offered
+	// until souk echoes `registered`, so a souk that restarted and forgot
+	// this provider is healed by the reconnect itself.
+	if err := conn.register(ctx); err != nil {
+		return fmt.Errorf("register: %w", err)
 	}
 	logf("attached; serving runs")
 	return conn.serve(ctx, brain.Answer)

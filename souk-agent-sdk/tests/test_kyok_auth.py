@@ -1,8 +1,7 @@
 """Covers KyokSigningAuth — see souk_agent_sdk/kyok_auth.py's own
-docstring and souk/api_llm_bridge.py's _verify_caller_identity (the souk-
-side reconstruction this signature must agree with byte-for-byte).
-Previously untested (see souk-agent-sdk/README.md's KYOK section before
-this file existed).
+docstring. The bytes it signs are funduq-contract's `kyok_call_payload`;
+the gateway's KYOK door reconstructs the same payload server-side and
+must agree byte-for-byte, which the reconstruction tests below pin.
 """
 
 from __future__ import annotations
@@ -46,11 +45,12 @@ def test_auth_flow_leaves_method_url_and_authorization_untouched():
 
 
 def test_signature_verifies_against_souk_side_reconstruction():
-    """Reconstructs exactly what souk.api_llm_bridge._verify_caller_identity
-    does server-side — bearer:timestamp:sha256(body) — and checks the
-    signature verifies against the matching public key. This is the
-    client/server agreement contract; a change to either side's payload
-    format should break this test.
+    """Reconstructs exactly what the gateway's KYOK door does server-side
+    — funduq-contract's `kyok_call_payload(bearer, timestamp,
+    sha256(body))` — and checks the signature verifies against the
+    matching public key. Spelled out as bytes rather than imported, so
+    this test stays the independent twin of the contract: a change to
+    either side's payload format should break it.
     """
     key = Ed25519PrivateKey.generate()
     public_key = key.public_key()
@@ -60,9 +60,19 @@ def test_signature_verifies_against_souk_side_reconstruction():
     timestamp = signed.headers["X-Souk-Kyok-Timestamp"]
     signature = bytes.fromhex(signed.headers["X-Souk-Kyok-Signature"])
     body_hash = hashlib.sha256(body).hexdigest()
-    payload = f"souk-kyok-call:kyoktoken123:{timestamp}:{body_hash}".encode()
+    payload = f"funduq-kyok-call:kyoktoken123:{timestamp}:{body_hash}".encode()
 
     public_key.verify(signature, payload)  # raises InvalidSignature on failure
+
+
+def test_the_signed_bytes_are_the_contract_packages():
+    """The auth flow must sign funduq-contract's statement, not a local
+    restatement — object identity makes an upstream byte change a change
+    here by construction."""
+    import funduq_contract
+    from souk_agent_sdk import kyok_auth
+
+    assert kyok_auth.kyok_call_payload is funduq_contract.kyok_call_payload
 
 
 def test_different_body_produces_a_different_signature():
@@ -90,5 +100,5 @@ def test_bearer_prefix_is_stripped_before_signing():
 
     # Signed against the bare token, not "Bearer bare-token" — this is
     # the payload souk itself reconstructs and expects to verify.
-    correct_payload = f"souk-kyok-call:bare-token:{timestamp}:{body_hash}".encode()
+    correct_payload = f"funduq-kyok-call:bare-token:{timestamp}:{body_hash}".encode()
     public_key.verify(signature, correct_payload)

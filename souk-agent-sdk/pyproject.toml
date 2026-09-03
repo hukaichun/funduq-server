@@ -14,8 +14,18 @@ license-files = ["LICENSE"]
 
 dependencies = [
     # What a provider *is* — identity, the port, the loop. This package
-    # is only the socket around it.
-    "souk-provider-sdk",
+    # is only the socket around it. From PyPI now; the signing payloads
+    # it re-exports come from funduq-contract underneath.
+    "funduq-provider-sdk>=0.0.8,<0.1",
+    # The AG-UI wire model both ends of every run frame validate against.
+    # Pinned with a floor here, and not left to whatever each subproject's
+    # lock happened to resolve: `funduq-contract` floors it at >=0.1, and
+    # 0.1.22 made `RunAgentInput.state` optional-and-omitted-when-unset
+    # while 0.1.19 still requires it — so a gateway on one and a provider
+    # on the other disagree about a frame neither contract revision nor
+    # any test in one process can catch. It cost a full stack run to find
+    # (funduq#243).
+    "ag-ui-protocol>=0.1.22",
     # The work socket (WS /ws/provider — the frame protocol is authored
     # in the gateway repo's docs/server-mode.md).
     "websockets>=13",
@@ -37,6 +47,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["souk_agent_sdk"]
-
-[tool.uv.sources]
-souk-provider-sdk = { path = "../AgentSouk/souk-provider-sdk", editable = true }

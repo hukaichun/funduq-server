@@ -1,29 +1,36 @@
 """Covers KyokBridge — the caller-side half of KYOK (Keep Your Own Key),
-now an identified LLM provider rather than a session-keyed bridge. See
-souk_client_sdk/kyok_bridge.py's own docstring for the transport (one
-WebSocket to /ws/kyok, opened with the mutual challenge-response) and
-docs/keep-your-own-key.md (in the souk repo) for the design.
+an identified LLM provider speaking wire v4. See
+souk_client_sdk/kyok_bridge.py's own docstring for the transport (ticket
+over HTTP, two-frame handshake, registration on the open link) and
+upstream funduq's docs/mechanisms/kyok.md for the design.
 
-Uses a stub /ws/kyok server speaking the gateway's frame protocol (no
-real souk instance needed), and monkeypatches litellm.acompletion
-directly rather than adding another mocking layer for it — litellm is
-already a runtime dependency here.
+Uses a stub gateway speaking the wire-v4 protocol — one websockets server
+whose HTTP side answers `POST /tickets` and whose WS side walks the
+hello/welcome handshake and the register/registered exchange (no real
+souk instance needed) — and monkeypatches litellm.acompletion directly
+rather than adding another mocking layer for it: litellm is already a
+runtime dependency here.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 from typing import Any
 
 import litellm
 import pytest
 import websockets
-from souk_llm_provider_sdk import llm_registration_payload
+from funduq_provider_sdk import (
+    WrongFunduq,
+    funduq_connect_payload,
+    provider_connect_payload,
+    verify_signature,
+)
+from funduq_provider_sdk.llm import CompletionRefused, ProviderIdentity
 
-from souk_client_sdk.kyok_bridge import KyokBridge, _to_chunk_dict
+from souk_client_sdk.kyok_bridge import HANDSHAKE_VERSION, KyokBridge, _to_chunk_dict
 
 RECEIVE_TIMEOUT = 2.0
 
@@ -53,7 +60,7 @@ def test_to_chunk_dict_falls_back_to_plain_dict_conversion():
     assert _to_chunk_dict({"via": "plain_dict"}) == {"via": "plain_dict"}
 
 
-# --- identity / registration / metadata -------------------------------------
+# --- metadata ---------------------------------------------------------------
 
 
 def test_run_metadata_names_the_offering_and_carries_the_context():
@@ -72,69 +79,191 @@ def test_run_metadata_names_the_offering_and_carries_the_context():
     assert "context" not in bridge.run_metadata()["kyok"]
 
 
-async def test_every_connection_re_registers_first(monkeypatch):
-    """The #16 fix: registration is part of each connection cycle, not a
-    one-shot precondition — a souk whose database was reset gets the
-    offering back on the next reconnect instead of refusing the attach
-    forever."""
-    calls = 0
+# --- the ticket endpoint ----------------------------------------------------
 
-    async def counting_register(self):
-        nonlocal calls
-        calls += 1
 
-    monkeypatch.setattr(KyokBridge, "register", counting_register)
+async def test_the_ticket_request_names_the_key_it_admits():
+    """POST /tickets carries exactly {"publicKey"}, and the bridge reads
+    back the ticket and funduq's key — the material the proof binds."""
+    seen: dict = {}
+
+    async def handle(reader, writer):
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            raw += await reader.read(1024)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        length = next(
+            int(line.split(b":")[1]) for line in head.split(b"\r\n")
+            if line.lower().startswith(b"content-length")
+        )
+        while len(body) < length:
+            body += await reader.read(1024)
+        seen["path"] = head.split(b" ")[1].decode()
+        seen["body"] = json.loads(body)
+        payload = json.dumps({"ticket": "t_1", "funduqPublicKey": "cd" * 32}).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+            + f"content-length: {len(payload)}\r\n\r\n".encode()
+            + payload
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        bridge = KyokBridge(f"http://127.0.0.1:{port}", model="m", api_key="k")
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            ticket, funduq_key = await bridge._fetch_ticket()
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert seen["path"] == "/tickets"
+    assert seen["body"] == {"publicKey": bridge.identity.public_key}
+    assert (ticket, funduq_key) == ("t_1", "cd" * 32)
+
+
+async def test_a_pinned_funduq_key_is_checked_at_ticket_time():
+    """The pin refuses before any socket exists: a ticket endpoint
+    presenting the wrong funduq key raises WrongFunduq out of the fetch."""
     async with StubGateway() as gateway:
-        bridge, task = await _connected_bridge(gateway, stub_register=False)
-        try:
-            assert calls == 1
-            # The connection drops; the reconnect cycle registers again.
-            gateway.connected.clear()
-            await gateway._conn.close()
-            async with asyncio.timeout(RECEIVE_TIMEOUT + bridge.reconnect_delay):
-                await gateway.connected.wait()
-            assert calls == 2
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        bridge = KyokBridge(
+            f"http://127.0.0.1:{gateway.port}",
+            model="m",
+            api_key="k",
+            funduq_public_key="ee" * 32,  # not the stub's key
+        )
+        with pytest.raises(WrongFunduq):
+            await bridge._fetch_ticket()
+    assert gateway.hello is None  # never connected
 
 
 # --- the socket ------------------------------------------------------------
 
 
 class StubGateway:
-    """The server half of one /ws/kyok socket: walks the four-frame
-    handshake (recording the hello and verifying the proof's shape),
-    pushes what a test tells it to, records every frame the bridge sends."""
+    """The gateway's half of wire v4, minimally: HTTP `POST /tickets` on
+    the same listener, then per WS connection the hello/welcome handshake
+    (signing the answer with its own funduq identity), the register/
+    registered exchange, deleted echoes for deleteModel — recording every
+    frame the bridge sends.
 
-    def __init__(self) -> None:
+    One port, two protocols, like the real gateway: a small TCP front
+    answers `/tickets` itself (websockets' own HTTP hook refuses any
+    request with a body) and pipes every other connection through to the
+    websockets server byte-for-byte."""
+
+    def __init__(self, *, bad_answer: bool = False) -> None:
+        self.funduq_identity = ProviderIdentity.generate()
+        self.bad_answer = bad_answer
+        self.ticket = "t_stub"
+        self.ticket_requests: list[dict] = []
         self.hello: dict | None = None
-        self.hello_raw: str | None = None
-        self.proof: dict | None = None
+        self.register: dict | None = None
+        self.register_count = 0
+        self.delete_frames: list[dict] = []
         self.frames: asyncio.Queue = asyncio.Queue()
         self.connected = asyncio.Event()
         self._conn = None
+        self._pumps: set[asyncio.Task] = set()
 
     async def __aenter__(self) -> "StubGateway":
-        self._server = await websockets.serve(self._handler, "127.0.0.1", 0)
-        self.port = self._server.sockets[0].getsockname()[1]
+        self._ws_server = await websockets.serve(self._handler, "127.0.0.1", 0)
+        self._ws_port = self._ws_server.sockets[0].getsockname()[1]
+        self._front = await asyncio.start_server(self._front_conn, "127.0.0.1", 0)
+        self.port = self._front.sockets[0].getsockname()[1]
         return self
 
     async def __aexit__(self, *exc) -> None:
-        self._server.close()
-        await self._server.wait_closed()
+        self._front.close()
+        await self._front.wait_closed()
+        for task in list(self._pumps):
+            task.cancel()
+        self._ws_server.close()
+        await self._ws_server.wait_closed()
+
+    async def _front_conn(self, reader, writer) -> None:
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = await reader.read(4096)
+            if not chunk:
+                writer.close()
+                return
+            raw += chunk
+        head, _, body = raw.partition(b"\r\n\r\n")
+        if head.split(b" ")[1] == b"/tickets":
+            length = next(
+                int(line.split(b":")[1]) for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length")
+            )
+            while len(body) < length:
+                body += await reader.read(4096)
+            self.ticket_requests.append(json.loads(body))
+            payload = json.dumps(
+                {"ticket": self.ticket, "funduqPublicKey": self.funduq_identity.public_key}
+            ).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+                + f"content-length: {len(payload)}\r\nconnection: close\r\n\r\n".encode()
+                + payload
+            )
+            await writer.drain()
+            writer.close()
+            return
+        # Anything else is the WS upgrade: replay what we read, then pump.
+        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", self._ws_port)
+        up_writer.write(raw)
+        await up_writer.drain()
+
+        async def pump(src, dst):
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except (ConnectionError, asyncio.CancelledError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    dst.close()
+
+        for direction in (pump(reader, up_writer), pump(up_reader, writer)):
+            task = asyncio.create_task(direction)
+            self._pumps.add(task)
+            task.add_done_callback(self._pumps.discard)
 
     async def _handler(self, ws) -> None:
-        self.hello_raw = await ws.recv()
-        self.hello = json.loads(self.hello_raw)
-        await ws.send(json.dumps({"type": "challenge", "soukPublicKey": None, "nonce": "n_souk"}))
-        self.proof = json.loads(await ws.recv())
-        await ws.send(json.dumps({"type": "welcome"}))
+        self.hello = json.loads(await ws.recv())
+        answer = self.funduq_identity.sign(
+            funduq_connect_payload(self.hello["ticket"], self.hello["nonce"])
+        )
+        if self.bad_answer:
+            answer = "00" * 64
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "welcome",
+                    "funduqPublicKey": self.funduq_identity.public_key,
+                    "answer": answer,
+                }
+            )
+        )
+        self.register = json.loads(await ws.recv())
+        self.register_count += 1
+        await ws.send(
+            json.dumps({"type": "registered", "names": self.register.get("models", [])})
+        )
         self._conn = ws
         self.connected.set()
         async for raw in ws:
-            self.frames.put_nowait(json.loads(raw))
+            frame = json.loads(raw)
+            if frame.get("type") == "deleteModel":
+                self.delete_frames.append(frame)
+                await ws.send(json.dumps({"type": "deleted", "name": frame["name"]}))
+            else:
+                self.frames.put_nowait(frame)
 
     async def push(self, frame: dict) -> None:
         await self._conn.send(json.dumps(frame))
@@ -144,7 +273,7 @@ class StubGateway:
             return await self.frames.get()
 
 
-async def _connected_bridge(gateway: StubGateway, *, stub_register: bool = True, **kwargs: Any):
+async def _connected_bridge(gateway: StubGateway, **kwargs: Any):
     bridge = KyokBridge(
         f"http://127.0.0.1:{gateway.port}",
         model="test-model",
@@ -152,100 +281,123 @@ async def _connected_bridge(gateway: StubGateway, *, stub_register: bool = True,
         reconnect_delay=0.05,
         **kwargs,
     )
-    # The stub is ws-only; registration needs an HTTP souk. A test that
-    # cares about register() patches it itself and passes stub_register=False.
-    if stub_register:
-
-        async def no_register():
-            pass
-
-        bridge.register = no_register
     task = asyncio.create_task(bridge.serve_forever())
     async with asyncio.timeout(RECEIVE_TIMEOUT):
         await gateway.connected.wait()
     return bridge, task
 
 
-async def test_the_handshake_carries_identity_and_offering_and_proves_the_key():
+async def _stop(task: asyncio.Task) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_the_hello_carries_the_ticket_and_a_verifiable_proof():
+    """v4: one hello frame, computed before connecting — version, key,
+    ticket, nonce and the proof over provider_connect_payload(funduq_key,
+    ticket, nonce). No model names (registration moved onto the link) and
+    no maxConcurrentRuns (kyok flow control is per-request)."""
     async with StubGateway() as gateway:
         bridge, task = await _connected_bridge(gateway, offering="my-llm")
         try:
-            assert gateway.hello["type"] == "hello"
-            assert gateway.hello["publicKey"] == bridge.identity.public_key
-            assert gateway.hello["modelNames"] == ["my-llm"]
-            # The proof signs the SDK's connect family (v3): the recipient
-            # souk key (empty — this stub presents none), both nonces and
-            # the sorted offering names, no hello digest.
-            from souk_provider_sdk import provider_connect_payload
-
-            payload = provider_connect_payload("", "n_souk", gateway.hello["nonce"], ["my-llm"])
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-            Ed25519PublicKey.from_public_bytes(
-                bytes.fromhex(bridge.identity.public_key)
-            ).verify(bytes.fromhex(gateway.proof["signature"]), payload)
+            hello = gateway.hello
+            assert hello["type"] == "hello"
+            assert hello["version"] == HANDSHAKE_VERSION == 4
+            assert hello["publicKey"] == bridge.identity.public_key
+            assert hello["ticket"] == gateway.ticket
+            assert "modelNames" not in hello
+            assert "maxConcurrentRuns" not in hello
+            assert verify_signature(
+                bridge.identity.public_key,
+                hello["proof"],
+                provider_connect_payload(
+                    gateway.funduq_identity.public_key, gateway.ticket, hello["nonce"]
+                ),
+            )
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _stop(task)
 
 
-def test_the_registration_payload_matches_the_sdk_statement():
-    """The payload this bridge signs at register() is the SDK's, not a
-    local restatement — one line, and it is what keeps this side from
-    drifting when core's changes."""
-    assert llm_registration_payload(["m"], 123) == b"souk-register-llm:m:123"
+async def test_a_wrong_answer_in_the_welcome_is_refused_before_anything_flows():
+    """The provider-protecting half of the handshake: an answer that does
+    not verify over funduq_connect_payload(ticket, nonce) means the link
+    is never treated open — no registration, no attach, just a reconnect
+    loop that keeps refusing."""
+    async with StubGateway(bad_answer=True) as gateway:
+        bridge = KyokBridge(
+            f"http://127.0.0.1:{gateway.port}", model="m", api_key="k", reconnect_delay=0.05
+        )
+        task = asyncio.create_task(bridge.serve_forever())
+        try:
+            await asyncio.sleep(0.3)  # several connect cycles
+            assert gateway.hello is not None  # it did try
+            assert gateway.register is None  # and never published
+            assert not bridge.attached.is_set()
+        finally:
+            await _stop(task)
+
+
+async def test_registration_travels_on_the_link_and_gates_attached():
+    async with StubGateway() as gateway:
+        bridge, task = await _connected_bridge(gateway, offering="my-llm")
+        try:
+            assert gateway.register == {"type": "register", "models": ["my-llm"]}
+            async with asyncio.timeout(RECEIVE_TIMEOUT):
+                await bridge.attached.wait()
+        finally:
+            await _stop(task)
+
+
+async def test_every_connection_re_registers():
+    """An open link serves exactly what it last published, so a reconnect
+    that skipped registration would serve nothing — the same self-healing
+    the HTTP-registration bridge had (AgentSoukServer#16), now structural:
+    registration is a frame inside every connection."""
+    async with StubGateway() as gateway:
+        bridge, task = await _connected_bridge(gateway)
+        try:
+            assert gateway.register_count == 1
+            gateway.connected.clear()
+            await gateway._conn.close()
+            async with asyncio.timeout(RECEIVE_TIMEOUT + bridge.reconnect_delay):
+                await gateway.connected.wait()
+            assert gateway.register_count == 2
+        finally:
+            await _stop(task)
 
 
 async def test_serving_is_the_whole_lifecycle_in_one_block():
-    """#19: registered, attached before the body runs, torn down on exit."""
+    """Attached and registered before the body runs, torn down on exit."""
     async with StubGateway() as gateway:
         bridge = KyokBridge(
             f"http://127.0.0.1:{gateway.port}", model="m", api_key="k", reconnect_delay=0.05
         )
-
-        async def no_register():
-            pass
-
-        bridge.register = no_register
         async with asyncio.timeout(RECEIVE_TIMEOUT):
             async with bridge.serving():
-                # The block only opens attached — no race against the
-                # socket for a run started here.
+                # The block only opens attached+registered — no race
+                # against the roster for a run started here.
                 assert bridge.attached.is_set()
+                assert gateway.register is not None
         # And nothing is left serving after the block.
         assert not bridge.attached.is_set()
 
 
-async def test_serving_deregisters_an_ephemeral_identity_on_exit():
+async def test_serving_withdraws_an_ephemeral_identity_on_exit():
     """An auto-minted key can never come back, so its offering is roster
-    garbage the moment the block ends — serving() deletes it on the way
-    out. A persisted identity keeps its registration, same as an agent
-    provider between connections."""
-    from souk_llm_provider_sdk import ProviderIdentity
-
-    async def _drive(bridge: KyokBridge, gateway: StubGateway) -> int:
-        calls = 0
-
-        async def no_register():
-            pass
-
-        async def counting_deregister():
-            nonlocal calls
-            calls += 1
-
-        bridge.register = no_register
-        bridge.deregister = counting_deregister
-        async with asyncio.timeout(RECEIVE_TIMEOUT):
-            async with bridge.serving():
-                pass
-        return calls
-
+    garbage the moment the block ends — serving() sends deleteModel over
+    the still-open link on the way out. A persisted identity keeps its
+    registration, same as an agent provider between connections."""
     async with StubGateway() as gateway:
         ephemeral = KyokBridge(
             f"http://127.0.0.1:{gateway.port}", model="m", api_key="k", reconnect_delay=0.05
         )
-        assert await _drive(ephemeral, gateway) == 1
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            async with ephemeral.serving():
+                pass
+        assert gateway.delete_frames == [
+            {"type": "deleteModel", "name": ephemeral.offering}
+        ]
 
     async with StubGateway() as gateway:
         persisted = KyokBridge(
@@ -255,16 +407,17 @@ async def test_serving_deregisters_an_ephemeral_identity_on_exit():
             reconnect_delay=0.05,
             identity=ProviderIdentity.generate(),
         )
-        assert await _drive(persisted, gateway) == 0
+        async with asyncio.timeout(RECEIVE_TIMEOUT):
+            async with persisted.serving():
+                pass
+        assert gateway.delete_frames == []
 
 
 async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
-    """The #63 envelope, end to end on this side: a handler raising
-    CompletionRefused answers with its payload on the error frame, not
-    prose — and the handler saw the whole DeliveredCompletion, which is
-    the material its policy runs on."""
-    from souk_llm_provider_sdk import CompletionRefused
-
+    """A handler raising CompletionRefused answers with its payload on
+    the error frame, not prose — and the handler saw the whole
+    DeliveredCompletion (actorChain included), which is the material its
+    policy runs on."""
     seen: dict = {}
 
     async def refusing_handler(delivered):
@@ -284,7 +437,11 @@ async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
                     "agentName": "greeter",
                     "llmName": "kyok",
                     "context": {"voucher": "v1"},
-                    "body": {"messages": []},
+                    "actorChain": ["ab" * 32],
+                    # The body is OpenAI's own request shape now
+                    # (funduq_contract.CompletionBody), so `model` is
+                    # required and unknown keys ride through verbatim.
+                    "body": {"model": "gpt-4", "messages": []},
                 }
             )
             frame = await gateway.next_frame()
@@ -293,10 +450,9 @@ async def test_a_refusal_from_the_handler_travels_as_a_structured_error_frame():
             assert seen["delivered"].run_id == "run_9"
             assert seen["delivered"].agent_name == "greeter"
             assert seen["delivered"].context == {"voucher": "v1"}
+            assert seen["delivered"].actor_chain == ["ab" * 32]
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _stop(task)
 
 
 async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch):
@@ -316,8 +472,17 @@ async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch
         _bridge, task = await _connected_bridge(gateway, api_base="http://llm.local")
         try:
             body = {
+                "model": "gpt-4",
                 "messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"type": "function"}],
+                # A real OpenAI tool: the body is validated as OpenAI's
+                # own request shape now, so a stub shaped only roughly
+                # like one is a malformed request, not a lenient pass.
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "ping", "parameters": {"type": "object"}},
+                    }
+                ],
                 "temperature": 0.5,
             }
             await gateway.push(
@@ -346,9 +511,7 @@ async def test_a_completion_request_streams_back_as_chunks_then_done(monkeypatch
             assert captured["temperature"] == 0.5
             assert captured["stream"] is True
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _stop(task)
 
 
 async def test_an_llm_failure_becomes_one_error_frame(monkeypatch):
@@ -366,15 +529,13 @@ async def test_an_llm_failure_becomes_one_error_frame(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": []},
+                    "body": {"model": "gpt-4", "messages": []},
                 }
             )
             frame = await gateway.next_frame()
             assert frame == {"type": "error", "requestId": "req_1", "message": "upstream boom"}
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _stop(task)
 
 
 async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
@@ -404,7 +565,7 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": [{"role": "user", "content": "slow"}]},
+                    "body": {"model": "gpt-4", "messages": [{"role": "user", "content": "slow"}]},
                 }
             )
             await gateway.push(
@@ -414,7 +575,7 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
                     "runId": "run-1",
                     "providerKey": "ab" * 32,
                     "agentName": "greeter",
-                    "body": {"messages": [{"role": "user", "content": "fast"}]},
+                    "body": {"model": "gpt-4", "messages": [{"role": "user", "content": "fast"}]},
                 }
             )
             # The fast one answers while the slow one is still held open.
@@ -424,6 +585,4 @@ async def test_concurrent_completions_multiplex_on_one_socket(monkeypatch):
             rest = [await gateway.next_frame() for _ in range(3)]
             assert {"req_fast", "req_slow"} == {f["requestId"] for f in [first, *rest]}
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _stop(task)

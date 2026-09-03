@@ -1,28 +1,42 @@
 """WS /ws/provider: the socket a provider connects out on.
 
-This file is transport and nothing else. souk states the provider
-contract itself now (`souk_provider_sdk`), and `broker.ConnectedProvider`
-is the whole of what souk needs to know about anybody: who you are, how
-to hand you a run, how to ask you to stop one. `SocketProvider` below is
-that, with a WebSocket underneath — the gateway's half of a contract
-whose other half is `souk_provider_sdk.ProviderRuntime`, running behind
-the same socket in souk-agent-sdk.
+This file is transport and nothing else. funduq states the provider
+contract itself (`funduq_provider_sdk`), and `broker.ConnectedProvider`
+is the whole of what funduq needs to know about anybody: who you are,
+how to hand you a run, how to ask you to stop one. `SocketProvider`
+below is that, with a WebSocket underneath — the gateway's half of a
+contract whose other half is `funduq_provider_sdk.ProviderRuntime`,
+running behind the same socket in souk-agent-sdk.
 
-**souk hands work over; it does not ask for it.** There is no claim loop
-here any more, on either side: the broker finds whoever serves an agent
-and offers each run, `deliver` writes it to the wire, and the ack frame
-that comes back is the return value. Declining is how a full provider
-says so, and souk keeps the run.
+**funduq hands work over; it does not ask for it.** There is no claim
+loop here on either side: the broker finds whoever serves an agent and
+offers each run, and `deliver` writes it to the wire. The answer comes
+back as an ordinary inbound frame and goes in through `answer_offer` —
+not as `deliver`'s return value, which is how it worked until contract
+revision 17 and is what funduq#249 was about. Declining is how a full
+provider says so, and funduq keeps the run.
 
-Two things the inversion deleted rather than moved. Liveness is no longer
-a heartbeat — `online` is `is_serving`, so being attached *is* being
-online and a socket that drops takes its agents offline at once. And
-there is no session token: nothing bearer-shaped exists to leak or to
-expire underneath a long-lived connection.
+Opening the socket is the v4 ticket handshake — two frames, the proof
+computed before connecting against a ticket from `POST /tickets`. See
+handshake.py for the payloads and for what changed from the in-band
+challenge-response it replaced.
 
-Opening the socket is a mutual challenge-response — four frames, both
-sides signing bytes the other chose. See `handshake.py` for the payloads
-and for what the self-signed assertion it replaced could not do.
+**Attach is nameless; registration happens on the open link.** A fresh
+socket serves nothing until its first `register` frame, and the names it
+serves are exactly the ones it last registered — a smaller roster takes
+the omitted names offline, `deleteAgent` removes a record outright (and
+is refused for an agent with a conversation behind it). Registration
+frames carry no signature: the link is the credential, proved once when
+it opened, and what that asks of this transport is the ordinary thing —
+an open link stays the party that opened it (one read loop, one
+identity, established here and never rebound).
+
+**One field joined the register frame** at contract revision 12:
+`takesInterjections`, per agent. It is the only thing this side can
+answer core's `takes_interjections(agent_name)` from — a required call
+that is *not* on the `ConnectedProvider` protocol, so a connection
+without it opens perfectly well and raises three layers deep at the
+first registration. See `SocketProvider.takes_interjections`.
 """
 
 from __future__ import annotations
@@ -31,81 +45,112 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, WebSocket
 
-from souk.errors import AgentNotFound, InvalidRegistration
-from souk.models import AgentRef
+import re
+
+import funduq_contract
+from funduq.errors import FunduqError, InvalidRegistration
+from funduq.models import AgentRef
 from pydantic import ValidationError
-from souk_provider_sdk import CONNECTED_PROVIDER_ATTRS, DeliveredRun, Refusal
-from souk_provider_sdk.contract import LINK_QUERY_METHODS
-from souk_server.handshake import HANDSHAKE_VERSION, souk_connect_payload
+from funduq_provider_sdk import DeliveredRun, FunduqLink, Refusal
+from souk_server.handshake import WIRE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     close_frame,
     parse_frame,
-    receive_frame,
     receive_hello,
     write_loop,
 )
 
 if TYPE_CHECKING:
-    from souk.core import Souk
+    from funduq.core import Funduq
 
 logger = logging.getLogger("souk.ws_provider")
 
 router = APIRouter()
 
-# A backstop, and deliberately longer than the deadline that actually
-# governs. souk wraps every offer in `RunBroker.deliver_timeout_seconds`
-# (5s) because it has one delivery loop and an offer that never returns
-# stops dispatch for everybody — so souk gives up first, and this never
-# fires in a souk that sets a deadline. Shortening it to "win" would put
-# the same policy in two places and let them drift; deleting it would
-# leave a wait with no bound at all if souk ever offers without one.
-ACK_TIMEOUT_SECONDS = 30.0
+# What a provider may ask funduq, and it is deliberately short: this is
+# not a mirror of funduq's API, because every method admitted here is one
+# more frame type every transport has to carry. Upstream withdrew the
+# `LINK_QUERY_METHODS` constant at revision 11 — the models are the single
+# definition now and there is no list left to read — so the one query is
+# named here and checked against the link ABC that declares it, which is
+# the surface that would actually grow a second one.
+QUERY_METHODS = frozenset({"thread_messages"})
+assert QUERY_METHODS <= FunduqLink.__abstractmethods__, (
+    "a query this wire carries is no longer a FunduqLink verb"
+)
 
-# What a provider may ask souk, and it is deliberately short. Upstream's
-# `contract.LINK_QUERY_METHODS` states the rule: this is not a mirror of
-# souk's API, because every method admitted here is one more frame type
-# every transport has to carry. Read from upstream rather than retyped, so
-# a method added there without a frame here fails a test instead of a
-# provider.
-QUERY_METHODS = frozenset(LINK_QUERY_METHODS)
+# Agent names go in URLs on every road this gateway serves, so the shape is
+# this layer's to police. Core validates none of it (upstream's
+# `Registration` has no pattern), and a name with a slash or a space in it
+# would register happily and then be unaddressable.
+_AGENT_NAME = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
-# How often a live socket re-asks whether souk still lists the agents it
-# attached for. The condition it catches is rare and permanent, so
-# noticing it a minute late costs nothing — see `_watch_registration`.
+# How often a live socket re-asks whether funduq still lists the agents it
+# registered. The condition it catches is rare and permanent, so noticing
+# it a minute late costs nothing — see `_watch_registration`.
 OWNERSHIP_RECHECK_SECONDS = 120.0
 
 # What this socket accepts after the handshake. The dispatch below reads
 # it, and docs/wire-vectors.json publishes it — one set, asserted equal in
 # tests, so a frame type added in code without a vectors row goes red.
-INBOUND_FRAME_TYPES = frozenset({"ack", "event", "finish", "query"})
+INBOUND_FRAME_TYPES = frozenset(
+    {"register", "deleteAgent", "ack", "event", "finish", "query"}
+)
 
 
 class SocketProvider:
     """`broker.ConnectedProvider` with a socket underneath.
 
-    **Not a `SoukLink`,** and upstream's own docstring says so. A link is
-    one provider joined to one souk, both directions in one object; this
-    lives on souk's side, holds an outbound queue and no runtime, and only
-    ever carries work *outward*. The object opposite it — the socket
-    client in souk-agent-sdk — is the one that subclasses `SoukLink`,
-    because it really does own both halves of the connection.
+    **Not a `FunduqLink`,** and upstream's own docstring says so. A link
+    is one provider joined to one funduq, both directions in one object;
+    this lives on funduq's side, holds an outbound queue and no runtime,
+    and only ever carries work *outward*. The object opposite it — the
+    socket client in souk-agent-sdk — is the one that subclasses
+    `FunduqLink`, because it really does own both halves of the connection.
 
-    So the four members below are duck-typed against souk's own
+    So the members below are duck-typed against funduq's own
     `ConnectedProvider` protocol rather than inherited. That loses the
     fails-at-construction property a base class gave, which is why the
-    constructor asserts against `CONNECTED_PROVIDER_ATTRS` instead: souk
-    sizes a capacity bucket from `max_concurrent_runs`, and a connection
-    that forgets it attaches perfectly well and then fails inside the
-    broker, three layers from the cause.
+    constructor asserts against `_PROTOCOL_SURFACE` instead: funduq sizes a
+    capacity bucket from `max_concurrent_runs`, and a connection that
+    forgets it attaches perfectly well and then fails inside the broker,
+    three layers from the cause. Upstream withdrew the
+    `CONNECTED_PROVIDER_ATTRS` list this used to read; the lesson it
+    encoded outlived it, so the surface is named here — and it is wider
+    than `broker.ConnectedProvider` declares, because
+    **`takes_interjections` is not on the protocol at all** and core calls
+    it inside `register_agents`. A connection without it type-checks, opens
+    and then raises `AttributeError` at the first registration.
 
-    Holds no per-run state beyond the acks it is waiting on: every frame
-    names its run, and souk keeps the only routing table.
+    Deliberately exposes no `sign_connect`: core would otherwise mint a
+    ticket and sign on this object's behalf, and this object cannot sign —
+    the real provider on the far side of the socket is the only holder of
+    the key, which is the whole point of the handshake. The ticket, nonce
+    and proof arrive in the hello and go to `attach_provider` explicitly.
+
+    Holds **no per-run state at all** since revision 17 took the verdict
+    off `deliver`'s return — every frame names its run and funduq keeps
+    the only routing table. What is left is `registered_names`, the roster
+    this link last published, which the registration watcher reads, and
+    `_interjections`, the per-agent capability that roster declared.
     """
+
+    # The whole of what funduq reaches for on this object. Not read off
+    # `broker.ConnectedProvider`: a Protocol's members are not enumerable
+    # in a way worth trusting, and `takes_interjections` is not on it.
+    _PROTOCOL_SURFACE = (
+        "public_key",
+        "max_concurrent_runs",
+        "deliver",
+        "cancel",
+        "takes_interjections",
+    )
 
     def __init__(
         self, public_key: str, outbound: asyncio.Queue, max_concurrent_runs: int | None
@@ -114,13 +159,14 @@ class SocketProvider:
         # `max_concurrent_runs` are properties, so asking `self` would run
         # their getters against fields this constructor has not assigned
         # yet and report every one of them missing.
-        missing = sorted(a for a in CONNECTED_PROVIDER_ATTRS if not hasattr(type(self), a))
+        missing = sorted(a for a in self._PROTOCOL_SURFACE if not hasattr(type(self), a))
         if missing:
             raise TypeError(f"{type(self).__name__} is not a ConnectedProvider: missing {missing}")
         self._public_key = public_key
         self._max_concurrent_runs = max_concurrent_runs
         self._outbound = outbound
-        self._acks: dict[str, asyncio.Future[bool | Refusal]] = {}
+        self.registered_names: set[str] = set()
+        self._interjections: dict[str, bool] = {}
 
     @property
     def public_key(self) -> str:
@@ -130,98 +176,101 @@ class SocketProvider:
     def max_concurrent_runs(self) -> int | None:
         return self._max_concurrent_runs
 
-    async def deliver(self, run: Any) -> bool | Refusal:
-        """Write this run to the wire and wait for the answer.
+    def declare_interjections(self, registrations: list[funduq_contract.Registration]) -> None:
+        """Record what this roster said about interjections, per agent.
 
-        The frame is `{"type": "run"}` plus the wire form upstream
-        declares — `DeliveredRun.from_claimed(...).model_dump(by_alias=
-        True)` — so this gateway no longer hand-writes the mapping and the
-        far side rebuilds with `model_validate` instead of picking fields.
-        `from_claimed` also owns the validation rule: input that does not
-        parse as `RunAgentInput` is a permanent `Refusal`, answered here
-        without ever touching the wire (souk built the input, so this
-        firing means a core bug or a version skew — either way permanent).
-
-        Answering late is the same as declining, whichever deadline ran
-        out: the ack arrives for a run nobody is waiting on any more, and
-        `ack` drops it. souk keeps the run either way.
+        Called before `register_agents`, because core asks during it. The
+        table is replaced rather than merged: `register` carries the FULL
+        roster, so an agent dropped from it has no declaration any more,
+        exactly as it has no live name.
         """
-        try:
-            delivered = DeliveredRun.from_claimed(run)
-        except ValidationError as e:
-            return Refusal(f"input does not validate as RunAgentInput: {e}")
-        loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[bool | Refusal] = loop.create_future()
-        self._acks[run.run_id] = waiter
+        self._interjections = {r.name: bool(r.takes_interjections) for r in registrations}
+
+    def takes_interjections(self, agent_name: str) -> bool:
+        """Whether the remote link declared this agent able to take an
+        interjection — a run arriving on a thread whose active run it
+        names.
+
+        Core calls this inside `register_agents` and **overwrites**
+        whatever the incoming `Registration` said, so that the agent card's
+        declaration is derived from the serving party rather than typed by
+        an author. Over a wire the serving party is on the other end of the
+        socket, and the `register` frame's `takesInterjections` is the only
+        thing this side can honestly answer from: the in-process link reads
+        the runtime's hook, and this reads what the runtime put on the
+        wire. An agent this link never published gets `False` — declaring a
+        capability for a name nobody registered would be a guess.
+        """
+        return self._interjections.get(agent_name, False)
+
+    async def deliver(self, run: DeliveredRun) -> None:
+        """Hand the offer over. Nothing comes back this way.
+
+        The frame is `{"type": "run"}` plus the published envelope: since
+        contract revision 11 `deliver` *receives* the `DeliveredRun`, so
+        there is no translation left to do and no claimed-run shape to
+        validate — funduq built and validated the model before offering it.
+
+        **Dumped `by_alias=True` and never `exclude_none`.** `RunAgentInput`
+        has required fields that are legitimately null (`forwardedProps`
+        among them); stripping them yields a `runInput` the far side cannot
+        rebuild, and a perfectly good run comes back as a permanent
+        refusal. (The opposite rule holds for AG-UI *events* — see
+        api_agui.encode_event — and the two pull against each other, which
+        is why each says so where it is written.)
+
+        **The verdict does not ride this return, and that is the fix to
+        funduq#249.** It used to: this method parked on a future that the
+        read loop resolved when the `ack` frame arrived. Two roads then led
+        into core — the verdict by `deliver`'s return, the events by
+        `report_event` — and nothing ordered them, so a provider that
+        accepted and streamed in the same breath had its opening events
+        refused by a run it had just been given. At revision 17 the second
+        road is gone: the verdict enters through `answer_offer`, in the
+        same handler that read it, ahead of every frame behind it. So this
+        method queues a frame and returns, and the transport keeps no
+        per-offer state at all.
+        """
         self._outbound.put_nowait(
-            {"type": "run", **delivered.model_dump(by_alias=True, mode="json")}
+            {"type": "run", **run.model_dump(by_alias=True, mode="json")}
         )
-        try:
-            return await asyncio.wait_for(waiter, timeout=ACK_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "provider %s did not answer the offer of run %s in %.0fs — treating as declined",
-                self.public_key,
-                run.run_id,
-                ACK_TIMEOUT_SECONDS,
-            )
-            return False
-        finally:
-            self._acks.pop(run.run_id, None)
 
-    def ack(self, run_id: str, accepted: bool, reason: str | None = None) -> None:
-        """A declined ack carrying a `reason` is a *permanent* refusal — the
-        provider saying re-offering can never succeed (an input that does
-        not parse, most importantly). souk fails the run with the reason
-        recorded verbatim and stops re-offering; a bare decline stays what
-        it always was, \"full right now\". The wire says so with one
-        optional field because the port says so with one optional type
-        (`souk_provider_sdk.Refusal`, read duck-typed by the broker)."""
-        waiter = self._acks.get(run_id)
-        if waiter is not None and not waiter.done():
-            if not accepted and isinstance(reason, str) and reason:
-                waiter.set_result(Refusal(reason))
-            else:
-                waiter.set_result(accepted)
+    async def cancel(self, run_id: str) -> bool:
+        """Ask, and do not wait for an outcome.
 
-    def cancel(self, run_id: str) -> None:
-        """Ask, and do not wait. souk decides the outcome from what the
-        run's stream does next, not from anything this returns."""
+        The return is a **receipt** — "the ask is on the wire" — never a
+        result: funduq decides the outcome from what the run's stream does
+        next. Returning `None` (which this used to do) logs a warning on
+        every cancel since revision 11, and would be a lie in the other
+        direction if it tried to mean more.
+        """
         self._outbound.put_nowait({"type": "cancel", "runId": run_id})
-
-    def fail_pending(self) -> None:
-        """The socket is gone: nothing can answer these offers."""
-        for waiter in self._acks.values():
-            if not waiter.done():
-                waiter.set_result(False)
-        self._acks.clear()
-
+        return True
 
 async def _answer_query(
-    souk: "Souk", public_key: str, parsed: dict[str, Any], outbound: asyncio.Queue
+    funduq: "Funduq", public_key: str, parsed: dict[str, Any], outbound: asyncio.Queue
 ) -> None:
     """One `query` frame, answered on the same socket by `queryId`.
 
-    The first thing on this wire that is not fire-and-forget, and the
+    The one frame on this wire that is not fire-and-forget, and the
     reason it exists is a real gap rather than convenience: a provider
     sees exactly what the *caller* sent for its run and nothing more. An
     AG-UI client resends its whole history every turn by convention;
     A2A's `message/send` carries one message. The same agent, unchanged,
-    cannot tell a tenth turn from a first — and souk has held the thread
+    cannot tell a tenth turn from a first — and funduq has held the thread
     the whole time.
 
     **`limit` is applied here, not by the caller.** The parameter exists
     to keep the response frame bounded; trimming after receiving would
     bound nothing and put a months-old thread on the wire to do it.
 
-    **A provider may only read threads for agents it serves**, which the
-    upstream design did not call for and this adds. Thread ids are not
-    guessable, but "not guessable" is not an authorization rule: a
-    provider that served one run knows that thread id permanently, and
+    **A provider may only read threads for agents it serves.** Thread ids
+    are not guessable, but "not guessable" is not an authorization rule:
+    a provider that served one run knows that thread id permanently, and
     would otherwise keep reading the conversation after being de-listed,
     or after the agent moved to somebody else's stall. The thread names
     its agent, and an agent is `(provider_key, name)`, so the check is a
-    comparison souk can already make.
+    comparison funduq can already make.
     """
     query_id = parsed.get("queryId")
     method = parsed.get("method")
@@ -246,7 +295,7 @@ async def _answer_query(
         answer(error="limit must be a positive integer")
         return
 
-    thread = await souk.get_thread(thread_id)
+    thread = await funduq.get_thread(thread_id)
     if thread is None or thread["provider_key"] != public_key:
         # One answer for "no such thread" and "not yours", deliberately:
         # telling them apart would confirm a thread exists to somebody who
@@ -254,218 +303,202 @@ async def _answer_query(
         answer(error="no such thread for this provider")
         return
 
-    messages = await souk.get_thread_messages(thread_id)
+    messages = await funduq.get_thread_messages(thread_id)
     answer(result=messages[-limit:] if limit is not None else messages)
 
 
 async def _watch_registration(
-    souk: "Souk", public_key: str, agent_names: list[str], outbound: asyncio.Queue
+    funduq: "Funduq", provider: SocketProvider, outbound: asyncio.Queue
 ) -> None:
-    """Close this socket if souk stops listing every agent it serves.
+    """Close this socket if funduq stops listing every agent it published.
 
-    souk checks registration once, when the provider attaches, and the
-    broker then holds the mapping in memory. So a registration that
-    disappears *underneath* a live socket — a restored database, a
-    de-listing, a souk redeployed against a fresh one — leaves the broker
-    serving an agent souk's own roster no longer has. Nothing can route to
-    it, because addressing it needs a row that is gone; nothing complains,
-    because the socket is fine. A healthy container and an invisible agent,
-    indefinitely.
+    Registration writes the records and the broker then holds the live
+    mapping in memory. So a registration that disappears *underneath* a
+    live socket — a restored database, a de-listing, a funduq redeployed
+    against a fresh one — leaves the broker serving an agent funduq's own
+    roster no longer has. Nothing can route to it, because addressing it
+    needs a row that is gone; nothing complains, because the socket is
+    fine. A healthy container and an invisible agent, indefinitely —
+    observed once already, for half an hour, with one server-side warning
+    per cycle and nothing at all on the provider's side.
 
-    That is the same failure the retired claim loop had, and it survived
-    the inversion rather than being fixed by it: `claim_work` used to
-    filter unowned ids and carry on, which was correct in itself and left
-    a worker looping forever against agents that no longer existed.
-    Observed once already — a database restored under a running provider
-    left it invisible for half an hour, with one server-side warning per
-    cycle and nothing at all on its own side.
-
-    Closing is the repair, not a punishment. Registration is what puts the
-    name back and the SDK re-registers on every reconnect, so a provider
-    told goodbye here comes back listed. Only when *every* name has gone:
-    losing one of several is a de-listing somebody meant, and the socket
-    still has work to do for the rest.
-
-    Asked per name through `get_agent`, which takes the pair and therefore
-    answers the ownership half by itself. It could not before — an
-    `agent_id` did not carry its owner, so the old version of this had to
-    scan the whole roster to ask the same question.
+    Closing is the repair, not a punishment. Registration is what puts
+    the name back and the SDK re-registers on every reconnect, so a
+    provider told goodbye here comes back listed. Only when *every* name
+    has gone: losing one of several is a de-listing somebody meant, and
+    the socket still has work to do for the rest. A link that has
+    published nothing yet is left alone — there is nothing to have lost.
     """
-    refs = [AgentRef(provider_key=public_key, name=name) for name in agent_names]
+    key = provider.public_key
     while True:
         await asyncio.sleep(OWNERSHIP_RECHECK_SECONDS)
-        listed = [ref for ref in refs if await souk.get_agent(ref) is not None]
-        if listed:
+        names = sorted(provider.registered_names)
+        if not names:
+            continue
+        refs = [AgentRef(provider_key=key, name=name) for name in names]
+        if any([await funduq.get_agent(ref) is not None for ref in refs]):
             continue
         logger.warning(
-            "provider %s is attached for agent(s) souk no longer lists (%s) — "
+            "provider %s is attached for agent(s) funduq no longer lists (%s) — "
             "closing so its reconnect re-registers",
-            public_key[:16],
-            agent_names,
+            key[:16],
+            names,
         )
         outbound.put_nowait(
-            close_frame(POLICY_VIOLATION, "souk no longer lists these agents; re-register")
+            close_frame(POLICY_VIOLATION, "funduq no longer lists these agents; re-register")
         )
         return
 
 
 def _hello_error(hello: dict[str, Any]) -> str | None:
-    """What a hello must carry to be worth challenging.
+    """What a hello must carry to be worth handing to attach.
 
-    Checked before souk signs anything, so an unparseable frame cannot
-    make it produce a signature over attacker-chosen bytes. The version is
-    first because a provider on the old two-frame shape has no `version`
-    at all, and saying so by name is far more use than the bad-signature
-    error it would otherwise get — which is what an attack looks like too.
+    The version is first because a provider on an older handshake says so
+    most clearly by its absence or its number, and refusing it by name is
+    far more use than the bad-ticket error it would otherwise get — which
+    is what an attack looks like too.
     """
     version = hello.get("version")
-    if version != HANDSHAKE_VERSION:
+    if version != WIRE_VERSION:
         if version is None:
             return (
-                "hello has no version: this souk speaks handshake "
-                f"v{HANDSHAKE_VERSION}, a mutual challenge-response. Upgrade "
-                "souk-agent-sdk."
+                "hello has no version: this souk speaks wire "
+                f"v{WIRE_VERSION}, the ticket handshake. Upgrade souk-agent-sdk."
             )
-        return f"unsupported handshake version {version!r}; this souk speaks v{HANDSHAKE_VERSION}"
-    if not isinstance(hello.get("publicKey"), str):
-        return "hello needs a publicKey"
-    if not isinstance(hello.get("nonce"), str) or not hello["nonce"]:
-        return "hello needs a nonce"
-    names = hello.get("agentNames")
-    if not (isinstance(names, list) and names and all(isinstance(n, str) for n in names)):
-        return "agentNames must be a non-empty list of strings"
-    max_runs = hello.get("maxConcurrentRuns")
-    if max_runs is not None and not isinstance(max_runs, int):
-        return "maxConcurrentRuns must be an integer"
+        return f"unsupported wire version {version!r}; this souk speaks v{WIRE_VERSION}"
+    # Presence and emptiness first, by name, because those are the
+    # mistakes worth a sentence. What survives that goes through
+    # `funduq_contract.Connect` — the published shape of this exchange —
+    # so the types are policed by the model both ends already share
+    # rather than by an isinstance ladder that can drift from it. The one
+    # difference is spelling: our v4 hello has carried `nonce` since
+    # before the model named the field `providerNonce`, and the wire
+    # vocabulary does not change in this round.
+    for field, message in (
+        ("publicKey", "hello needs a publicKey"),
+        ("ticket", "hello needs a ticket — POST /tickets issues one"),
+        ("nonce", "hello needs a nonce"),
+        ("proof", "hello needs a proof signed over the ticket"),
+    ):
+        value = hello.get(field)
+        if not isinstance(value, str) or not value:
+            return message
+    try:
+        funduq_contract.Connect(
+            publicKey=hello["publicKey"],
+            ticket=hello["ticket"],
+            providerNonce=hello["nonce"],
+            proof=hello["proof"],
+            maxConcurrentRuns=hello.get("maxConcurrentRuns"),
+        )
+    except ValidationError as e:
+        return f"hello is not a valid connect: {e}"
     return None
 
 
-async def collect_connect_proof(
-    websocket: WebSocket, souk: "Souk", hello: dict[str, Any]
-) -> tuple[str, str] | None:
-    """Frames two and three: souk answers the provider's nonce, then
-    collects the provider's answer to its own. Returns `(challenge,
-    proof)` for attach to verify, or None after closing the socket.
+def _parse_registration(frame: dict[str, Any]) -> list[funduq_contract.Registration]:
+    """The `register` frame's agents, as the models core now takes.
 
-    The gateway stopped being the verifier here — that moved into core's
-    attach, which is where runs change hands and therefore where the
-    proof belongs (upstream's attach-proof change; in-process links are
-    challenged the same way now, so this transport is no longer the only
-    authenticated road in). What stays this side's: relaying the
-    challenge core minted (`issue_connect_challenge` — single-use,
-    freshness-bounded, so a recorded proof answers a question nobody is
-    asking), and souk's own signature over `souk-connect-souk:...`, which
-    core cannot send because core has no wire.
+    `funduq_contract.Registration` is the single definition of this shape
+    — both ends import it — and it is `extra="forbid"`, so a misspelt key
+    is caught at the door with a message naming the field instead of
+    travelling intact and being dropped in silence by a reader that cannot
+    tell a typo from an omission. The local `AgentRegistration` that used
+    to stand here was a second model of the same thing; it is gone.
 
-    souk signs first, and that ordering is the point of the exchange
-    rather than an accident of it: a provider must be able to walk away
-    from a souk it does not recognise *before* it has produced anything
-    worth stealing. A souk with no identity configured cannot sign, and
-    says so by sending `soukPublicKey: null` rather than by failing —
-    honest, and the provider's pin is what turns it into a refusal.
-
-    The challenge frame's `soukPublicKey` does double duty since v3: it
-    is also the recipient the provider binds into its proof — core
-    verifies against a payload built with its *own* key, so a proof this
-    souk coaxed out cannot be relayed to attach at another. A provider
-    facing an identity-less souk binds the empty string, matching what
-    core builds when `identity_public_key` is None.
-
-    Attach returns souk's answering signature over the same
-    `souk-connect-souk:` bytes signed here — for transports where the
-    proof arrives before souk has spoken. This transport already said it
-    in the challenge frame (deterministic Ed25519: same key, same bytes,
-    same signature), so the sockets discard the return rather than
-    sending it twice.
+    Two things the model does not police and this layer must: `agents`
+    being a non-empty list at all, and the name being URL-shaped — every
+    road this gateway serves puts an agent name in a path segment.
     """
-    souk_nonce = souk.issue_connect_challenge()
-    provider_nonce = hello["nonce"]
-    souk_public_key = souk.identity_public_key
-    challenge: dict[str, Any] = {
-        "type": "challenge",
-        "soukPublicKey": souk_public_key,
-        "nonce": souk_nonce,
-        "signature": (
-            souk.sign(souk_connect_payload(souk_nonce, provider_nonce))
-            if souk_public_key is not None
-            else None
-        ),
-    }
-    if souk_public_key is None:
-        logger.warning(
-            "this souk has no identity, so provider %s cannot tell it from any other — "
-            "set SOUK_IDENTITY_PRIVATE_KEY",
-            hello["publicKey"][:16],
-        )
-    await websocket.send_text(json.dumps(challenge))
+    agents = frame.get("agents")
+    if not isinstance(agents, list) or not agents:
+        raise ValueError("register needs a non-empty 'agents' list")
+    parsed = []
+    for entry in agents:
+        if not isinstance(entry, dict):
+            raise ValueError("each agent must be an object")
+        try:
+            registration = funduq_contract.Registration.model_validate(entry)
+        except ValidationError as e:
+            raise ValueError(f"invalid agent registration: {e}") from None
+        if not _AGENT_NAME.match(registration.name):
+            raise ValueError(
+                f"invalid agent name {registration.name!r}: "
+                "names are 1-128 characters of [A-Za-z0-9_-]"
+            )
+        parsed.append(registration)
+    return parsed
 
-    proof = await receive_frame(websocket)
-    if proof is None or proof.get("type") != "proof":
-        await websocket.close(code=POLICY_VIOLATION, reason="expected a proof frame")
-        return None
-    signature = proof.get("signature")
-    if not isinstance(signature, str):
-        await websocket.close(code=POLICY_VIOLATION, reason="proof needs a signature")
-        return None
-    return souk_nonce, signature
+
+def _parse_verdict(frame: dict[str, Any]) -> funduq_contract.Verdict:
+    """One inbound `ack` frame as the contract's own three-valued verdict.
+
+    The v4 wire spells an offer's answer as `accepted` plus an optional
+    `reason` and correlates by `runId`; upstream's `Verdict` spells it as
+    one of three names correlated by the request's `id`. Translating here
+    rather than carrying two vocabularies means the *meaning* — that a
+    reasoned no is a different answer from a bare no — has one definition,
+    the model's, and the frame stays what every shipped provider sends.
+    """
+    reason = frame.get("reason")
+    accepted = bool(frame.get("accepted", True))
+    return funduq_contract.Verdict(
+        id=frame.get("runId"),
+        verdict="accepted"
+        if accepted
+        else ("refused" if isinstance(reason, str) and reason else "declined"),
+        reason=reason if isinstance(reason, str) and reason else None,
+    )
 
 
 @router.websocket("/ws/provider")
 async def provider_socket(websocket: WebSocket) -> None:
-    souk: "Souk" = websocket.app.state.souk
+    funduq: "Funduq" = websocket.app.state.souk
 
     await websocket.accept()
-    received = await receive_hello(websocket)
-    if received is None:
+    hello = await receive_hello(websocket)
+    if hello is None:
         return
-    hello, _hello_raw = received
 
     problem = _hello_error(hello)
     if problem:
         await websocket.close(code=POLICY_VIOLATION, reason=problem)
         return
 
-    exchange = await collect_connect_proof(websocket, souk, hello)
-    if exchange is None:
-        return
-    challenge, proof = exchange
-
     public_key = hello["publicKey"]
-    agent_names = hello["agentNames"]
-
     outbound: asyncio.Queue = asyncio.Queue()
     provider = SocketProvider(public_key, outbound, hello.get("maxConcurrentRuns"))
-    # Queued *before* attaching, and that is not cosmetic. Attaching is what
-    # makes this provider reachable, and the broker starts offering the
-    # moment it is — inside `attach_provider`'s own awaits. Queue the welcome
-    # afterwards and a provider with queued work receives a `run` frame as
-    # the first thing after its hello, which is not the handshake either
-    # side's docs describe: souk-agent-sdk reads exactly one frame, sees a
-    # run where it expected a welcome, raises, and reconnects into the same
-    # race forever.
-    #
-    # Nothing is written yet — the writer task starts below — so a failed
-    # attach still closes without ever sending this.
-    outbound.put_nowait({"type": "welcome"})
     try:
-        # Registration and the connect proof are both core's to enforce:
-        # a name this key never registered, or a proof that does not
-        # answer the live challenge, is refused here rather than served.
-        await souk.attach_provider(
+        # Core is the verifier: the ticket must be live and issued to this
+        # key, and the proof must answer it. A failure closes 1008 with
+        # core's own words; 1011 stays reserved for faults the client did
+        # not cause.
+        answer = await funduq.attach_provider(
             provider,
-            agent_names,
-            challenge=challenge,
+            ticket=hello["ticket"],
             provider_nonce=hello["nonce"],
-            proof=proof,
+            proof=hello["proof"],
         )
-    except (AgentNotFound, InvalidRegistration, ValueError) as e:
+    except (InvalidRegistration, ValueError) as e:
         await websocket.close(code=POLICY_VIOLATION, reason=str(e))
         return
 
-    writer = asyncio.create_task(write_loop(websocket, outbound))
-    watcher = asyncio.create_task(
-        _watch_registration(souk, public_key, agent_names, outbound)
+    # The welcome relays funduq's half of the handshake: its signature over
+    # `funduq_connect_payload(ticket, nonce)`, which the provider checks
+    # against the key it pinned at ticket time before treating the link as
+    # open. Queued before the read loop below can process a `register`, so
+    # it is the first frame on the wire — and since a nameless attach
+    # serves nothing until registration, no run can precede it either.
+    outbound.put_nowait(
+        {
+            "type": "welcome",
+            "funduqPublicKey": funduq.identity_public_key,
+            "answer": answer,
+        }
     )
+
+    writer = asyncio.create_task(write_loop(websocket, outbound))
+    watcher = asyncio.create_task(_watch_registration(funduq, provider, outbound))
     try:
         while True:
             frame = await websocket.receive()
@@ -479,19 +512,94 @@ async def provider_socket(websocket: WebSocket) -> None:
             run_id = parsed.get("runId")
             if kind not in INBOUND_FRAME_TYPES:
                 outbound.put_nowait({"type": "error", "message": f"unexpected frame {kind!r}"})
+            elif kind == "register":
+                # Answered, and the socket stays: a registration mistake is
+                # a caller error on an authenticated link, not a breach.
+                try:
+                    agents = _parse_registration(parsed)
+                    # Before the call, not after: core asks
+                    # `takes_interjections` *inside* register_agents, and
+                    # this is the only place the answer exists.
+                    provider.declare_interjections(agents)
+                    registered = await funduq.register_agents(
+                        provider, agents, provider_name=parsed.get("providerName")
+                    )
+                except (FunduqError, ValueError) as e:
+                    outbound.put_nowait({"type": "error", "message": str(e)})
+                else:
+                    # `register_agents` answers a plain {name: AgentRef}
+                    # mapping since revision 11 (it was a dataclass with an
+                    # `.agents` field).
+                    names = sorted(registered)
+                    provider.registered_names = set(names)
+                    outbound.put_nowait({"type": "registered", "names": names})
+            elif kind == "deleteAgent":
+                name = parsed.get("name")
+                if not isinstance(name, str) or not name:
+                    outbound.put_nowait({"type": "error", "message": "deleteAgent needs a name"})
+                    continue
+                try:
+                    await funduq.delete_agent(provider, name)
+                except FunduqError as e:
+                    # Core's refusal reaches the provider verbatim — most
+                    # importantly "has a conversation behind it", which is
+                    # the one guard a deletion still has.
+                    outbound.put_nowait({"type": "error", "name": name, "message": str(e)})
+                else:
+                    provider.registered_names.discard(name)
+                    outbound.put_nowait({"type": "deleted", "name": name})
             elif kind == "ack":
-                provider.ack(
-                    run_id,
-                    bool(parsed.get("accepted", True)),
-                    parsed.get("reason"),
+                try:
+                    verdict = _parse_verdict(parsed)
+                except ValidationError as e:
+                    outbound.put_nowait(
+                        {"type": "error", "message": f"invalid ack: {e}"}
+                    )
+                    continue
+                # Straight through the door, in the handler that read it —
+                # which is the whole of funduq#249's fix. Everything this
+                # connection says about the run after this point queues
+                # behind the verdict at the run's own owner, so a provider
+                # that accepts and streams in the same breath can no longer
+                # outrun its own "yes".
+                #
+                # `refused` is *permanent* — the provider saying re-offering
+                # can never succeed (an input that does not parse, most
+                # importantly): funduq fails the run with the reason
+                # recorded verbatim and stops re-offering. `declined` stays
+                # "full right now". Keyword, not positional: `Refusal` is a
+                # pydantic model in funduq_contract now, and a positional
+                # call would raise inside this read loop — which reads as a
+                # provider that went quiet, not as a bad constructor.
+                answer: Any = (
+                    Refusal(reason=verdict.reason or "refused")
+                    if verdict.verdict == "refused"
+                    else verdict.verdict == "accepted"
                 )
+                # The answer to "did anyone hear that" is deliberately
+                # dropped: a verdict for a run funduq no longer holds is
+                # normal — it took the run back and will offer it again —
+                # and an error frame for it would teach every provider to
+                # log a scare on its own slow morning.
+                funduq.answer_offer(run_id, answer, provider_key=public_key)
+            # `report_event` and `finish_run` mean "attributed and posted"
+            # since revision 17, and answer `False` for one thing only: a
+            # run funduq does not know. Whether *this* key holds the run is
+            # judged by the run's own owner, in arrival order, and a
+            # misattributed report is dropped and logged there rather than
+            # answered back here — so the error frame below now says
+            # "no such run", and no longer doubles as "not yours". The
+            # bounded retry this used to carry for funduq's claim window is
+            # deleted with the window (funduq#249).
             elif kind == "event":
-                if not souk.report_event(run_id, parsed.get("event"), claimed_by=public_key):
+                if not funduq.report_event(
+                    run_id, parsed.get("event"), claimed_by=public_key
+                ):
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "event refused"}
                     )
             elif kind == "finish":
-                if not souk.finish_run(run_id, claimed_by=public_key):
+                if not funduq.finish_run(run_id, claimed_by=public_key):
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "finish refused"}
                     )
@@ -500,16 +608,13 @@ async def provider_socket(websocket: WebSocket) -> None:
                 # and awaiting it here would stop this socket reading —
                 # including the acks and events of every run in flight on
                 # it — for the length of that read.
-                asyncio.create_task(_answer_query(souk, public_key, parsed, outbound))
+                asyncio.create_task(_answer_query(funduq, public_key, parsed, outbound))
     finally:
-        provider.fail_pending()
-        # Detaching is what takes these agents offline, immediately —
-        # `online` is `is_serving`, so there is no window where souk still
-        # advertises an agent whose socket has gone. Named by connection
-        # (upstream's detach-scoped change): if this key already
-        # re-attached on a fresh socket, this cleanup withdraws nothing
-        # and the replacement stays serving.
-        souk.detach_provider(public_key, provider)
+        # Connection-scoped on purpose: a re-attach replaces the old link,
+        # and a whole-key detach fired by this (replaced) socket's teardown
+        # would take the live replacement offline — exactly the case a
+        # reconnect produces. Scoped to this connection it is a no-op then.
+        funduq.detach_provider(public_key, provider)
         for task in (watcher, writer):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

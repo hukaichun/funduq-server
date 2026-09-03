@@ -2,17 +2,20 @@
 
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://python.org)
 [![Protocol: WebSocket / AG-UI / A2A](https://img.shields.io/badge/Protocols-WebSocket%20%7C%20AG--UI%20%7C%20A2A-blue.svg)](../docs/server-mode.md)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../AgentSouk/LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 > **The Official Python Agent Provider SDK for Agent Souk.**  
 > Effortlessly make any local, firewall-bound, or edge AI agent reachably exposed over **AG-UI** (human streaming) and **A2A** (agent-to-agent JSON-RPC) — **with zero inbound ports, no public IP, and no network configuration.**
 
-This document is the pitch and the quick start. For the situations that
-come up once your agent is actually running — multi-agent delegation
-topologies (verified against a real LLM), session continuity, why
-cancellation doesn't always work, and a few other things worth knowing
-before they surprise you — see
-**[agent-provider-guide.md](../AgentSouk/docs/agent-provider-guide.md)** (upstream).
+This document is the pitch and the quick start. What a provider *is* —
+its identity, the port an agent satisfies, the loop that runs the work —
+comes from the published
+[`funduq-provider-sdk`](https://pypi.org/project/funduq-provider-sdk/)
+package; this SDK is the WebSocket transport around it, speaking the
+gateway's wire (spec of record: [docs/server-mode.md](../docs/server-mode.md)).
+For upstream's own account of the handshake and the contract a transport
+must satisfy, see the [funduq repository](https://github.com/hukaichun/funduq)
+(docs/writing-a-transport.md).
 
 ---
 
@@ -26,7 +29,7 @@ If your agent already emits AG-UI-compatible event streams (or can format JSON e
 RunStream = Callable[[dict[str, Any]], AsyncIterator[dict[str, Any]]]
 ```
 
-The SDK handles all background network complexities: **Ed25519 keypair identity, the persistent WebSocket work relay, multiplexed runs, backpressure, reconnection, thread state, and cancellation.**
+The SDK handles all background network complexities: **Ed25519 keypair identity, the ticket handshake, the persistent WebSocket work relay, on-link registration, multiplexed runs, backpressure, reconnection, thread state, and cancellation.**
 
 ```
 ┌───────────────────────────────────────────────┐
@@ -35,9 +38,11 @@ The SDK handles all background network complexities: **Ed25519 keypair identity,
                         │ Outbound WS /ws/provider
 ┌───────────────────────┴───────────────────────┐
 │            souk_agent_sdk Client              │
-│  - Ed25519 Identity & HMAC Token Refresh      │
-│  - Server-Driven Claims over One Socket       │
+│  - Ed25519 Identity & Ticket Handshake        │
+│  - Server-Driven Offers over One Socket       │
 │  - Task Concurrency Budget & Cancel Race      │
+├───────────────────────────────────────────────┤
+│      funduq_provider_sdk ProviderRuntime      │
 ├───────────────────────────────────────────────┤
 │            Your Agent Logic (run_stream)      │
 │  (Pydantic-AI / LangGraph / Custom LLM Loop)  │
@@ -53,7 +58,7 @@ The SDK handles all background network complexities: **Ed25519 keypair identity,
 Not published to PyPI — this lives in the AgentSoukServer repo (the
 network side of Agent Souk: the gateway that authors the wire protocol,
 and the SDKs that speak it) and is meant to be depended on as a local
-path:
+path. Its own dependency on `funduq-provider-sdk` resolves from PyPI:
 
 ```toml
 # your pyproject.toml
@@ -102,7 +107,7 @@ async def main():
     )
     
     provider = SoukProvider(
-        souk_http_url="http://localhost:8000",  # one URL: registration and the work socket ride the same listener
+        souk_http_url="http://localhost:8000",  # one URL: the ticket desk and the work socket ride the same listener
         agents=[handle],
         max_concurrent_runs=10,  # declared to souk as the claim budget
     )
@@ -119,14 +124,16 @@ if __name__ == "__main__":
 
 | Capability | What `souk-agent-sdk` Handles Automatically |
 |---|---|
-| 🔐 **Self-Sovereign Identity** | Automatically generates & manages persistent **Ed25519 keypair** (`souk_identity.key`). Signs registration payloads to guarantee cryptographic ownership of assigned `agent_id`. |
-| 🔄 **Automatic Reconnection & Token Refresh** | Re-registers on disconnects and seamlessly refreshes HMAC session bearer tokens without dropping queued tasks or interrupting run loops. |
-| ⚡ **One Socket, Server-Driven** | Holds a single outbound WebSocket (`/ws/provider`); the *server* runs the claim loop and pushes runs — input included — as they're claimed. Idle costs one quiet connection, and new work arrives in one push, not one poll cycle. |
+| 🔐 **Self-Sovereign Identity** | Automatically generates & manages a persistent **Ed25519 keypair** (`souk_identity.key`). The key is proved once, at link-open, against a single-use ticket — registration itself is unsigned, because the authenticated link is the proof. |
+| 🎫 **Ticket Handshake & Mutual Identity** | Fetches a single-use ticket over `POST /tickets`, signs a proof that *names the souk it means to reach*, and verifies souk's counter-signature on the `welcome` before treating the link open. Pass `souk_public_key` to pin the souk; a mismatch is refused **before anything is signed** (`SoukIdentityMismatch`, a `WrongFunduq`). |
+| 🔄 **Automatic Reconnection & Re-Registration** | A dropped socket ends nothing: the runtime keeps running, queued frames flush on the next connection, and every reconnect performs the full ceremony again — fresh ticket, fresh handshake, fresh `register` — without dropping in-flight runs. |
+| ⚡ **One Socket, Server-Driven** | Holds a single outbound WebSocket (`/ws/provider`); the *server* runs the offer loop and pushes runs — input included — as they're claimed. Idle costs one quiet connection, and new work arrives in one push, not one poll cycle. |
+| 💬 **Interjections** | An `AgentHandle` with an `interject_stream` hook takes messages addressed to a run already in flight; the capability is derived from the hook and declared per agent as `takesInterjections` in the `register` frame, so the agent card cannot claim what the router would not honour. An agent without one refuses the interjection, and the caller learns it cannot be interrupted. |
 | ⛔ **Task Preemption & Cancellation** | On Souk's `cancel` frame, cancels that run's task — propagating `asyncio.CancelledError` into in-flight LLM/tool calls, not merely between yields. Souk *asks*; complying is this client's choice. |
-| 🎛️ **Concurrency Throttling** | `max_concurrent_runs=N` prevents GPU/LLM rate-limit saturation by letting Souk queue surplus work server-side. |
+| 🎛️ **Concurrency Throttling** | `max_concurrent_runs=N` prevents GPU/LLM rate-limit saturation by letting Souk queue surplus work server-side. The ack stays three-valued: accepted, declined-because-full, or permanently refused with a reason. |
 | ⏸️ **Human-in-the-Loop (HITL)** | Intercepts AG-UI native `interrupt` outcomes to pause runs resumbably (`status='input-required'`). |
-| 🔗 **A2A Delegation & Actor Chains** | `a2a_client.call_agent_streaming` simplifies sub-agent calls while signing multi-hop EdDSA JWT `ActorChain` provenance. |
-| 🔑 **Keep-Your-Own-Key (KYOK)** *(experimental)* | `KyokSigningAuth` simplifies signature generation for caller-funded LLM completions over `/kyok/v1`. See `tests/test_kyok_auth.py` for its coverage; still in-memory only, no recovery if Souk or the provider restarts mid-relay. See [`keep-your-own-key.md`](../AgentSouk/docs/keep-your-own-key.md) (upstream). |
+| 🔗 **A2A Delegation & Actor Chains** | `a2a_client.call_agent_streaming` simplifies sub-agent calls while signing multi-hop EdDSA JWT actor-chain provenance (`funduq-contract`'s chain format). |
+| 🔑 **Keep-Your-Own-Key (KYOK)** *(experimental)* | `KyokSigningAuth` simplifies signature generation for caller-funded LLM completions over `/kyok/v1`, signing `funduq-contract`'s `kyok_call_payload` per call. See `tests/test_kyok_auth.py` for its coverage. |
 
 ---
 
@@ -140,14 +147,19 @@ sequenceDiagram
     participant Caller as HTTP / AG-UI / A2A Caller
 
     Note over Agent: Load/Create Ed25519 Keypair
-    Agent->>Souk: POST /agents/register (Signed with Ed25519 key)
-    Souk-->>Agent: Session Bearer Token + Assigned agent_ids
+    Agent->>Souk: POST /tickets {publicKey}
+    Souk-->>Agent: {ticket (single-use, ~60s), funduqPublicKey}
+    Note over Agent: Pinned key checked BEFORE signing.<br/>proof = sign_connect(funduqPublicKey, ticket, nonce)
 
-    Agent->>Souk: WS /ws/provider — hello (token, agentIds, maxClaim)
-    Souk-->>Agent: welcome
+    Agent->>Souk: WS /ws/provider — hello (version 4, publicKey, ticket, nonce, proof, maxConcurrentRuns)
+    Souk-->>Agent: welcome (funduqPublicKey, answer)
+    Note over Agent: answer verified over funduq_connect_payload(ticket, nonce)<br/>— WrongFunduq if it does not prove the key
 
-    Note over Souk: Souk drives the claim loop on this worker's behalf,<br/>within the declared maxClaim budget
-    Souk-->>Agent: run frame (runId, agentId, RunAgentInput) — claiming is the hand-over
+    Agent->>Souk: register {agents: [{name, description, agentCardExtra, metadata, takesInterjections}]}
+    Souk-->>Agent: registered {names} — unsigned: the link is the proof
+
+    Note over Souk: Souk drives the offer loop on this worker's behalf,<br/>within the declared maxConcurrentRuns budget
+    Souk-->>Agent: run frame (runId, agentName, RunAgentInput) — the ack is a receipt, three-valued
 
     loop Streaming Run Execution
         Agent->>Souk: event frames (AG-UI Events: RUN_STARTED, TEXT_..., RUN_FINISHED)
@@ -159,7 +171,7 @@ sequenceDiagram
     end
 
     Agent->>Souk: finish frame — the run's last word, and the claim budget's credit
-    Note over Agent: Nothing comes back for a finished run;<br/>a dropped socket ends nothing — reconnect and report the rest
+    Note over Agent: Nothing comes back for a finished run;<br/>a dropped socket ends nothing — reconnect, re-register, report the rest
 ```
 
 ---
@@ -180,21 +192,36 @@ Every `run_stream` generator must yield events adhering to AG-UI specifications:
 
 ## 🤝 Advanced Delegation (Agent-to-Agent)
 
-An agent can delegate sub-tasks to other agents registered on Souk using `a2a_client`:
+An agent can delegate sub-tasks to other agents registered on Souk using `a2a_client` (speaking a2a-sdk 1.1's JSON-RPC wire — `SendStreamingMessage`, `A2A-Version: 1.0`):
 
 ```python
-from souk_agent_sdk.a2a_client import call_agent_streaming
-from souk_agent_sdk.identity import extend_actor_chain, new_actor_chain
+from souk_agent_sdk.a2a_client import call_agent_streaming, get_task
 
-# Delegate streaming task to sub-agent
+# Delegate a streaming task to a sub-agent
 async for update in call_agent_streaming(
-    a2a_url="http://localhost:8000/a2a/translator/rpc",
-    message={"role": "user", "parts": [{"type": "text", "text": "Bonjour"}]},
+    "http://localhost:8000/a2a/<provider>/<agent>/rpc",
+    "Bonjour",
     reference_task_ids=[current_run_id],  # Lineage tracking
-    actor_chain=actor_chain,               # Multi-hop identity chain
+    actor_chain=actor_chain,              # Multi-hop identity chain
 ):
     print("Sub-agent update:", update)
+
+# Reading a task later needs a *view proof* when its thread is bound to a
+# chain (contract revision 13): pass this provider's identity and the
+# read is signed for it. Without one, a bound run answers "not found" —
+# existence is part of what is guarded, so the read does not error, it
+# simply finds nothing.
+task = await get_task(
+    "http://localhost:8000/a2a/<provider>/<agent>/rpc",
+    task_id,
+    identity=provider.identity,
+)
 ```
+
+The non-streaming `call_agent` is the same call answered with the settled
+`Task`, and carries A2A's two honoured configuration fields:
+`return_immediately` (answer with the Task as it stands — souk's queued
+lane makes `submitted` a state with real duration) and `history_length`.
 
 ---
 
@@ -203,21 +230,21 @@ async for update in call_agent_streaming(
 > [!IMPORTANT]
 > **Identity Key Persistence**
 > The provider's identity is defined by its **Ed25519 keypair** (`souk_identity.key`).
-> - Re-registering with the same key maintains ownership of assigned `agent_ids`.
-> - If `souk_identity.key` is lost, Souk will treat new registrations under the same display name as a *new, separate identity* and issue fresh `agent_id`s.
+> - Reconnecting with the same key keeps this provider *being* the same provider — the pair `(public key, agent name)` is the address everything else points at.
+> - If `souk_identity.key` is lost, a regenerated key is a *new, separate identity*: anything pinned to the old key (a thread's bound authority, a chain hop already signed) keeps pointing at the orphan.
 > - **Always back up `souk_identity.key` in production environments!**
 
 ---
 
 ## 📁 Reference Implementations
 
-- **[`agent-template`](../AgentSouk/agent-template)** (upstream): The minimal reference implementation (no LLM required). Start here to build a custom provider.
-- **[`providers/pydantic-ai-agent`](../AgentSouk/providers/pydantic-ai-agent)** (upstream): Full-featured production provider using [Pydantic-AI](https://ai.pydantic.dev), MCP tools, sub-agent delegation, and KYOK support *(experimental — see above)*.
+- **[`agent-template`](../agent-template)**: The minimal reference implementation (no LLM required). Start here to build a custom provider.
+- **[`providers/pydantic-ai-agent`](../providers/pydantic-ai-agent)**: Full-featured provider using [Pydantic-AI](https://ai.pydantic.dev), MCP tools, sub-agent delegation, and KYOK support *(experimental — see above)*.
 
 ---
 
 ## 🤝 Contributing & License
 
-For development setup and contribution guidelines, see [CONTRIBUTING.md](../AgentSouk/CONTRIBUTING.md) (upstream).
+Upstream core lives at [hukaichun/funduq](https://github.com/hukaichun/funduq); this repo owns the network layer. See the repo root's [README](../README.md) for the boundary.
 
-**License**: [Apache 2.0](../AgentSouk/LICENSE)
+**License**: [Apache 2.0](LICENSE)

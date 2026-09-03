@@ -1,11 +1,12 @@
-"""The reference gateway: assembles a Souk into one HTTP server.
+"""The reference gateway: assembles a Funduq into one HTTP server.
 
 This is the serving layer. It is the only place that binds a port, applies
-CORS, or terminates TLS — every such decision belongs to whoever hosts souk,
-not to souk itself, which is why `create_app` hands back a plain ASGI app and
-`main` is a thin wrapper that happens to serve it. One listener carries
-everything (docs/server-mode.md): callers over HTTP+SSE, providers over
-WS /ws/provider, LLM providers over WS /ws/kyok.
+CORS, or terminates TLS — every such decision belongs to whoever hosts
+funduq, not to funduq itself, which is why `create_app` hands back a plain
+ASGI app and `main` is a thin wrapper that happens to serve it. One
+listener carries everything (docs/server-mode.md): callers over HTTP+SSE,
+providers over WS /ws/provider, LLM providers over WS /ws/kyok, ticket
+issuance over POST /tickets.
 """
 
 import asyncio
@@ -17,9 +18,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from souk_server import api_a2a, api_agui, api_health, api_llm_bridge, api_registry, ws_kyok, ws_provider
-from souk.config import CoreSettings
-from souk_server.config import ServingSettings
-from souk.core import Souk
+from souk_server.config import ServingSettings, core_settings_from_env
+from funduq.core import Funduq
 from souk_server.deps import install_error_handlers
 from souk_server.mcp_docent import create_docent, transport_security_for
 
@@ -27,8 +27,8 @@ logger = logging.getLogger("souk_server")
 logging.basicConfig(level=logging.INFO)
 
 
-def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
-    """Builds the ASGI app for `souk`. Does not bind anything — the caller
+def create_app(funduq: Funduq, serving: ServingSettings | None = None) -> FastAPI:
+    """Builds the ASGI app for `funduq`. Does not bind anything — the caller
     decides how (or whether) it reaches a network, and is free to wrap it in
     their own middleware or mount it inside a larger app.
     """
@@ -38,7 +38,7 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
     # Stateless because it holds nothing per visitor — every answer is a
     # fresh query against the roster, so there is no session worth pinning to
     # one process, and a second replica can answer just as well.
-    docent = create_docent(souk, serving.public_http_url)
+    docent = create_docent(funduq, serving.public_http_url)
     docent_app = docent.streamable_http_app(
         streamable_http_path="/",
         stateless_http=True,
@@ -51,31 +51,41 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Bringing souk up is souk's own business — reconciling what the last
-        # process left behind and keeping the health sweeps running (see
-        # Souk.start). This layer only decides *when*, and may call it after
-        # _serve already has: start() runs once.
+        # Bringing funduq up is funduq's own business — failing what the
+        # last process left behind and starting dispatch (see
+        # Funduq.start). This layer only decides *when*, and may call it
+        # after _serve already has: start() runs once and answers [] the
+        # second time. It hands back the runs it had to declare orphaned —
+        # already recorded failed, so all that is left is to say so where
+        # an operator looks.
         #
-        # The schema is not part of it: `alembic upgrade head` (see
-        # souk/alembic/) is a deploy-time step with DDL-capable credentials,
-        # separate from starting the server, which only ever runs DML against
-        # a possibly DML-only role.
-        await souk.start()
+        # The schema is not part of it: `python -m funduq.migrate` (the
+        # chain packaged inside the wheel) is a deploy-time step with
+        # DDL-capable credentials, separate from starting the server,
+        # which only ever runs DML against a possibly DML-only role.
+        orphaned = await funduq.start()
+        if orphaned:
+            logger.warning(
+                "funduq.start() failed %d orphaned run(s) from a previous process: %s",
+                len(orphaned),
+                orphaned,
+            )
         # The MCP session manager owns a task group; without this its
         # requests fail rather than degrade, which is why it is entered here
         # rather than lazily on first call.
         async with docent.session_manager.run():
             yield
-        # Deliberately no aclose: this app was handed a Souk it does not own
-        # (see create_app's docstring — it may be mounted inside a larger
-        # app), and closing someone else's would take their background work
-        # and their connection pool with it. Whoever constructed it closes
-        # it; _serve below does exactly that for the one it constructs.
+        # Deliberately no aclose: this app was handed a Funduq it does not
+        # own (see create_app's docstring — it may be mounted inside a
+        # larger app), and closing someone else's would take their
+        # background work and their connection pool with it. Whoever
+        # constructed it closes it; _serve below does exactly that for the
+        # one it constructs.
 
     app = FastAPI(title="souk", lifespan=lifespan)
-    # Read back by souk.deps' dependencies, so the routers hold no
-    # module-level state and two apps can serve two different souks.
-    app.state.souk = souk
+    # Read back by souk_server.deps' dependencies, so the routers hold no
+    # module-level state and two apps can serve two different instances.
+    app.state.souk = funduq
     app.state.serving_settings = serving
     app.add_middleware(
         CORSMiddleware,
@@ -98,14 +108,19 @@ def create_app(souk: Souk, serving: ServingSettings | None = None) -> FastAPI:
 
 
 async def _serve() -> None:
-    souk = Souk(CoreSettings())
+    # Core reads no environment at all since contract revision 14
+    # (`CoreSettings.from_env` is gone), so the read is this entry point's
+    # — souk_server.config.core_settings_from_env, over the same FUNDUQ_*
+    # names this repo has always documented. Identity and signing secret
+    # are required and their absence fails here, at startup.
+    funduq = Funduq(core_settings_from_env())
     serving = ServingSettings()
-    app = create_app(souk, serving)
+    app = create_app(funduq, serving)
 
     if not (serving.http_tls_cert_path and serving.http_tls_key_path):
         logger.warning(
             "HTTP server listening on %s:%s WITHOUT TLS — fine for same-host development, "
-            "never for a souk reachable over a real network (see souk.config's http_tls_* settings)",
+            "never for a souk reachable over a real network (see ServingSettings' http_tls_* settings)",
             serving.http_host,
             serving.http_port,
         )
@@ -120,13 +135,13 @@ async def _serve() -> None:
     http_server = uvicorn.Server(config)
 
     try:
-        # uvicorn's serve() runs the app's ASGI lifespan, which brings souk
-        # up (reconciliation, health sweeps) before the listener accepts
+        # uvicorn's serve() runs the app's ASGI lifespan, which brings
+        # funduq up (orphan cleanup, dispatch) before the listener accepts
         # anything — no work can arrive on any surface before it has run,
         # now that every surface lives on this one listener.
         await http_server.serve()
     finally:
-        await souk.aclose()
+        await funduq.aclose()
 
 
 def main() -> None:

@@ -1,87 +1,57 @@
-"""Registration and roster HTTP surface: routes only.
+"""Ticket issuance and the read-only rosters: routes only.
 
-Verifying that a registration really holds the key it claims is domain, not
-HTTP — the same act for a provider across a network and one in this process —
-so it lives on `Souk` (see `Souk.register_agents`). This file only parses the
-request; a rejection becomes a 401 through the app-wide handler.
+The signed HTTP registration and deletion routes are gone. Registration
+and deletion are operations on an open provider link now (`register` /
+`deleteAgent` / `deleteModel` frames — see ws_provider.py, ws_kyok.py),
+because the key is proved once, when the link opens, and a per-operation
+signature would only re-prove it. What remains here:
+
+- `POST /tickets` — the out-of-band half of the v4 handshake, serving
+  BOTH sockets. Core keeps `issue_ticket` off the link's operation set on
+  purpose: a ticket fetched over the link would mean the link existed
+  before anything authorised it. **Issuing is the admission decision**,
+  which makes this endpoint the future edge-auth plug point — a
+  deployment that gates who may serve gates it here. Unauthenticated
+  today, deliberately: this souk is an open market.
+- The roster GETs, which are what a caller (or souk-directory) reads to
+  discover agents and offerings and glance at their liveness.
 """
 
 from fastapi import APIRouter, Depends
 
-from souk.core import Souk
-from souk.identity import provider_fingerprint
+from funduq.core import Funduq
+from funduq.identity import provider_fingerprint
 from souk_server.deps import get_souk
 from souk_server.models import (
     AgentRosterEntry,
-    DeletionRequest,
     LlmOfferingEntry,
-    LlmRegisterRequest,
-    LlmRegisterResponse,
     LlmRosterResponse,
-    RegisterBatchRequest,
-    RegisterBatchResponse,
     RosterResponse,
+    TicketRequest,
+    TicketResponse,
 )
 
 router = APIRouter()
 
 
-@router.post("/agents/register", status_code=201)
-async def register_agents(
-    body: RegisterBatchRequest, souk: Souk = Depends(get_souk)
-) -> RegisterBatchResponse:
-    registration = await souk.register_agents(
-        body.public_key,
-        body.signature,
-        body.timestamp,
-        [agent.model_dump() for agent in body.agents],
-        provider_name=body.provider_name,
-    )
+@router.post("/tickets", status_code=201)
+async def issue_ticket(body: TicketRequest, funduq: Funduq = Depends(get_souk)) -> TicketResponse:
+    """Mint a single-use ticket admitting `publicKey` to open a link.
 
-    return RegisterBatchResponse(agents=await _roster(souk))
-
-
-@router.post("/llm-providers/register", status_code=201)
-async def register_llm_providers(
-    body: LlmRegisterRequest, souk: Souk = Depends(get_souk)
-) -> LlmRegisterResponse:
-    registered = await souk.register_llm_providers(
-        body.public_key,
-        body.signature,
-        body.timestamp,
-        body.models,
-        metadata=body.metadata or None,
-    )
-    return LlmRegisterResponse(models=sorted(registered))
-
-
-@router.delete("/agents", status_code=204)
-async def delete_agent(body: DeletionRequest, souk: Souk = Depends(get_souk)) -> None:
-    """Remove one agent record, on a signed order from the key that owns
-    it. Core refuses (409 through the app-wide handler) while a provider
-    serves it, while it has active runs, or when it has conversation
-    history — history means the record is the past's, and the way to
-    retire the agent is to stop offering it."""
-    await souk.delete_agent(body.public_key, body.name, body.signature, body.timestamp)
-
-
-@router.delete("/llm-providers", status_code=204)
-async def delete_llm_offering(
-    body: DeletionRequest, souk: Souk = Depends(get_souk)
-) -> None:
-    """Remove one LLM offering record — the deletion half of roster
-    symmetry, and what lets a throwaway KYOK bridge clean up after
-    itself instead of leaving an ephemeral key's offering on the roster
-    forever. Core refuses (409) while the offering is attached or a live
-    run is bound to it; offerings carry no history, so unlike agents
-    there is nothing else to protect."""
-    await souk.delete_llm_offering(
-        body.public_key, body.name, body.signature, body.timestamp
+    The response also carries funduq's public key: the provider learns it
+    here, over TLS, and the connect proof it signs before connecting
+    names that key — so a proof one funduq coaxes out cannot be relayed
+    to attach at another, and the `answer` in the welcome frame is
+    checked against the same pin.
+    """
+    return TicketResponse(
+        ticket=funduq.issue_ticket(body.public_key),
+        funduq_public_key=funduq.identity_public_key,
     )
 
 
 @router.get("/llm-providers")
-async def list_llm_providers(souk: Souk = Depends(get_souk)) -> LlmRosterResponse:
+async def list_llm_providers(funduq: Funduq = Depends(get_souk)) -> LlmRosterResponse:
     """The offering roster, `GET /agents`' mirror — what a KYOK caller
     reads to discover an offering and to glance at its liveness before
     binding a run to it."""
@@ -91,17 +61,17 @@ async def list_llm_providers(souk: Souk = Depends(get_souk)) -> LlmRosterRespons
                 **summary.model_dump(),
                 fingerprint=provider_fingerprint(summary.provider_key),
             )
-            for summary in await souk.list_llm_providers()
+            for summary in await funduq.list_llm_providers()
         ]
     )
 
 
 @router.get("/agents")
-async def list_agents(souk: Souk = Depends(get_souk)) -> RosterResponse:
-    return RosterResponse(agents=await _roster(souk))
+async def list_agents(funduq: Funduq = Depends(get_souk)) -> RosterResponse:
+    return RosterResponse(agents=await _roster(funduq))
 
 
-async def _roster(souk: Souk) -> list[AgentRosterEntry]:
+async def _roster(funduq: Funduq) -> list[AgentRosterEntry]:
     """The roster, with the fingerprint this gateway addresses agents by
     filled in beside the key it is derived from."""
     return [
@@ -109,5 +79,5 @@ async def _roster(souk: Souk) -> list[AgentRosterEntry]:
             **summary.model_dump(),
             fingerprint=provider_fingerprint(summary.provider_key),
         )
-        for summary in await souk.list_agents()
+        for summary in await funduq.list_agents()
     ]
