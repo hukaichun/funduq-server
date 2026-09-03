@@ -134,7 +134,7 @@ go test ./...
 `wire_test.go` replays [`docs/wire-vectors.json`](../../docs/wire-vectors.json)
 (handshake version and frame vocabulary) and
 [`docs/upstream-contract-vectors.json`](../../docs/upstream-contract-vectors.json)
-(upstream funduq's payload vectors, vendored at contract revision 16): it
+(upstream funduq's payload vectors, vendored at contract revision 17): it
 asserts every published payload — the connect proof, the welcome
 verification, the KYOK call, and the singular-act family (resolve, cancel,
 view) this binary does not sign but must not drift from — is

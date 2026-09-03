@@ -42,7 +42,7 @@ def test_the_payload_vectors_pointer_names_a_file_that_exists_at_the_pinned_revi
     here rather than as a skip there."""
     vendored = DOCS.parent / VECTORS["payload_vectors"]
     payload_vectors = json.loads(vendored.read_text())
-    assert payload_vectors["contract"]["revision"] == funduq_contract.CONTRACT_REVISION == 16
+    assert payload_vectors["contract"]["revision"] == funduq_contract.CONTRACT_REVISION == 17
 
 
 def test_the_frame_vocabulary_is_the_dispatched_one():

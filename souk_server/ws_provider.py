@@ -10,9 +10,11 @@ running behind the same socket in souk-agent-sdk.
 
 **funduq hands work over; it does not ask for it.** There is no claim
 loop here on either side: the broker finds whoever serves an agent and
-offers each run, `deliver` writes it to the wire, and the ack frame that
-comes back is the return value. Declining is how a full provider says
-so, and funduq keeps the run.
+offers each run, and `deliver` writes it to the wire. The answer comes
+back as an ordinary inbound frame and goes in through `answer_offer` —
+not as `deliver`'s return value, which is how it worked until contract
+revision 17 and is what funduq#249 was about. Declining is how a full
+provider says so, and funduq keeps the run.
 
 Opening the socket is the v4 ticket handshake — two frames, the proof
 computed before connecting against a ticket from `POST /tickets`. See
@@ -70,15 +72,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger("souk.ws_provider")
 
 router = APIRouter()
-
-# A backstop, and deliberately longer than the deadline that actually
-# governs. funduq wraps every offer in `RunBroker.deliver_timeout_seconds`
-# (5s) because it has one delivery loop and an offer that never returns
-# stops dispatch for everybody — so funduq gives up first, and this never
-# fires in a funduq that sets a deadline. Shortening it to "win" would put
-# the same policy in two places and let them drift; deleting it would
-# leave a wait with no bound at all if funduq ever offers without one.
-ACK_TIMEOUT_SECONDS = 30.0
 
 # What a provider may ask funduq, and it is deliberately short: this is
 # not a mirror of funduq's API, because every method admitted here is one
@@ -141,11 +134,11 @@ class SocketProvider:
     the key, which is the whole point of the handshake. The ticket, nonce
     and proof arrive in the hello and go to `attach_provider` explicitly.
 
-    Holds no per-run state beyond the acks it is waiting on — every frame
-    names its run, and funduq keeps the only routing table — plus
-    `registered_names`, the roster this link last published, which the
-    registration watcher reads, and `_interjections`, the per-agent
-    capability that roster declared.
+    Holds **no per-run state at all** since revision 17 took the verdict
+    off `deliver`'s return — every frame names its run and funduq keeps
+    the only routing table. What is left is `registered_names`, the roster
+    this link last published, which the registration watcher reads, and
+    `_interjections`, the per-agent capability that roster declared.
     """
 
     # The whole of what funduq reaches for on this object. Not read off
@@ -172,12 +165,7 @@ class SocketProvider:
         self._public_key = public_key
         self._max_concurrent_runs = max_concurrent_runs
         self._outbound = outbound
-        self._acks: dict[str, asyncio.Future[bool | Refusal]] = {}
         self.registered_names: set[str] = set()
-        # Runs this connection has accepted whose first report has not
-        # landed yet. See `claim_settling` — this is the whole state the
-        # ordering guard needs, and it empties itself.
-        self.accepted_unreported: set[str] = set()
         self._interjections: dict[str, bool] = {}
 
     @property
@@ -215,8 +203,8 @@ class SocketProvider:
         """
         return self._interjections.get(agent_name, False)
 
-    async def deliver(self, run: DeliveredRun) -> bool | Refusal:
-        """Write this run to the wire and wait for the answer.
+    async def deliver(self, run: DeliveredRun) -> None:
+        """Hand the offer over. Nothing comes back this way.
 
         The frame is `{"type": "run"}` plus the published envelope: since
         contract revision 11 `deliver` *receives* the `DeliveredRun`, so
@@ -224,68 +212,28 @@ class SocketProvider:
         validate — funduq built and validated the model before offering it.
 
         **Dumped `by_alias=True` and never `exclude_none`.** `RunAgentInput`
-        has required fields that are legitimately null (`state`,
-        `forwardedProps`); stripping them yields a `runInput` the far side
-        cannot rebuild, and a perfectly good run comes back as a permanent
+        has required fields that are legitimately null (`forwardedProps`
+        among them); stripping them yields a `runInput` the far side cannot
+        rebuild, and a perfectly good run comes back as a permanent
         refusal. (The opposite rule holds for AG-UI *events* — see
         api_agui.encode_event — and the two pull against each other, which
         is why each says so where it is written.)
 
-        Answering late is the same as declining, whichever deadline ran
-        out: the ack arrives for a run nobody is waiting on any more, and
-        `ack` drops it. funduq keeps the run either way.
+        **The verdict does not ride this return, and that is the fix to
+        funduq#249.** It used to: this method parked on a future that the
+        read loop resolved when the `ack` frame arrived. Two roads then led
+        into core — the verdict by `deliver`'s return, the events by
+        `report_event` — and nothing ordered them, so a provider that
+        accepted and streamed in the same breath had its opening events
+        refused by a run it had just been given. At revision 17 the second
+        road is gone: the verdict enters through `answer_offer`, in the
+        same handler that read it, ahead of every frame behind it. So this
+        method queues a frame and returns, and the transport keeps no
+        per-offer state at all.
         """
-        loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[bool | Refusal] = loop.create_future()
-        self._acks[run.run_id] = waiter
         self._outbound.put_nowait(
             {"type": "run", **run.model_dump(by_alias=True, mode="json")}
         )
-        try:
-            return await asyncio.wait_for(waiter, timeout=ACK_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "provider %s did not answer the offer of run %s in %.0fs — treating as declined",
-                self.public_key,
-                run.run_id,
-                ACK_TIMEOUT_SECONDS,
-            )
-            return False
-        finally:
-            self._acks.pop(run.run_id, None)
-
-    def ack(self, verdict: funduq_contract.Verdict) -> bool:
-        """Answer one outstanding offer, and say whether anyone was waiting.
-
-        A `refused` verdict is *permanent* — the provider saying re-offering
-        can never succeed (an input that does not parse, most importantly).
-        funduq fails the run with the reason recorded verbatim and stops
-        re-offering; `declined` stays what it always was, "full right now".
-        The port says so with one optional type
-        (`funduq_provider_sdk.Refusal`, read duck-typed by the broker), and
-        `funduq_contract.Verdict` is where the three names are written down.
-
-        **A verdict for nothing is normal, not an error.** Upstream
-        withdrew `accept_late_ack` at revision 11: an answer arriving after
-        the delivery window matches nothing and is answered false. funduq
-        has already taken the run back and will offer it again.
-        """
-        waiter = self._acks.get(verdict.id)
-        if waiter is None or waiter.done():
-            return False
-        if verdict.verdict == "refused":
-            # Keyword, not positional: `Refusal` is a pydantic model in
-            # funduq_contract now (it was a one-argument dataclass), and a
-            # positional call raises inside this socket's read loop —
-            # which reads as a provider that went quiet, not as a bad
-            # constructor.
-            waiter.set_result(Refusal(reason=verdict.reason or "refused"))
-        else:
-            accepted = verdict.verdict == "accepted"
-            if accepted:
-                self.accepted_unreported.add(verdict.id)
-            waiter.set_result(accepted)
-        return True
 
     async def cancel(self, run_id: str) -> bool:
         """Ask, and do not wait for an outcome.
@@ -298,14 +246,6 @@ class SocketProvider:
         """
         self._outbound.put_nowait({"type": "cancel", "runId": run_id})
         return True
-
-    def fail_pending(self) -> None:
-        """The socket is gone: nothing can answer these offers."""
-        for waiter in self._acks.values():
-            if not waiter.done():
-                waiter.set_result(False)
-        self._acks.clear()
-
 
 async def _answer_query(
     funduq: "Funduq", public_key: str, parsed: dict[str, Any], outbound: asyncio.Queue
@@ -490,51 +430,6 @@ def _parse_registration(frame: dict[str, Any]) -> list[funduq_contract.Registrat
     return parsed
 
 
-CLAIM_SETTLE_SECONDS = 0.5
-
-
-async def claim_settling(
-    report: "Callable[[], bool]", provider: "SocketProvider", run_id: str
-) -> bool:
-    """Report upward, allowing for a claim that has not landed yet.
-
-    **The window this closes is real and was found by running the stack, not
-    by reading.** Since contract revision 11 funduq offers a `DeliveredRun`
-    and records the claim only *after* `deliver` returns — before then, the
-    run is held by nobody. Our `deliver` returns by having this socket's read
-    loop resolve its future, and that read loop is then free to handle the
-    very next frame. A provider that answers `accepted` and starts streaming
-    in the same breath — which an SDK-less one does, because nothing tells it
-    not to — therefore lands its first events inside funduq's own claim
-    window, and every one of them is refused as "reported for a run nobody
-    holds". Measured: exactly one event-loop turn, but only on this machine,
-    on this day, against SQLite; one turn is not a number to build on.
-
-    So the first report of an accepted run waits for the claim rather than
-    assuming it. Bounded by `CLAIM_SETTLE_SECONDS`, and only for a run *this*
-    connection accepted and has not successfully reported yet — a report for
-    anything else is refused immediately, as it always was, because that is
-    a provider talking about work it does not hold.
-
-    The retry costs one "nobody holds" line in funduq's log per run, which is
-    the honest trace of a wait that really happened.
-    """
-    if report():
-        provider.accepted_unreported.discard(run_id)
-        return True
-    if run_id not in provider.accepted_unreported:
-        return False
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + CLAIM_SETTLE_SECONDS
-    while loop.time() < deadline:
-        await asyncio.sleep(0.005)
-        if report():
-            provider.accepted_unreported.discard(run_id)
-            return True
-    provider.accepted_unreported.discard(run_id)
-    return False
-
-
 def _parse_verdict(frame: dict[str, Any]) -> funduq_contract.Verdict:
     """One inbound `ack` frame as the contract's own three-valued verdict.
 
@@ -661,30 +556,50 @@ async def provider_socket(websocket: WebSocket) -> None:
                         {"type": "error", "message": f"invalid ack: {e}"}
                     )
                     continue
-                # The answer to "did anyone hear that" is deliberately
-                # dropped: a verdict that matches nothing is normal — the
-                # window ran out and funduq took the run back — and
-                # answering an error frame for it would teach every
-                # provider to log a scare on its own slow morning.
-                provider.ack(verdict)
-            elif kind == "event":
-                event = parsed.get("event")
-                landed = await claim_settling(
-                    lambda: funduq.report_event(run_id, event, claimed_by=public_key),
-                    provider,
-                    run_id,
+                # Straight through the door, in the handler that read it —
+                # which is the whole of funduq#249's fix. Everything this
+                # connection says about the run after this point queues
+                # behind the verdict at the run's own owner, so a provider
+                # that accepts and streams in the same breath can no longer
+                # outrun its own "yes".
+                #
+                # `refused` is *permanent* — the provider saying re-offering
+                # can never succeed (an input that does not parse, most
+                # importantly): funduq fails the run with the reason
+                # recorded verbatim and stops re-offering. `declined` stays
+                # "full right now". Keyword, not positional: `Refusal` is a
+                # pydantic model in funduq_contract now, and a positional
+                # call would raise inside this read loop — which reads as a
+                # provider that went quiet, not as a bad constructor.
+                answer: Any = (
+                    Refusal(reason=verdict.reason or "refused")
+                    if verdict.verdict == "refused"
+                    else verdict.verdict == "accepted"
                 )
-                if not landed:
+                # The answer to "did anyone hear that" is deliberately
+                # dropped: a verdict for a run funduq no longer holds is
+                # normal — it took the run back and will offer it again —
+                # and an error frame for it would teach every provider to
+                # log a scare on its own slow morning.
+                funduq.answer_offer(run_id, answer, provider_key=public_key)
+            # `report_event` and `finish_run` mean "attributed and posted"
+            # since revision 17, and answer `False` for one thing only: a
+            # run funduq does not know. Whether *this* key holds the run is
+            # judged by the run's own owner, in arrival order, and a
+            # misattributed report is dropped and logged there rather than
+            # answered back here — so the error frame below now says
+            # "no such run", and no longer doubles as "not yours". The
+            # bounded retry this used to carry for funduq's claim window is
+            # deleted with the window (funduq#249).
+            elif kind == "event":
+                if not funduq.report_event(
+                    run_id, parsed.get("event"), claimed_by=public_key
+                ):
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "event refused"}
                     )
             elif kind == "finish":
-                landed = await claim_settling(
-                    lambda: funduq.finish_run(run_id, claimed_by=public_key),
-                    provider,
-                    run_id,
-                )
-                if not landed:
+                if not funduq.finish_run(run_id, claimed_by=public_key):
                     outbound.put_nowait(
                         {"type": "error", "runId": run_id, "message": "finish refused"}
                     )
@@ -695,7 +610,6 @@ async def provider_socket(websocket: WebSocket) -> None:
                 # it — for the length of that read.
                 asyncio.create_task(_answer_query(funduq, public_key, parsed, outbound))
     finally:
-        provider.fail_pending()
         # Connection-scoped on purpose: a re-attach replaces the old link,
         # and a whole-key detach fired by this (replaced) socket's teardown
         # would take the live replacement offline — exactly the case a

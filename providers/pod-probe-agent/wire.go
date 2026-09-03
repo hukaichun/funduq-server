@@ -4,7 +4,7 @@
 // and must not need the gateway, souk core, or any Python installed to
 // come alive. Every payload here is cross-checked byte-for-byte in
 // wire_test.go against the vendored upstream vectors
-// (docs/upstream-contract-vectors.json, contract revision 16).
+// (docs/upstream-contract-vectors.json, contract revision 17).
 package main
 
 import (

@@ -98,10 +98,10 @@ catches all of it; "verified end to end" is a claim about one path.
   finalise a fixture from a different task than it set up in, which a
   cancel scope cannot survive.
 
-## Upstream's contract (currently revision 16)
+## Upstream's contract (currently revision 17)
 
-The pin is `funduq` 0.0.6, `funduq-provider-sdk[llm]` 0.0.7,
-`funduq-contract` 0.0.9. Read
+The pin is `funduq` 0.0.7, `funduq-provider-sdk[llm]` 0.0.8,
+`funduq-contract` 0.0.10. Read
 [upstream's `docs/contract-changelog.md`](https://github.com/hukaichun/funduq/blob/main/docs/contract-changelog.md)
 before moving it: it says what an implementation must change, which
 commit subjects cannot. Four things here bite in ways a green suite does
@@ -109,7 +109,7 @@ not always catch first:
 
 - **Two dump rules that pull opposite ways.** A frame envelope is dumped
   `by_alias=True` and **never** `exclude_none` (`RunAgentInput`'s
-  `state`/`forwardedProps` are legitimately null, and stripping them
+  `forwardedProps` is legitimately null, and stripping it
   makes a good run come back as a *permanent refusal*); a typed AG-UI
   event is dumped **with** `exclude_none=True` (or `timestamp: null` and
   `rawEvent: null` land in the caller's stream). Upstream's codec used to

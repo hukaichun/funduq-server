@@ -26,7 +26,7 @@ dependencies = [
     # payloads. The old two SDK packages merged; the LLM half is the
     # `llm` extra (`funduq_provider_sdk.llm`). Apache-2.0, like this
     # package.
-    "funduq-provider-sdk[llm]>=0.0.7,<0.1",
+    "funduq-provider-sdk[llm]>=0.0.8,<0.1",
     # The AG-UI wire model both ends of every run frame validate against.
     # Pinned with a floor here, and not left to whatever each subproject's
     # lock happened to resolve: `funduq-contract` floors it at >=0.1, and

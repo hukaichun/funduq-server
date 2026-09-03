@@ -5,20 +5,22 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Upstream is the published `funduq` packages now (`funduq` 0.0.6,
-`funduq-provider-sdk[llm]` 0.0.7, `funduq-contract` 0.0.9 — the repo is
+Upstream is the published `funduq` packages now (`funduq` 0.0.7,
+`funduq-provider-sdk[llm]` 0.0.8, `funduq-contract` 0.0.10 — the repo is
 [hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
 payloads and delivery envelopes on this wire are theirs, pinned at a
-named **contract revision** (currently 16, vendored in
+named **contract revision** (currently 17, vendored in
 [`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json)).
 The *framing* — which frames exist, what each carries, the handshake's
 shape on a socket — remains this repo's to decide, and this gateway has
 no deployments outside this repo, so a wire change is still a hard
 cutover selected by the `version` field rather than a staged migration.
 
-**Revisions 8–16 changed nothing about the frame vocabulary.** The wire
-is still v4 — same frames, same `handshake_version` — and the section
-below on what upstream ships instead is the whole of what moved.
+**Revisions 8–17 changed nothing about the frame vocabulary.** The wire
+is still v4 — same frames, same `handshake_version`, and every signed
+payload byte-identical since revision 16. What moved is underneath: the
+types the frames validate into, and — at revision 17 — which door a
+verdict enters core by.
 
 ## The decision
 
@@ -66,7 +68,7 @@ after in-process and gRPC. The KYOK edge swaps the same way because the
 LLM-provider link is likewise a transport-free port; only this repo's
 serving layer changes.
 
-## Shapes, not a machine — and the orderings live here now
+## Shapes, not a machine — and where the orderings live
 
 This repo asked upstream for a sans-io protocol machine
 ([hukaichun/funduq#213](https://github.com/hukaichun/funduq/issues/213)):
@@ -81,13 +83,26 @@ reason, from the changelog, is worth quoting rather than paraphrasing:
 > are plain request/response, so there is nothing left for a machine to
 > order.
 
-This document is where the consequence lands: **nothing upstream
-enforces the orderings on this wire any more, so they are stated here and
-tested here.** Welcome before anything else, offer-then-verdict, a roster
-that replaces rather than appends, an answer accepted only on the
-connection its request was delivered to — every one of them is this
-repo's to keep, in the sections below, in `docs/wire-vectors.json`, and
-in the three suites plus the Go probe that replay it.
+This document is where the consequence lands: **almost nothing upstream
+enforces the orderings on this wire, so they are stated here and tested
+here.** Welcome before anything else, a roster that replaces rather than
+appends, an answer accepted only on the connection its request was
+delivered to — every one of them is this repo's to keep, in the sections
+below, in `docs/wire-vectors.json`, and in the three suites plus the Go
+probe that replay it.
+
+"Almost", because one of them went home. The rule that a provider's
+events cannot overtake its own verdict was ours to enforce for exactly
+one release — a bounded retry around funduq's claim window — and at
+contract revision 17 upstream took it back and made it structural, by
+routing the verdict through `answer_offer` so that both roads into core
+become one. See "The verdict does not ride a return value" below. The
+episode is the best argument in this document for where such rules
+belong: the window lived entirely inside core, was invisible in every
+frame, and cost a full stack run to find; any transport that ever exists
+would otherwise have paid for it separately. What is left here is the
+framing — genuinely ours, because we chose it — rather than the
+happens-before rules of core's own bookkeeping.
 
 What was adopted instead is the half of #213 that survived, and it is a
 real improvement:
@@ -531,23 +546,53 @@ declares *unlimited*, and upstream takes that at its word: an unlimited
 provider that declines is counted `misdeclared`. Pacing is declared, not
 improvised.
 
-Two deadlines apply to an offer, and only one governs. souk wraps every
-offer in `RunBroker.deliver_timeout_seconds` (5s, a `CoreSettings` field
-since revision 14) because it has a single delivery loop and an offer
-that never returns stops dispatch for everybody. The gateway's own
-`ACK_TIMEOUT_SECONDS` is longer and is a backstop for a souk that offers
-without a deadline; shortening it to "win" would put the same policy in
-two places and let them drift.
+**The verdict does not ride a return value, and the transport keeps no
+per-offer state.** `deliver` hands the offer to the wire and returns
+nothing (contract revision 17); the `ack` frame comes back as an
+ordinary inbound frame and the read loop posts it through
+`Funduq.answer_offer(run_id, answer, provider_key=…)`, in the handler
+that read it. Because everything this connection says about a run enters
+by the same door and is judged by the run's one owner in arrival order,
+a provider's events queue *behind* its own verdict and cannot overtake
+it. There is no ack timeout here any more, and nothing to time out —
+`RunBroker.deliver_timeout_seconds` (5s, a `CoreSettings` field since
+revision 14) remains souk's own, protecting its single delivery loop.
+
+**This is the one ordering that went home.** Until revision 17 the
+verdict rode `deliver`'s return while events walked in through
+`report_event`, and nothing sequenced the two roads: a provider that
+accepted and streamed in the same breath — which an SDK-less one does,
+because nothing on this wire tells it to wait — had its opening events
+refused by a run souk had just given it, and was marked `abandoned` for
+the privilege. Every SDK-backed provider hid it (the runtime awaits the
+agent first), and this repo's suite passed with the hole in it; only the
+Go probe running under `docker compose` was fast enough to fall in. It
+was reported as
+[funduq#249](https://github.com/hukaichun/funduq/issues/249) — where
+upstream granted that revision 11's rationale for withdrawing the
+protocol machines, that "over a wire the provider-initiated calls are
+plain request/response, so there is nothing left for a machine to
+order", had missed exactly this happens-before, which lives in no frame
+— and fixed by removing the second road rather than pacing it. The
+bounded retry this gateway carried in the meantime is deleted with the
+window.
 
 **Answering late is not a path — it is a guard.** `accept_late_ack` and
-the `answered_late` counter were withdrawn at revision 11: a verdict
-arriving after the delivery window matches nothing and is answered
-`false`. souk has already taken the run back and will simply offer it
-again, so relaying a `false` for an offer this side thought it had
-delivered is normal rather than an error, and the gateway deliberately
-drops the "did anyone hear that" answer instead of sending an `error`
+the `answered_late` counter were withdrawn at revision 11: a verdict for
+a run souk no longer holds matches nothing and is answered `false`. souk
+has already taken the run back and will simply offer it again, so a
+`false` from `answer_offer` is normal rather than an error, and the
+gateway deliberately drops that answer instead of sending an `error`
 frame — which would teach every provider to log a scare on its own slow
 morning.
+
+**`event`/`finish` refusal means one thing now: no such run.** Since
+revision 17 `report_event` and `finish_run` mean "attributed and
+posted", and answer `false` only for a run funduq does not know;
+whether the reporting key holds it is judged by the run's owner, and a
+misattributed report is dropped and logged there rather than answered
+synchronously. The frame this side sends back therefore no longer
+doubles as "not yours", which makes it something a provider can act on.
 
 **`cancel` returns a receipt, not an outcome.** It is `async` and returns
 `bool` since revision 11 — "the ask is on the wire" — because funduq
@@ -1072,7 +1117,7 @@ and upstream keeps none: this repo owns both ends of every wire it
 defines. What used to be "pinned by commit" is now pinned by version
 bounds in each `pyproject.toml`, and what used to be a path into the
 submodule (vectors, scripts, docs) now has an in-repo home:
-`docs/upstream-contract-vectors.json` (vendored at contract revision 16,
+`docs/upstream-contract-vectors.json` (vendored at contract revision 17,
 regenerated by re-vendoring when the pin moves) and
 `scripts/gen_dev_tls_cert.py`.
 

@@ -16,7 +16,7 @@ dependencies = [
     # What a provider *is* — identity, the port, the loop. This package
     # is only the socket around it. From PyPI now; the signing payloads
     # it re-exports come from funduq-contract underneath.
-    "funduq-provider-sdk>=0.0.7,<0.1",
+    "funduq-provider-sdk>=0.0.8,<0.1",
     # The AG-UI wire model both ends of every run frame validate against.
     # Pinned with a floor here, and not left to whatever each subproject's
     # lock happened to resolve: `funduq-contract` floors it at >=0.1, and

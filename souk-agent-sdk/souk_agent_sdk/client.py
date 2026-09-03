@@ -206,17 +206,21 @@ class SoukProvider(FunduqLink):
     def max_concurrent_runs(self) -> int | None:
         return self.runtime.max_concurrent_runs
 
-    async def deliver(self, run: DeliveredRun) -> bool | Refusal:
+    async def deliver(self, run: DeliveredRun) -> None:
         """souk hands a run down. Never called on this side — a socket
         provider is handed work by a `run` frame, which `_offer` below
         turns into `runtime.deliver`. It exists because `FunduqLink` names
         both directions and this is the half a wire routes differently.
 
-        Three-valued, as upstream's link is: `True` accepted, `False` a
-        transient decline (full right now — the run stays souk's), and a
-        `Refusal` a permanent one.
+        **Returns nothing since contract revision 17.** The verdict used to
+        ride this return; it now goes back the way it always travelled on a
+        wire — as an `ack` frame — and the gateway posts it through
+        `answer_offer`. `_offer` below still reads the runtime's
+        three-valued answer (`True`, `False`, or a `Refusal`) to build that
+        frame; what changed is that no caller of *this* method is waiting
+        for it.
         """
-        return await self.runtime.deliver(run)
+        await self.runtime.deliver(run)
 
     def takes_interjections(self, agent_name: str) -> bool:
         """Whether the named agent takes interjections — a **method**, per
@@ -559,7 +563,11 @@ class SoukProvider(FunduqLink):
                 {"type": "ack", "runId": run_id, "accepted": False, "reason": reason}
             )
             return
-        verdict = await self.deliver(delivered)
+        # The runtime, not `self.deliver`: since contract revision 17 the
+        # link's `deliver` returns nothing (the verdict stopped riding a
+        # return value anywhere in this system), and the answer this frame
+        # needs is the runtime's own three-valued one.
+        verdict = await self.runtime.deliver(delivered)
         if isinstance(verdict, Refusal):
             # A permanent refusal from the runtime — today, an interjection
             # addressed to an agent that takes none. Its reason travels, so

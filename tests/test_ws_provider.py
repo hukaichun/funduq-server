@@ -995,41 +995,29 @@ async def test_an_ack_naming_no_run_at_all_is_answered_by_name(souk):
             assert "ack" in frame["message"]
 
 
-async def test_events_sent_in_the_same_breath_as_the_ack_are_not_lost(souk, monkeypatch):
+async def test_events_sent_in_the_same_breath_as_the_ack_are_not_lost(souk):
     """Accept and stream without pausing — and keep every event.
 
     An SDK-less provider answers `accepted` and starts reporting in the
-    same breath, because nothing on this wire tells it to wait. Since
-    contract revision 11 funduq records the claim only after `deliver`
-    returns, and `deliver` returns by this socket's read loop resolving a
-    future — so those first events can arrive while the run is still held
-    by nobody, and without `claim_settling` they come back "event refused"
-    and the caller's stream loses its opening. Found by running the full
-    stack; the gateway suite passed with the hole in it, because every
-    other test acks and then awaits something.
+    same breath, because nothing on this wire tells it to wait. That used
+    to lose the opening of every such run: the verdict rode `deliver`'s
+    return value while the events walked in through `report_event`, and
+    nothing ordered the two roads, so the events arrived at a run funduq
+    had said yes to but not yet written down. Found by running the full
+    stack against the Go probe; reported as funduq#249 and fixed upstream
+    at contract revision 17 by removing the second road — the verdict now
+    enters through `answer_offer`, in the handler that read it, and
+    everything behind it queues behind it.
 
-    The window is one event-loop turn wide against SQLite on a quiet
-    machine, which is far too narrow to reproduce by racing it here — a
-    test that tried would pass for the wrong reason on a fast day and flake
-    on a slow one. So the window is *held open*: the first report of this
-    run is refused the way funduq refuses one it has not claimed yet, and
-    the guard has to notice and come back. Disable `claim_settling` and
-    this test fails.
+    So this test no longer guards a workaround of ours; it guards that we
+    still route the verdict through that door. Its weakness is worth
+    stating: the old window was one event-loop turn wide, far too narrow
+    to lose by racing it here, so a regression that re-parked the verdict
+    on `deliver` would likely still pass this. The compose stack with the
+    SDK-less probe is what actually catches that class, which is why it is
+    in the verification bar and not beside it.
     """
     from funduq.models import AgentRef
-
-    real_report = souk.report_event
-    refused: set[str] = set()
-
-    def report_once_too_early(run_id, event, *, claimed_by):
-        """Refuse exactly the first report of each run, as an unlanded
-        claim does — every later one behaves normally."""
-        if run_id not in refused:
-            refused.add(run_id)
-            return False
-        return real_report(run_id, event, claimed_by=claimed_by)
-
-    monkeypatch.setattr(souk, "report_event", report_once_too_early)
 
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
@@ -1042,6 +1030,9 @@ async def test_events_sent_in_the_same_breath_as_the_ack_are_not_lost(souk, monk
             assert frame["type"] == "run"
             run_id = frame["runId"]
 
+            # No await on anything of funduq's between the verdict and the
+            # first event: the ordering a provider with its answer already
+            # in hand produces.
             await socket.send({"type": "ack", "runId": run_id, "accepted": True})
             await socket.send(
                 {
@@ -1054,24 +1045,20 @@ async def test_events_sent_in_the_same_breath_as_the_ack_are_not_lost(souk, monk
                     },
                 }
             )
-
-            # The event survived a claim that had not landed when it arrived…
-            await socket.expect_nothing()
-            assert run_id in refused
-
-            # …and the run is live and finishable, not stranded.
             await socket.send({"type": "finish", "runId": run_id})
+
             await socket.expect_nothing()
             assert (await souk.get_run(handle.run_id)).status not in {"queued", "running"}
 
 
-async def test_a_report_for_a_run_this_socket_never_accepted_is_refused_at_once(souk):
-    """The guard waits only for a claim it is owed.
+async def test_a_report_naming_a_run_funduq_does_not_know_is_refused(souk):
+    """`report_event` answers `False` for one thing only: no such run.
 
-    `claim_settling` exists for the run this connection just said yes to;
-    anything else is a provider talking about work it does not hold, and
-    that answer is immediate. Without this the guard would be a half-second
-    of patience handed to every stray frame.
+    It used to also mean "not yours", and this frame carried both. Since
+    revision 17 attribution is judged by the run's own owner — a report
+    from a key that does not hold the run is dropped and logged there,
+    not answered synchronously — so the error frame below has exactly one
+    meaning left, and a provider reading it can act on it.
     """
     async with _provider_client(souk) as client:
         async with _connect(client) as ws:
@@ -1080,7 +1067,7 @@ async def test_a_report_for_a_run_this_socket_never_accepted_is_refused_at_once(
             await socket.send(
                 {
                     "type": "event",
-                    "runId": "run_never_offered_here",
+                    "runId": "run_no_such_thing",
                     "event": {"type": "RUN_STARTED", "threadId": "t", "runId": "x"},
                 }
             )

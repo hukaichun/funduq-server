@@ -663,7 +663,7 @@ wheels = [
 
 [[package]]
 name = "funduq-provider-sdk"
-version = "0.0.7"
+version = "0.0.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
@@ -672,9 +672,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d8/ac/06ab25a7ac931138997c69e7ad0a605184427d831bfafa316a94bc380a7d/funduq_provider_sdk-0.0.7.tar.gz", hash = "sha256:a2cc15883cd2eefdc7a506b2736e81fc165806f1179eb26e5efa28a70f4cfca2", size = 57748, upload-time = "2026-09-02T22:07:22.652Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cb/99/5cc5eee718e0a60285da3e89929302bd3c7070dff6cf7b07b4835accb4ea/funduq_provider_sdk-0.0.8.tar.gz", hash = "sha256:ecc894a8a880b764c4d8b33467425a1da822aba0905d6c2d030f6795dfa714c6", size = 57905, upload-time = "2026-09-03T07:28:22.73Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/fb/6f25b861cde3d4a23af8eeb05a1a66deaddb81f59c09d41c66742da41d93/funduq_provider_sdk-0.0.7-py3-none-any.whl", hash = "sha256:988e373301aa90f0430968c659ffb8f832d8778faf6be31b74fa50f147c7f02f", size = 21239, upload-time = "2026-09-02T22:07:21.075Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/da/9d57ca0e44890beee6d94a04175c087b388cc427a68bb3e23170507a8823/funduq_provider_sdk-0.0.8-py3-none-any.whl", hash = "sha256:867d82a825e1d86e9b9b1060f8d13c2824d34f431358b6c4d84db255ca58e4e1", size = 21483, upload-time = "2026-09-03T07:28:21.442Z" },
 ]
 
 [package.optional-dependencies]
@@ -1756,7 +1756,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ag-ui-protocol", specifier = ">=0.1.22" },
-    { name = "funduq-provider-sdk", extras = ["llm"], specifier = ">=0.0.7,<0.1" },
+    { name = "funduq-provider-sdk", extras = ["llm"], specifier = ">=0.0.8,<0.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx-sse", specifier = ">=0.4" },
     { name = "litellm", specifier = ">=1.95" },

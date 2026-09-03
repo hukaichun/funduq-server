@@ -24,7 +24,7 @@ import (
 //   - docs/wire-vectors.json: this repo's frame vocabulary + handshake
 //     version.
 //   - docs/upstream-contract-vectors.json: upstream funduq's payload
-//     vectors, vendored verbatim at contract revision 16.
+//     vectors, vendored verbatim at contract revision 17.
 
 func repoRoot(t *testing.T) string {
 	// providers/pod-probe-agent -> repo root
@@ -105,7 +105,7 @@ func TestHandshakeVersionAndVocabulary(t *testing.T) {
 // singular-act family, which this binary does not sign today but keeps
 // byte-exact so a reshape upstream is caught here.
 //
-// Every kind published at revision 16 is replayed — there is no longer a
+// Every kind published at revision 17 is replayed — there is no longer a
 // vector this file skips. `delegation` is gone from the file entirely
 // (revision 15 deleted the certificate and the funduq-delegate tag with
 // it), and `resolution` changed shape at 16: an ask hash where a
@@ -140,8 +140,8 @@ func TestContractVectors(t *testing.T) {
 	if err := json.Unmarshal(data, &cf); err != nil {
 		t.Fatal(err)
 	}
-	if cf.Contract.Revision != 16 {
-		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 16 — re-read the changelog before bumping", cf.Contract.Revision)
+	if cf.Contract.Revision != 17 {
+		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 17 — re-read the changelog before bumping", cf.Contract.Revision)
 	}
 
 	testKey := ed25519.NewKeyFromSeed(mustHex(t, cf.TestKey.PrivateHex))
