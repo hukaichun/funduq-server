@@ -963,12 +963,21 @@ No `X-` prefix: RFC 6648 deprecated that in 2012, and the two
 (renaming those is its own round). Three properties, each earning its
 place:
 
-- **the body hash** binds the proof to *this* request, so a captured
-  header cannot be replayed onto a different call. This is modelled
-  directly on `kyok_call_payload`, the one payload upstream already uses
-  to authenticate an HTTP call with a body — and it is why
-  `view_payload` could not be reused: that binds one `run_id`, and a
-  request that *opens* a run has no run id yet;
+- **the body hash** binds the proof to *this* request. Be precise about
+  what that buys, because upstream pushed back on an earlier and looser
+  claim here (funduq#269): a captured *chain* is already worthless to
+  whoever cannot sign the next hop — `verify_chain` refuses a hop
+  following a dispatch hop unless the party that dispatch named signed
+  it — so replay of the chain is not what this closes. What it closes is
+  narrower and real: the chain is not a secret, so an attacker holding a
+  captured request holds the header too, and without the binding could
+  swap that header onto a *different body* inside the freshness window —
+  "B asked for a translation" replayed as B asking for something else.
+  This gateway wants request binding for that reason, which is its own,
+  not because chains require it. Modelled on `kyok_call_payload`, the one
+  payload upstream already uses to authenticate an HTTP call with a body
+  — and it is why `view_payload` could not be reused: that binds one
+  `run_id`, and a request that *opens* a run has no run id yet;
 - **the timestamp** bounds capture-and-replay of the same request to the
   60-second window the cancel family already uses
   (`funduq.identity.is_timestamp_fresh`, so there is one window here, not
