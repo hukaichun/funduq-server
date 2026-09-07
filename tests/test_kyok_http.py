@@ -72,7 +72,7 @@ async def _live_run(souk, serve, *names: str):
     ref = served.ref()
     thread_id = await souk.create_thread(ref)
     async with souk.session() as session:
-        created = await repo.create_run(session, thread_id, ref, "ag-ui", {})
+        created = await repo.create_run(session, thread_id, ref, {})
         await session.commit()
     run_id = created["run_id"]
     souk.enqueue_run(
@@ -88,7 +88,6 @@ async def _live_run(souk, serve, *names: str):
             "context": [],
             "forwardedProps": None,
         },
-        "ag-ui",
     )
     return served, run_id
 

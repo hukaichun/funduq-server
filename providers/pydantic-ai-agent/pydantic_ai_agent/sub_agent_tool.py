@@ -13,6 +13,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from pydantic_ai import RunContext, Tool
+from funduq_provider_sdk import ProviderIdentity
 from souk_agent_sdk.a2a_client import call_agent_streaming
 
 from pydantic_ai_agent.config import SubAgentConfig
@@ -39,6 +40,14 @@ class AgentDeps:
     # souk/identity.py's verify_actor_chain). Optional: a sub-agent call
     # without one is still allowed, just unattributed.
     actor_chain: list[str] | None = None
+    # The same key the chain's last hop was signed with, in the shape the
+    # A2A client needs to sign the presenter header. Contract revision 21
+    # refuses a chain at a door that cannot say who presented it
+    # (`PresenterRequired`), so a chain now travels with a proof that the
+    # caller holds the key it names — and the SDK refuses locally rather
+    # than sending a call it knows will come back 401. Two shapes of one
+    # key: the raw key signs the hop, `ProviderIdentity` signs the header.
+    identity: ProviderIdentity | None = None
     # sub_agent name -> the real contextId (A2A) souk returned on that
     # sub-agent's most recent call. souk never reuses a callee thread
     # implicitly (see souk/repo.py's ensure_thread docstring: lineage via
@@ -111,6 +120,7 @@ def _make_tool(sub: SubAgentConfig, resolved: ResolvedAddress) -> Tool:
             context_id=context_id,
             reference_task_ids=reference_task_ids,
             actor_chain=ctx.deps.actor_chain,
+            identity=ctx.deps.identity,
         ):
             # The provider rides along, and it is not decoration: this is
             # the *only* live signal that a delegation is happening — the

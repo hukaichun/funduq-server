@@ -30,19 +30,29 @@ from httpx_sse import aconnect_sse
 
 
 def resolution_proof(
-    identity: ProviderIdentity, run_id: str, ask_ids: list[str]
+    identity: ProviderIdentity, task_id: str, ask_ids: list[str]
 ) -> dict[str, str]:
-    """The proof that answers a paused run's asks: `{publicKey, signature}`.
+    """The proof that answers a paused conversation's asks:
+    `{publicKey, signature}`.
 
     Contract revision 16: a resolve proof signs the *ask*, not the clock.
-    The signed bytes are `funduq-resolve:{run_id}:{sha256 hex of the ask
+    The signed bytes are `funduq-resolve:{task_id}:{sha256 hex of the ask
     ids, sorted and NUL-joined}` — canonicalization lives in
     `funduq_contract.resolve_payload` and nowhere else, so both sides
     derive the same bytes from the same set. Order does not matter here:
     sorting is the builder's job, not the caller's.
 
+    **`task_id` is the lineage root, not the paused run.** Revision 19
+    made answering a pause open the *next* run rather than reopen the
+    paused one, and core verifies the proof over `repo.root_of(the run
+    that asked)` — the id a caller holds for the whole conversation, which
+    A2A calls the task id. On a first-turn pause the root and the paused
+    run are the same id, so signing the wrong one still verifies; on the
+    second pause it does not. Use `SoukClient.last_task_id`, never
+    `last_run_id`.
+
     Consequently there is **no timestamp and no freshness window** on this
-    one proof, unlike cancel and view: a later pause has new ask ids, so
+    one proof, unlike the timestamped cancel payload: a later pause has new ask ids, so
     the signature never verifies against any ask but the one it was signed
     for, and replay against that same ask is consumed by the reopen's own
     status guard.
@@ -52,7 +62,7 @@ def resolution_proof(
     """
     return {
         "publicKey": identity.public_key,
-        "signature": identity.sign_resolution(run_id, ask_ids),
+        "signature": identity.sign_resolution(task_id, ask_ids),
     }
 
 
@@ -104,6 +114,15 @@ class SoukClient:
         self.timeout = timeout
         self.last_thread_id: str | None = None
         self.last_run_id: str | None = None
+        # The id of the run that *started* the current lineage — what A2A
+        # calls the task id, and what a resolution proof is signed over
+        # (see `resolution_proof`). A run that answers the previous run's
+        # open asks continues its lineage and keeps this id; anything else
+        # starts a new one, so this is set from the first RUN_STARTED after
+        # a stream that left nothing open. On a first-turn pause it equals
+        # `last_run_id`, which is exactly why a single-pause round trip
+        # cannot tell the two apart.
+        self.last_task_id: str | None = None
         # What the last run this client streamed is still waiting on, if it
         # paused — its interrupt / tool-call ids, in core's one ask id
         # space. Surfaced because since contract revision 16 a caller
@@ -175,9 +194,9 @@ class SoukClient:
         *,
         thread_id: str | None = None,
         role: str = "user",
+        forwarded_props: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         resume: list[dict[str, Any]] | None = None,
-        addressed_run_id: str | None = None,
         resolution: dict[str, str] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """POSTs a RunAgentInput to `/agui/{provider}/{name}` and yields each
@@ -188,12 +207,26 @@ class SoukClient:
         `agent` is an `Agent` from `resolve` or `roster`. It is not a name:
         see this module's docstring for why the SDK asks for an address.
 
-        `metadata` is stored on the run/thread as-is (minus
-        `kyok.context`, which souk strips before anything persists) and,
-        notably, is where a Keep Your Own Key caller opts the run into an
-        LLM offering: `{"kyok": {"llmProvider": {"providerKey": ...,
-        "name": ...}, "context": ...}}` — `KyokBridge.run_metadata()`
-        builds it; see docs/keep-your-own-key.md in the souk repo.
+        `forwarded_props` is **the caller's bag**: its declarations to
+        funduq, and anything of its own it wants relayed to the agent. It
+        rides as `RunAgentInput.forwardedProps`, which since contract
+        revision 20 is the one place funduq reads a caller's declarations
+        on the AG-UI door — the request level, matching the request's
+        `metadata` on A2A. funduq reads nothing from a message's own
+        metadata, and the run row has no metadata column at all any more.
+        (`metadata=` is accepted as the old name for this same bag; it
+        used to land in `body["metadata"]`, where nothing reads it, so a
+        KYOK opt-in sent that way minted no grant and the agent quietly
+        answered with no model.)
+
+        Notably this bag is where a Keep Your Own Key caller opts the run
+        into an LLM offering: `{"kyok": {"llmProvider": {"providerKey":
+        ..., "name": ...}, "context": ...}}` — `KyokBridge.run_metadata()`
+        builds it; see docs/keep-your-own-key.md in the souk repo. funduq
+        moves what it reads under one reserved `funduq` key before the
+        agent sees it (`forwardedProps.funduq`), and strips a `funduq` key
+        of the caller's own; every other key here reaches the agent
+        untouched.
 
         `resume` is AG-UI's own interrupt/resume mechanism
         (`ag_ui.core.ResumeEntry`: `{"interruptId": ..., "status":
@@ -205,18 +238,21 @@ class SoukClient:
         anything new in the conversation, so an empty `message` sends no
         message at all rather than an empty one.
 
-        `addressed_run_id` declares this message an *interjection* into a
-        run already going on that thread (pass its id — a previous call's
-        `last_run_id`): it rides as `forwardedProps.addressedRunId`, and
-        souk delivers the message into that run instead of starting a new
-        turn. Interjection is caller-declared, never inferred.
+        There is no `addressed_run_id` here, and its absence is the honest
+        answer rather than a gap: core reads an interjection declaration on
+        the **A2A door only** (`SendMessageRequest.metadata`'s
+        `.../addressedRunId`, which `souk_agent_sdk.a2a_client` sends). The
+        AG-UI door never sets one, and the `forwardedProps` key this
+        argument used to write to now belongs to funduq. To interject, call
+        through A2A.
 
         `resolution`, if given, is the proof that this caller may answer a
-        paused run bound to an actor chain — `{publicKey, signature}` from
-        `resolution_proof(identity, run_id, ask_ids)`, riding
-        `metadata.resolution` where souk reads it. Build it over
-        `last_outstanding_asks` from the stream that paused; a run on an
-        unbound thread needs none.
+        paused run on a thread bound to an actor chain — `{publicKey,
+        signature}` from `resolution_proof(identity, task_id, ask_ids)`,
+        merged into the same `forwardedProps` bag under `resolution`, where
+        souk reads it. Sign it over `last_task_id` (the lineage root, not
+        the paused run) and `last_outstanding_asks` from the stream that
+        paused; a run on an unbound thread needs none.
         """
         if thread_id is None:
             thread_id = await self.create_thread(agent)
@@ -237,15 +273,24 @@ class SoukClient:
         }
         if message:
             body["messages"] = [{"id": str(uuid4()), "role": role, "content": message}]
+        # One bag, merged, never overwritten: the caller's own keys, the
+        # deprecated `metadata=` spelling of the same bag, and the
+        # resolution proof beside them. Assigning `{"resolution": ...}`
+        # here — as the old `addressedRunId` branch assigned its own dict —
+        # would silently drop a KYOK opt-in passed in the same call.
+        bag: dict[str, Any] = {**(metadata or {}), **(forwarded_props or {})}
         if resolution is not None:
-            metadata = {**(metadata or {}), "resolution": resolution}
-        if metadata is not None:
-            body["metadata"] = metadata
+            bag["resolution"] = resolution
+        if bag:
+            body["forwardedProps"] = bag
         if resume is not None:
             body["resume"] = resume
-        if addressed_run_id is not None:
-            body["forwardedProps"] = {"addressedRunId": addressed_run_id}
         url = f"{self.souk_http_url}/agui/{agent.path}"
+
+        # A run continues the previous lineage only when the previous one
+        # left asks open on this same thread; otherwise it starts a new
+        # task. See `last_task_id`.
+        continues_lineage = bool(self.last_outstanding_asks) and thread_id == self.last_thread_id
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             async with aconnect_sse(client, "POST", url, json=body) as event_source:
@@ -258,12 +303,16 @@ class SoukClient:
                 self.last_thread_id = thread_id
                 # The ask id space core pauses on, tracked as the stream
                 # goes by: tool calls announced and not answered, plus the
-                # interrupts the RUN_FINISHED outcome names. Mirrors
-                # funduq.pause's `unanswered_tool_calls` /
-                # `outstanding_asks` — the ids a resolve proof must sign.
+                # interrupts the RUN_FINISHED outcome names. This mirrors
+                # `funduq.pause.open_asks`, which is now the single
+                # definition of that space — everything a *finished* run
+                # left waiting on, whether or not it finished on an
+                # interrupt outcome. A run that ends with a tool call
+                # nobody answered is waiting too, which is why the
+                # outstanding set is computed on every RUN_FINISHED and not
+                # only on an interrupt one.
                 announced: list[str] = []
                 answered: set[str] = set()
-                interrupts: list[str] = []
                 self.last_outstanding_asks = []
                 async for sse in event_source.aiter_sse():
                     event = json.loads(sse.data)
@@ -271,26 +320,27 @@ class SoukClient:
                     if kind == "RUN_STARTED":
                         self.last_thread_id = event.get("threadId", thread_id)
                         self.last_run_id = event.get("runId")
+                        if not continues_lineage:
+                            self.last_task_id = self.last_run_id
                     elif kind == "TOOL_CALL_START":
                         announced.append(event["toolCallId"])
                     elif kind == "TOOL_CALL_RESULT":
                         answered.add(event["toolCallId"])
                     elif kind == "RUN_FINISHED":
                         outcome = event.get("outcome")
-                        if isinstance(outcome, dict) and outcome.get("type") == "interrupt":
-                            interrupts = [
-                                ask
-                                for ask in (
-                                    interrupt.get("toolCallId") or interrupt.get("id")
-                                    for interrupt in outcome.get("interrupts") or []
-                                )
-                                if ask
-                            ]
-                            outstanding = [
-                                ask for ask in announced if ask not in answered
-                            ]
-                            outstanding += [
-                                ask for ask in interrupts if ask not in outstanding
-                            ]
-                            self.last_outstanding_asks = outstanding
+                        interrupts = (
+                            outcome.get("interrupts") or []
+                            if isinstance(outcome, dict)
+                            and outcome.get("type") == "interrupt"
+                            else []
+                        )
+                        outstanding = [ask for ask in announced if ask not in answered]
+                        # An interrupt is identified by its tool call id
+                        # where it has one, else its own id — core's rule,
+                        # restated because this side has no funduq to import.
+                        for interrupt in interrupts:
+                            ask = interrupt.get("toolCallId") or interrupt.get("id")
+                            if ask and ask not in outstanding:
+                                outstanding.append(ask)
+                        self.last_outstanding_asks = outstanding
                     yield event

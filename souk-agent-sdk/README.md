@@ -131,8 +131,8 @@ if __name__ == "__main__":
 | 💬 **Interjections** | An `AgentHandle` with an `interject_stream` hook takes messages addressed to a run already in flight; the capability is derived from the hook and declared per agent as `takesInterjections` in the `register` frame, so the agent card cannot claim what the router would not honour. An agent without one refuses the interjection, and the caller learns it cannot be interrupted. |
 | ⛔ **Task Preemption & Cancellation** | On Souk's `cancel` frame, cancels that run's task — propagating `asyncio.CancelledError` into in-flight LLM/tool calls, not merely between yields. Souk *asks*; complying is this client's choice. |
 | 🎛️ **Concurrency Throttling** | `max_concurrent_runs=N` prevents GPU/LLM rate-limit saturation by letting Souk queue surplus work server-side. The ack stays three-valued: accepted, declined-because-full, or permanently refused with a reason. |
-| ⏸️ **Human-in-the-Loop (HITL)** | Intercepts AG-UI native `interrupt` outcomes to pause runs resumbably (`status='input-required'`). |
-| 🔗 **A2A Delegation & Actor Chains** | `a2a_client.call_agent_streaming` simplifies sub-agent calls while signing multi-hop EdDSA JWT actor-chain provenance (`funduq-contract`'s chain format). |
+| ⏸️ **Human-in-the-Loop (HITL)** | Intercepts AG-UI native `interrupt` outcomes to pause runs resumably (the A2A task state is `input-required`; the run itself is `completed`, and what it left open is read from its events). |
+| 🔗 **A2A Delegation & Actor Chains** | `a2a_client.call_agent_streaming` simplifies sub-agent calls while signing multi-hop EdDSA JWT actor-chain provenance (`funduq-contract`'s chain format) and the `Funduq-Presenter` header that authenticates whoever presents it. |
 | 🔑 **Keep-Your-Own-Key (KYOK)** *(experimental)* | `KyokSigningAuth` simplifies signature generation for caller-funded LLM completions over `/kyok/v1`, signing `funduq-contract`'s `kyok_call_payload` per call. See `tests/test_kyok_auth.py` for its coverage. |
 
 ---
@@ -203,14 +203,22 @@ async for update in call_agent_streaming(
     "Bonjour",
     reference_task_ids=[current_run_id],  # Lineage tracking
     actor_chain=actor_chain,              # Multi-hop identity chain
+    identity=provider.identity,           # Who is *presenting* that chain
 ):
     print("Sub-agent update:", update)
 
-# Reading a task later needs a *view proof* when its thread is bound to a
-# chain (contract revision 13): pass this provider's identity and the
-# read is signed for it. Without one, a bound run answers "not found" —
-# existence is part of what is guarded, so the read does not error, it
-# simply finds nothing.
+# Since contract revision 21 a chain must be presented by a caller the
+# door can authenticate: `identity` signs a `Funduq-Presenter` header
+# over the exact bytes of the request, and it must be the same key that
+# ends `actor_chain` (`souk_agent_sdk.identity.provider_identity` turns
+# the raw key that signed the hop into that object). Passing a chain with
+# no identity raises `PresenterIdentityRequired` here rather than
+# collecting a 401 from souk.
+
+# Reading a task uses the same header: a run whose thread is bound to a
+# chain is answered as the key the transport authenticated, and an
+# unauthenticated reader is told "not found" — existence is part of what
+# is guarded, so the read does not error, it simply finds nothing.
 task = await get_task(
     "http://localhost:8000/a2a/<provider>/<agent>/rpc",
     task_id,

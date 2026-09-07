@@ -22,8 +22,8 @@ simply absent from ours. What is left here is the two things a transport
 must decide for itself: which errors leave A2A's vocabulary, and what
 rides the wire that A2A has no field for.
 
-Two errors are deliberately funduq's, because A2A has no word for either
-and one that means something else would be worse:
+Three errors are deliberately funduq's, because A2A has no word for any
+of them and one that means something else would be worse:
 
 - `AgentNotFound` → **404 on the route**, not a JSON-RPC error inside a
   200: the agent is the endpoint, resolved from the path before the
@@ -33,17 +33,25 @@ and one that means something else would be worse:
   tell. Raised as a Starlette `HTTPException` from inside the handler
   because that is the one exception type the dispatcher re-raises
   instead of converting to a JSON-RPC internal error.
+- `PresenterRequired` → **401**, upstream's own instruction ("map it to
+  authentication required, not bad request"). Authentication is the
+  transport's business by construction — the header is not in A2A's
+  vocabulary, so neither is its absence — and left unescaped it would
+  reach the caller as a JSON-RPC *internal error* inside a 200: a server
+  fault reported for a missing credential, saying nothing about what to
+  send instead.
 
-**The view proof rides a header.** Since contract revision 13, reading a
-run whose thread is bound to a chain requires a signed view proof, and a
-read without one is answered as absence — existence is part of what is
-guarded. A2A's read requests carry no caller data at all, so the proof
-has nowhere in the protocol to travel: it comes in as `X-Funduq-View`,
-compact JSON `{"publicKey", "timestamp", "signature"}`, and reaches core
-through `A2ARequestHandler(view_metadata_of=...)` as `{"view": {…}}`.
-Absent or malformed passes nothing, and a bound run then reads as
-absent — the designed answer, never a 500, because a 500 would tell an
-unauthorized reader that there was something there to fail on.
+**One header answers both halves.** Revision 21 collapsed reading and
+writing onto a single question — who is presenting this request — and
+`presenter_key_of` is where the transport answers it: for a write it is
+the key the chain's last hop must match, for a read it is who is looking.
+The proof rides in `Funduq-Presenter` (souk_server/presenter.py), signed
+over the request body it accompanies. Absent or malformed is `None`,
+never an error: a bound run then reads as absent — the designed answer,
+because a 500 would tell an unauthorized reader that there was something
+there to fail on — and a *chain* presented with no proof is refused by
+core, by name (`PresenterRequired` -> 401). The old `X-Funduq-View`
+header is gone with the `view_metadata_of` hook that fed it.
 
 `CancelTaskRequest.metadata` is passed through whole by the handler: a
 run on a thread that bound an authority at birth can only be stopped by
@@ -55,16 +63,20 @@ delegation` any more: the session delegation certificate was removed at
 revision 15, and a grant is the authenticating seat's policy now.
 
 **A paused run says what it is waiting on.** A resolve proof signs the
-ask it answers (revision 16: `funduq-resolve:{run_id}:{sha256 of the
+asks it answers (revision 16: `funduq-resolve:{run_id}:{sha256 of the
 sorted, NUL-joined ask ids}`), so a caller that cannot see the ask ids
 cannot build one at all. Core knows them and A2A has no field for them,
-which makes surfacing them this seat's job: `funduq/outstandingAsks` on
-the Task's metadata, wherever this door hands back a paused run.
+which makes surfacing them this seat's job: `metadata.funduq.
+outstandingAsks` on the Task, wherever this door hands back a task
+waiting on an answer. Under `funduq`, beside core's own keys, because
+revision 18 moved every key core writes there and a flat `funduq/…` key
+now looks like a caller's rather than the serving layer's.
 
-`presenter_key_of=None` on the handler: core's caller doors are not
-independently safe (operational-limits §1) — a chain proves origin, not
-possession — and the gateway seat is where presenter authentication goes
-when this deployment grows one. That parameter is the plug point.
+**A task is a lineage, not a run.** Revision 19 made an answer a *new*
+run with `parentRunId`, and the task id names the lineage's **root**. So
+the asks a caller must answer are the *tail's*, and reading them off
+`get_run(task.id)` would compute a second-or-later pause off the wrong
+run — the first run in the lineage, whose asks were answered turns ago.
 
 One way to address an agent: `/a2a/{provider}/{name}/...`. An agent *is*
 `(provider_key, name)`, so addressing it takes both and takes nothing
@@ -74,10 +86,8 @@ fingerprint, which core tells apart by length.
 
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import AsyncGenerator
-from typing import Any
+from collections.abc import AsyncGenerator, Callable
 
 from a2a.server.context import ServerCallContext
 from a2a.server.events.event_queue import Event
@@ -89,27 +99,27 @@ from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
 
 from funduq.core import Funduq
-from funduq.errors import AgentNotFound, ThreadQueueFull
+from funduq.errors import AgentNotFound, PresenterRequired, ThreadQueueFull
 from funduq.identity import provider_fingerprint
 from funduq.models import AgentRef
-from funduq.pause import outstanding_asks
+from funduq.pause import open_asks
 from funduq.protocols.a2a import A2AAdapter, A2ARequestHandler, ServedInterface
+from funduq.protocols.a2a_translate import funduq_metadata_of
+from funduq.props import OBSERVED_METADATA_KEY
 from souk_server.config import ServingSettings
 from souk_server.deps import get_serving_settings, get_souk, resolve_ref
+from souk_server.presenter import PRESENTER_HEADER, presenter_key_of
 
 logger = logging.getLogger("souk.api_a2a")
 
 router = APIRouter()
 
-# The header a view proof rides in. Named for what it proves rather than
-# for this gateway, because the thing it carries is upstream's shape and a
-# second transport speaking to the same core should spell it the same way.
-VIEW_PROOF_HEADER = "x-funduq-view"
-
-# Where a paused run's outstanding ask ids appear on a Task. Same
-# namespace convention as core's own `funduq/cancelRequested`: a key that
-# is visibly not A2A's, so nobody reads it as part of the protocol.
-OUTSTANDING_ASKS_METADATA_KEY = "funduq/outstandingAsks"
+# Where a waiting task's outstanding ask ids appear on a Task: under the
+# one key everything funduq writes into A2A metadata lives beneath
+# (`funduq.props.OBSERVED_METADATA_KEY`, beside core's own `interrupts`
+# and `cancelRequested`), so the whole of what is visibly not A2A's sits
+# in one place and nobody reads any of it as part of the protocol.
+OUTSTANDING_ASKS_METADATA_KEY = "outstandingAsks"
 
 
 def _interfaces(agent: AgentRef, serving: ServingSettings) -> list[ServedInterface]:
@@ -130,7 +140,7 @@ def _interfaces(agent: AgentRef, serving: ServingSettings) -> list[ServedInterfa
 
 
 def _escape(exc: Exception) -> Exception:
-    """The two errors that leave A2A's vocabulary, sent up as HTTP.
+    """The three errors that leave A2A's vocabulary, sent up as HTTP.
 
     `HTTPException` is the one type the dispatcher re-raises rather than
     converting to a JSON-RPC `InternalError` inside a 200, so it is the
@@ -140,6 +150,8 @@ def _escape(exc: Exception) -> Exception:
     """
     if isinstance(exc, AgentNotFound):
         return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, PresenterRequired):
+        return HTTPException(status_code=401, detail=str(exc))
     if isinstance(exc, ThreadQueueFull):
         return HTTPException(
             status_code=429,
@@ -149,59 +161,74 @@ def _escape(exc: Exception) -> Exception:
     return exc
 
 
-def view_metadata_of(context: ServerCallContext) -> dict[str, Any] | None:
-    """The `X-Funduq-View` header as the `{"view": …}` metadata core reads.
+def _presenter_key_of(body: bytes) -> Callable[[ServerCallContext], str | None]:
+    """The `presenter_key_of` hook for one request, closed over its body.
 
-    **Nothing here judges the proof.** Whether the signature verifies,
-    whether the signer is on the run's chain and whether the timestamp is
-    inside the 60-second window are core's questions, asked against a run
-    this function has never seen. All this does is get the caller's bytes
-    across a protocol that has no field for them.
+    A2A carries no field for a caller's identity — its read requests carry
+    no caller data at all — so the proof travels in a header
+    (`Funduq-Presenter`) and the transport is the party that checks it.
+    a2a-sdk's default context builder copies the request's headers into
+    `context.state["headers"]`, already lowercased, which is the whole of
+    what this needs from the protocol.
 
-    Absent, unparseable, or not a JSON object → **pass nothing**, which
-    makes a bound run read as absent. That is the designed answer rather
-    than a swallowed error: a 400 here would tell a caller holding a
-    malformed proof that there was a run behind the id worth fixing it
-    for, and this door's whole rule is that an unauthorized read cannot
-    tell absence from refusal.
+    The hook is per-request rather than per-app because the proof is bound
+    to the body: a signature over these exact bytes cannot be lifted onto
+    another call, which is the property that makes a captured header
+    worthless.
+
+    Nothing here judges *whether* the key may do what the request asks.
+    An unproven read answers absence; a chain whose last hop is not this
+    key is `InvalidChain`; a chain with no proof at all is
+    `PresenterRequired`. All three are core's to say, and saying any of
+    them twice would eventually say them differently.
     """
-    raw = (context.state.get("headers") or {}).get(VIEW_PROOF_HEADER)
-    if not raw:
-        return None
-    try:
-        proof = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.debug("ignoring an unparseable %s header", VIEW_PROOF_HEADER)
-        return None
-    if not isinstance(proof, dict):
-        return None
-    return {"view": proof}
+
+    def read(context: ServerCallContext) -> str | None:
+        headers = context.state.get("headers") or {}
+        return presenter_key_of(headers.get(PRESENTER_HEADER), body)
+
+    return read
 
 
 async def _annotate_asks(funduq: Funduq, task: pb.Task | None) -> pb.Task | None:
-    """Put a paused run's outstanding ask ids on the Task it comes back as.
+    """Put a waiting task's outstanding ask ids on the Task it comes back as.
 
     The one thing a caller cannot do without: a resolve proof signs the
     exact set of asks it answers, canonicalized inside
     `funduq_contract.resolve_payload`, so a caller that cannot enumerate
     them has no proof to build and no way to answer the pause. Core has
-    the ids on the run's metadata and A2A has no field for them; this seat
-    is where the two meet.
+    them in the run's events and A2A has no field for them; this seat is
+    where the two meet.
 
-    Read off the run rather than the Task's state, so it answers the
-    question actually asked — "is anything outstanding" — rather than a
-    status name that may spell a pause differently tomorrow. Sorted,
-    because the payload's canonical order is sorted and a caller reading
-    them in that order is one fewer thing to get wrong.
+    **The tail's asks, not the root's.** A task id names the run that
+    started the lineage; every answer since has opened a new run under it.
+    `funduq.lineage(task.id)` is that lineage, root first, so its last
+    entry is the run actually waiting — reading `get_run(task.id)` instead
+    would answer a second pause with the first one's ids, which no proof
+    would ever match. (The proof is still signed over `task.id`: the root
+    is the id a caller holds across every turn.)
+
+    Read off the run's events rather than the Task's state, so it answers
+    the question actually asked — "is anything outstanding" — rather than
+    a status name that may spell a pause differently tomorrow; revision 19
+    already deleted the one it used to spell it with. Sorted, because the
+    payload's canonical order is sorted and a caller reading them in that
+    order is one fewer thing to get wrong.
+
+    Merged into whatever core already wrote under `funduq`, never
+    assigned over it: a protobuf `Struct` field is replaced wholesale, so
+    a plain update here would silently drop `interrupts` and
+    `cancelRequested` — the two keys a caller most needs beside these.
     """
     if task is None:
         return None
-    run = await funduq.get_run(task.id)
-    if run is None:
+    lineage = await funduq.lineage(task.id)
+    if not lineage:
         return task
-    asks = outstanding_asks(run.metadata or {})
+    asks = open_asks(await funduq.get_run_events(lineage[-1].run_id))
     if asks:
-        task.metadata.update({OUTSTANDING_ASKS_METADATA_KEY: sorted(asks)})
+        ours = {**funduq_metadata_of(task), OUTSTANDING_ASKS_METADATA_KEY: sorted(asks)}
+        task.metadata.update({OBSERVED_METADATA_KEY: ours})
     return task
 
 
@@ -217,16 +244,16 @@ class SoukA2ARequestHandler(A2ARequestHandler):
     without.
     """
 
-    def __init__(self, funduq: Funduq, agent: AgentRef) -> None:
+    def __init__(self, funduq: Funduq, agent: AgentRef, body: bytes) -> None:
         super().__init__(
             funduq,
             agent,
-            # No edge authentication in this deployment yet — see the
-            # module docstring and operational-limits §1. This is the
-            # plug point, left explicit rather than defaulted so that
-            # growing one is an edit here and not a discovery.
-            presenter_key_of=None,
-            view_metadata_of=view_metadata_of,
+            # The one hook core asks the transport to fill: who presented
+            # this request. `body` is the raw request bytes the proof is
+            # signed over, captured on the route before the dispatcher
+            # parses anything — a proof bound to a different body is a
+            # proof for a different call.
+            presenter_key_of=_presenter_key_of(body),
         )
         self._funduq = funduq
 
@@ -235,7 +262,7 @@ class SoukA2ARequestHandler(A2ARequestHandler):
     ) -> pb.Task | pb.Message:
         try:
             sent = await super().on_message_send(params, context)
-        except (AgentNotFound, ThreadQueueFull) as exc:
+        except (AgentNotFound, PresenterRequired, ThreadQueueFull) as exc:
             raise _escape(exc) from exc
         if isinstance(sent, pb.Task):
             return await _annotate_asks(self._funduq, sent)
@@ -247,7 +274,7 @@ class SoukA2ARequestHandler(A2ARequestHandler):
         try:
             async for event in super().on_message_send_stream(params, context):
                 yield event
-        except (AgentNotFound, ThreadQueueFull) as exc:
+        except (AgentNotFound, PresenterRequired, ThreadQueueFull) as exc:
             raise _escape(exc) from exc
 
     async def on_get_task(
@@ -298,8 +325,11 @@ async def rpc_by_pair(
     # means the address does not exist, so it is a 404 here — never a
     # JSON-RPC error inside a 200.
     agent = await resolve_ref(funduq, provider, name)
+    # Read once, here: Starlette caches it, so the dispatcher parses the
+    # very bytes the presenter proof covers rather than a re-read of the
+    # stream, and the two can never disagree.
     dispatcher = JsonRpcDispatcher(
-        request_handler=SoukA2ARequestHandler(funduq, agent),
+        request_handler=SoukA2ARequestHandler(funduq, agent, await request.body()),
         enable_v0_3_compat=True,
     )
     return await dispatcher.handle_requests(request)

@@ -56,7 +56,7 @@ import funduq_contract
 from funduq.errors import FunduqError, InvalidRegistration
 from funduq.models import AgentRef
 from pydantic import ValidationError
-from funduq_provider_sdk import DeliveredRun, FunduqLink, Refusal
+from funduq_provider_sdk import DeliveredRun, Refusal
 from souk_server.handshake import WIRE_VERSION
 from souk_server.ws_common import (
     POLICY_VIOLATION,
@@ -75,15 +75,18 @@ router = APIRouter()
 
 # What a provider may ask funduq, and it is deliberately short: this is
 # not a mirror of funduq's API, because every method admitted here is one
-# more frame type every transport has to carry. Upstream withdrew the
-# `LINK_QUERY_METHODS` constant at revision 11 — the models are the single
-# definition now and there is no list left to read — so the one query is
-# named here and checked against the link ABC that declares it, which is
-# the surface that would actually grow a second one.
+# more frame type every transport has to carry.
+#
+# It used to be checked against `FunduqLink.__abstractmethods__`, on the
+# reasoning that the link ABC was the surface a second query would grow
+# on. Revision 21 ended that: reading is no longer a link verb at all —
+# `thread_messages` left the ABC, and every party now reads through
+# funduq's one read surface, `Funduq.as_reader(key)`, the provider as the
+# key it proved at the handshake. The frame stays, because this repo owns
+# both ends of every wire it defines and core only stopped *requiring*
+# the verb; what is gone is the tripwire, which now says the opposite of
+# what it was written to say.
 QUERY_METHODS = frozenset({"thread_messages"})
-assert QUERY_METHODS <= FunduqLink.__abstractmethods__, (
-    "a query this wire carries is no longer a FunduqLink verb"
-)
 
 # Agent names go in URLs on every road this gateway serves, so the shape is
 # this layer's to police. Core validates none of it (upstream's
@@ -264,13 +267,21 @@ async def _answer_query(
     to keep the response frame bounded; trimming after receiving would
     bound nothing and put a months-old thread on the wire to do it.
 
-    **A provider may only read threads for agents it serves.** Thread ids
-    are not guessable, but "not guessable" is not an authorization rule:
-    a provider that served one run knows that thread id permanently, and
+    **Two checks, and both earn their place.** The read itself goes
+    through `funduq.as_reader(public_key)` — core's one read surface since
+    revision 21, entered as the key this socket proved at the handshake,
+    so a thread bound to a responsibility segment answers only its
+    parties. In front of it stands this gateway's older rule: *a provider
+    may only read threads for agents it serves*. Core's circle is the
+    weaker of the two — `readers_of` returns "anyone holding the id" for
+    an **unbound** thread, so `as_reader` alone would let any connected
+    provider read any unbound thread whose id it once saw. Thread ids are
+    not guessable, but "not guessable" is not an authorization rule: a
+    provider that served one run knows that thread id permanently, and
     would otherwise keep reading the conversation after being de-listed,
-    or after the agent moved to somebody else's stall. The thread names
-    its agent, and an agent is `(provider_key, name)`, so the check is a
-    comparison funduq can already make.
+    or after the agent moved to somebody else's stall. The two compose
+    cleanly because both answer "not yours" and "no such thread"
+    identically.
     """
     query_id = parsed.get("queryId")
     method = parsed.get("method")
@@ -303,7 +314,7 @@ async def _answer_query(
         answer(error="no such thread for this provider")
         return
 
-    messages = await funduq.get_thread_messages(thread_id)
+    messages = await funduq.as_reader(public_key).thread_messages(thread_id)
     answer(result=messages[-limit:] if limit is not None else messages)
 
 

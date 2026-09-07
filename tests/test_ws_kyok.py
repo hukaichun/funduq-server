@@ -114,10 +114,10 @@ async def _live(serve, souk, llm: LlmRef, context=None):
     served = await serve(HoldingAgent(), "greeter")
     thread_id = await souk.create_thread(served.ref())
     async with souk.session() as session:
-        created = await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+        created = await repo.create_run(session, thread_id, served.ref(), {})
         await session.commit()
     run_id = created["run_id"]
-    souk.enqueue_run(run_id, served.ref(), thread_id, _run_input(run_id, thread_id), "ag-ui")
+    souk.enqueue_run(run_id, served.ref(), thread_id, _run_input(run_id, thread_id))
     souk.kyok_relay.bind_run(run_id, KyokBinding(llm_provider=llm, context=context))
     return served, issue_kyok_token(run_id, served.ref(), TEST_SIGNING_SECRET), run_id
 

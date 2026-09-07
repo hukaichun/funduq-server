@@ -191,7 +191,7 @@ wheels = [
 
 [[package]]
 name = "funduq-contract"
-version = "0.0.9"
+version = "0.0.11"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
@@ -200,14 +200,14 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e3/93/e348f3bdb10bc0fac65394a632f44ca54624208d8c0f66e8128926789908/funduq_contract-0.0.9.tar.gz", hash = "sha256:701eb5c25aebb206fcf529d39c3851f8cbabfc93cb0660077b5ad816481a2345", size = 47070, upload-time = "2026-09-02T22:06:52.202Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/68/65/79c10df15348d498da7046e0d347b2c089abbe5ffc6cabb67f85fac74538/funduq_contract-0.0.11.tar.gz", hash = "sha256:a48429bd8af9cfabbc2a4029b6ffc350a27d2bad37daafcc8619c6a043f87444", size = 47072, upload-time = "2026-09-07T19:04:04.477Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/30/6c/86e90e2abee6ba4dc2e3d0a751eb38e41ca534ec31e05b44c5d933eb48c5/funduq_contract-0.0.9-py3-none-any.whl", hash = "sha256:55226dc4f7003e7fb5d5c01c43cf093cd0c696d88999a83d8b3c54bd6e3299d2", size = 13710, upload-time = "2026-09-02T22:06:50.921Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/64/c6d02839dcbae8466bcd758389504ab5f75ea80267e71b47bca14388da02/funduq_contract-0.0.11-py3-none-any.whl", hash = "sha256:c6a2347a63361e269c7f23c3ffd9b7c080adb612618e812acd4a6661402c76ec", size = 13721, upload-time = "2026-09-07T19:04:03.057Z" },
 ]
 
 [[package]]
 name = "funduq-provider-sdk"
-version = "0.0.8"
+version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
@@ -216,9 +216,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/99/5cc5eee718e0a60285da3e89929302bd3c7070dff6cf7b07b4835accb4ea/funduq_provider_sdk-0.0.8.tar.gz", hash = "sha256:ecc894a8a880b764c4d8b33467425a1da822aba0905d6c2d030f6795dfa714c6", size = 57905, upload-time = "2026-09-03T07:28:22.73Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2b/1c/b1eaea220b18c683bddf4ec36effbd63056712e833a5b1faf4f10cc3676e/funduq_provider_sdk-0.0.9.tar.gz", hash = "sha256:a41d89093c514ab282442e8cf5f5447370251451e425eb70763f11cd92be4dec", size = 57781, upload-time = "2026-09-07T19:04:34.052Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/da/9d57ca0e44890beee6d94a04175c087b388cc427a68bb3e23170507a8823/funduq_provider_sdk-0.0.8-py3-none-any.whl", hash = "sha256:867d82a825e1d86e9b9b1060f8d13c2824d34f431358b6c4d84db255ca58e4e1", size = 21483, upload-time = "2026-09-03T07:28:21.442Z" },
+    { url = "https://files.pythonhosted.org/packages/82/27/f90f83b9cab0be93a058a4a29d18b800b7d9524e26afb405a7b095032cd3/funduq_provider_sdk-0.0.9-py3-none-any.whl", hash = "sha256:60b58146dd2509599b22532b8fca6254935d0177a778a5fe299310e6125f42dd", size = 21319, upload-time = "2026-09-07T19:04:32.643Z" },
 ]
 
 [[package]]
@@ -611,7 +611,7 @@ dev = [
 requires-dist = [
     { name = "ag-ui-protocol", specifier = ">=0.1.22" },
     { name = "cryptography", specifier = ">=42.0" },
-    { name = "funduq-provider-sdk", specifier = ">=0.0.8,<0.1" },
+    { name = "funduq-provider-sdk", specifier = ">=0.0.9,<0.1" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx-sse", specifier = ">=0.4" },
     { name = "pyjwt", specifier = ">=2.9" },

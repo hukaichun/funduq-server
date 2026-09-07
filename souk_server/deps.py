@@ -26,13 +26,15 @@ from funduq.errors import (
     KyokRejected,
     LlmOfferingInUse,
     LlmProviderNotFound,
+    PresenterRequired,
     ProviderFingerprintTaken,
     RunNotFound,
+    StreamTaken,
     ThreadNotFound,
     ThreadOwnershipMismatch,
     ThreadQueueFull,
 )
-from funduq.identity import InvalidCancel, InvalidResolution, InvalidView
+from funduq.identity import InvalidCancel, InvalidResolution
 from funduq.models import AgentRef
 from funduq.repo import ThreadMembershipRequired
 from funduq_contract import InvalidChain
@@ -72,16 +74,34 @@ _STATUS = {
     # A tampered actor chain (`funduq_contract.InvalidChain`, which
     # replaced core's InvalidActorChain) is refused at the door.
     InvalidChain: 401,
+    # A chain presented at a door that could not say who presented it
+    # (contract revision 21). Upstream's own instruction is to map it to
+    # authentication required, not bad request — nothing about the request
+    # is malformed; what is missing is a `Funduq-Presenter` proof
+    # (souk_server/presenter.py). Kept as its own row rather than folded
+    # into `InvalidChain` so the message reaching the caller and the log
+    # says which of the two it is: an unverifiable chain and an
+    # unauthenticated presenter are different mistakes with different
+    # fixes.
+    PresenterRequired: 401,
+    # Two consumers of one run's stream would each get half its events, so
+    # core admits one and refuses the second by name. A conflict with what
+    # is already happening, not a bad request — and the caller's remedy is
+    # to read the run's stored events or wait, not to change the request.
+    # (The A2A door translates this itself, inside its JSON-RPC envelope;
+    # this entry covers the AG-UI door and the facade.)
+    StreamTaken: 409,
     # The singular acts on a chain-bound run, refused for want of a proof
     # from one of its authorities. They are plain ValueErrors upstream, so
     # without these rows an unproven cancel or an unproven resolve reaches
     # a caller as a 500 — a server fault for a caller mistake, and one
-    # that says nothing about what to send instead. `InvalidView` is here
-    # for completeness only: the read doors answer an unproven view as
-    # absence and never raise it outward (see api_a2a).
+    # that says nothing about what to send instead. There is no `view`
+    # member any more: `verify_view`/`InvalidView` left core at revision
+    # 21, and a read now answers as the key the transport proved (see
+    # souk_server/presenter.py) — an unauthorized read is absence, which
+    # raises nothing.
     InvalidCancel: 401,
     InvalidResolution: 401,
-    InvalidView: 401,
     # Writing to a thread bound to a responsibility segment when you are
     # neither its head nor its serving provider. A bare `Exception`
     # upstream — not even a ValueError — so it is the likeliest of these

@@ -45,7 +45,7 @@ async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, ser
     served = await serve(HoldingAgent(), "greeter")
     thread_id = await souk.create_thread(served.ref())
     async with souk.session() as session:
-        created = await repo.create_run(session, thread_id, served.ref(), "ag-ui", {})
+        created = await repo.create_run(session, thread_id, served.ref(), {})
         await session.commit()
     run_id = created["run_id"]
     souk.enqueue_run(
@@ -61,7 +61,6 @@ async def test_the_signer_a_provider_ships_is_accepted_by_this_gateway(souk, ser
             "context": [],
             "forwardedProps": None,
         },
-        "ag-ui",
     )
     token = issue_kyok_token(run_id, served.ref(), TEST_SIGNING_SECRET)
     try:

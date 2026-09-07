@@ -27,7 +27,8 @@ the wire-v4 ticket handshake:
    `deleted`.
 
 The caller then opts a run in by naming the offering — `run_metadata()`
-builds exactly that.
+builds exactly that, for the caller's `forwardedProps` bag (request level
+since contract revision 20, not the message's metadata).
 
 The transport after the handshake is what it always was: one WebSocket,
 completion requests pushed down it (`completionRequest` =
@@ -94,7 +95,7 @@ class KyokBridge:
     ```python
     async with bridge.serving():
         async for event in client.run(agent, msg,
-                                      metadata=bridge.run_metadata(ctx)):
+                                      forwarded_props=bridge.run_metadata(ctx)):
             ...
     ```
 
@@ -192,11 +193,24 @@ class KyokBridge:
         return data["ticket"], funduq_key
 
     def run_metadata(self, context: Any = None) -> dict[str, Any]:
-        """The `metadata` a caller passes to opt a run into this bridge:
-        names the offering, and carries `context` — opaque to souk,
-        stripped before anything persists, delivered back to this bridge
-        on every completion the run makes (a delegated run carries only
-        what *its* caller submitted; bindings do not propagate)."""
+        """The caller's bag that opts a run into this bridge: names the
+        offering, and carries `context` — opaque to souk, delivered back
+        to this bridge on every completion the run makes (a delegated run
+        carries only what *its* caller submitted; bindings do not
+        propagate).
+
+        Pass it as `SoukClient.run(..., forwarded_props=...)`: since
+        contract revision 20 a caller's declarations are read at request
+        level, `forwardedProps` on the AG-UI door and the request's
+        `metadata` on A2A. It used to ride `body["metadata"]`, which
+        nothing reads — an opt-in sent there mints no grant, and the agent
+        answers with no model rather than failing.
+
+        `context` is no longer stripped before persistence: revision 21
+        deleted `strip_kyok_context`, and the opt-in stays in the bag as
+        the caller's own word so a restart can rebuild the binding from
+        it. Put nothing in `context` that must not be stored.
+        """
         kyok: dict[str, Any] = {
             "llmProvider": {
                 "providerKey": self.identity.public_key,
@@ -269,7 +283,7 @@ class KyokBridge:
         ```python
         async with bridge.serving():
             async for event in client.run(agent, msg,
-                                          metadata=bridge.run_metadata(ctx)):
+                                          forwarded_props=bridge.run_metadata(ctx)):
                 ...
         ```
 

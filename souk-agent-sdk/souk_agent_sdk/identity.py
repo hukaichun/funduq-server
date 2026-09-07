@@ -22,6 +22,7 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from funduq_contract import extend_chain, new_chain, sign_hop  # noqa: F401 (sign_hop re-exported)
+from funduq_provider_sdk import ProviderIdentity
 
 
 def load_or_create_identity(path: str | Path) -> Ed25519PrivateKey:
@@ -70,3 +71,18 @@ def extend_actor_chain(private_key: Ed25519PrivateKey, prev_chain: list[str]) ->
             "extend_actor_chain requires a non-empty prev_chain — use new_actor_chain to originate one"
         )
     return extend_chain(private_key, prev_chain)
+
+
+def provider_identity(private_key: Ed25519PrivateKey) -> ProviderIdentity:
+    """The same key as the object form the rest of this SDK signs with.
+
+    The two halves of a delegated call now need one key in two shapes: the
+    raw `Ed25519PrivateKey` that `new_actor_chain`/`extend_actor_chain`
+    sign hops with, and a `ProviderIdentity` for `a2a_client`'s
+    `Funduq-Presenter` header — which since contract revision 21 is what
+    lets souk accept the chain at all. Bridging them by hand is where a
+    caller reaches for a *different* key, and a presenter key that is not
+    the chain's last hop is refused as `InvalidChain` rather than accepted
+    as somebody else.
+    """
+    return ProviderIdentity(private_key)

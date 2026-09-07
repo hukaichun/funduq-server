@@ -448,7 +448,13 @@ async def test_an_interjection_to_an_agent_without_a_hook_is_a_permanent_refusal
             # r1 is live on the thread once its first event is out.
             assert (await gateway.next_frame())["type"] == "event"
             interjection = _input("r2")
-            interjection["forwardedProps"] = {"addressedRunId": "r1"}
+            # Revision 18: funduq's own keys live under one `funduq` key
+            # of the delivered bag, never at its top level, so a caller's
+            # own `addressedRunId` can never pass for funduq's. Written
+            # flat, the runtime does not see it at all: the run is
+            # accepted as an ordinary turn and this test passes for the
+            # wrong reason.
+            interjection["forwardedProps"] = {"funduq": {"addressedRunId": "r1"}}
             await gateway.push(
                 {
                     "type": "run",

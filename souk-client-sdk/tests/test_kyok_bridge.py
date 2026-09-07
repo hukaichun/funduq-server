@@ -19,6 +19,7 @@ import contextlib
 import json
 from typing import Any
 
+import httpx
 import litellm
 import pytest
 import websockets
@@ -30,6 +31,7 @@ from funduq_provider_sdk import (
 )
 from funduq_provider_sdk.llm import CompletionRefused, ProviderIdentity
 
+from souk_client_sdk import Agent, SoukClient
 from souk_client_sdk.kyok_bridge import HANDSHAKE_VERSION, KyokBridge, _to_chunk_dict
 
 RECEIVE_TIMEOUT = 2.0
@@ -77,6 +79,41 @@ def test_run_metadata_names_the_offering_and_carries_the_context():
     # No context → no context key, not a null one: souk treats the field
     # as opaque and absent is the honest shape for "nothing shared".
     assert "context" not in bridge.run_metadata()["kyok"]
+
+
+async def test_a_run_metadata_bag_is_the_forwarded_props_a_caller_sends(monkeypatch):
+    """It is the caller's bag, and the caller's bag is `forwardedProps` on
+    the AG-UI door since contract revision 20 — `kyok` at its top level,
+    where `funduq.kyok.parse_kyok_opt_in` reads it. Passed the old way it
+    landed in `body["metadata"]`, which nothing reads: no grant minted, no
+    error raised, and the agent answering with no model."""
+    bridge = KyokBridge("http://souk.local", model="test-model", api_key="key", offering="my-llm")
+    seen: dict = {}
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=b""
+            )
+
+    real = httpx.AsyncClient
+
+    def _client(*args, **kwargs):
+        kwargs["transport"] = _Transport()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client)
+
+    client = SoukClient("http://souk.local")
+    agent = Agent(provider="ab" * 8, name="echo", provider_key="ab" * 32)
+    async for _ in client.run(
+        agent, "hi", thread_id="t1", forwarded_props=bridge.run_metadata()
+    ):
+        pass  # pragma: no cover - the stub streams nothing
+
+    assert seen["body"]["forwardedProps"]["kyok"]["llmProvider"]["name"] == "my-llm"
+    assert "metadata" not in seen["body"]
 
 
 # --- the ticket endpoint ----------------------------------------------------

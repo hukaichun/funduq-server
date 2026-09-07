@@ -30,51 +30,64 @@ import json
 from typing import Any
 
 from ag_ui.core import RunAgentInput
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from funduq import repo
 from funduq.core import Funduq
 from funduq.errors import AgentNotFound
 from funduq.models import AgentRef
-from funduq.pause import outstanding_asks
+from funduq.pause import open_asks
 from funduq.protocols.agui import AGUIAdapter, EventStream, ThreadSnapshot
 from souk_server.deps import get_souk, resolve_ref
 from souk_server.models import CreateThreadRequest, CreateThreadResponse
+from souk_server.presenter import PRESENTER_HEADER, presenter_key_of
 
 router = APIRouter()
 
 
-async def _with_outstanding_asks(funduq: Funduq, snapshot: dict) -> dict:
-    """Add a paused active run's outstanding ask ids to a thread snapshot.
+async def _with_outstanding_asks(funduq: Funduq, thread_id: str, snapshot: dict) -> dict:
+    """Say what this thread is waiting on, if anything.
 
     This read path exists for exactly the caller a pause strands: the SSE
-    stream closed when the run paused, and the caller comes back here to
-    find out what happened. Since contract revision 16 the answer it needs
-    is not just "paused" but *what it is waiting on* — a resolve proof
-    signs the ask ids themselves
-    (`funduq-resolve:{run_id}:{sha256 of the sorted, NUL-joined ids}`), so
-    a caller that cannot enumerate them cannot build a proof at all and
-    the pause is unanswerable.
+    stream closed when the run finished asking, and the caller comes back
+    here to find out what happened. Since contract revision 16 the answer
+    it needs is not just "paused" but *what it is waiting on* — a resolve
+    proof signs the ask ids themselves
+    (`funduq-resolve:{root_run_id}:{sha256 of the sorted, NUL-joined
+    ids}`), so a caller that cannot enumerate them cannot build a proof at
+    all and the pause is unanswerable.
 
-    Core's snapshot summarises the active run as `{run_id, status}`; the
-    ids live on the run's metadata, so this fetches the run rather than
-    inventing a field for core to carry. Absent when there is nothing
-    outstanding, so the key's presence means something.
+    **Not `active_run` any more.** Revision 19 deleted `input-required`:
+    a run that finished asking is `completed`, so it is not the thread's
+    *active* run and there is nothing in flight to hang the ids on. The
+    question is now about the thread's latest run and its events —
+    `pause.open_asks`, which is empty for a run that has not finished and
+    for one that finished with nothing open — so the answer gets its own
+    key, `waiting_run`, and is absent when there is nothing to answer. A
+    caller must not be able to read an empty list as "a pause with no
+    asks", which would be a pause nobody could ever resolve.
+
+    `run_id` beside the ids because the two are used together and the
+    caller has to name the run it is answering; sorted ids, matching the
+    canonical order `resolve_payload` hashes in — one fewer thing for a
+    signer to get wrong. Note the id a *proof* is signed over is the
+    lineage root (an A2A task id), which for a first pause is this run
+    itself; `funduq.lineage` names it for later ones.
     """
-    active = snapshot.get("active_run")
-    if not active:
-        return snapshot
-    run = await funduq.get_run(active["run_id"])
-    if run is None:
-        return snapshot
-    asks = outstanding_asks(run.metadata or {})
+    async with funduq.session() as session:
+        latest = await repo.latest_run_for_thread(session, thread_id)
+        if latest is None or latest.cancel_requested_by is not None:
+            return snapshot
+        asks = open_asks(await repo.get_run_events(session, latest.run_id))
     if asks:
-        # Sorted, matching the canonical order `resolve_payload` hashes in
-        # — one fewer thing for a signer to get wrong.
-        active["outstanding_asks"] = sorted(asks)
+        snapshot["waiting_run"] = {
+            "run_id": latest.run_id,
+            "outstanding_asks": sorted(asks),
+        }
     return snapshot
 
 
@@ -113,13 +126,13 @@ async def get_thread_snapshot(thread_id: str, funduq: Funduq = Depends(get_souk)
     its original AG-UI SSE connection closed because the run it was watching
     paused, and it needs to know what has happened since.
 
-    A paused active run also says what it is waiting on, under
-    `active_run.outstanding_asks` — see `_with_outstanding_asks`.
+    A thread waiting on an answer also says what it is waiting on, under
+    `waiting_run` — see `_with_outstanding_asks`.
     """
     snapshot = await funduq.get_thread_snapshot(thread_id)
     if snapshot is None:
         raise AgentNotFound(f"thread '{thread_id}' not found")
-    return await _with_outstanding_asks(funduq, snapshot)
+    return await _with_outstanding_asks(funduq, thread_id, snapshot)
 
 
 @router.get("/threads/{thread_id}/tree")
@@ -136,12 +149,18 @@ async def get_thread_tree(thread_id: str, funduq: Funduq = Depends(get_souk)) ->
     return tree
 
 
-async def _run_agent(funduq: Funduq, agent: AgentRef, body: RunAgentInput):
-    # presenter_key=None: this deployment has no authenticating seat in
-    # front of the doors yet (see docs/server-mode.md on operational-
-    # limits §1 — the gateway seat is where presenter auth goes when it
-    # exists, and this call site is the plug point).
-    result = await AGUIAdapter(funduq).run(agent, body, presenter_key=None)
+async def _run_agent(
+    funduq: Funduq, agent: AgentRef, body: RunAgentInput, request: Request
+):
+    # Who presented this request, proved over the bytes actually received:
+    # the raw body, which FastAPI has already read and cached, so asking
+    # for it again is free and gives exactly what the signature covers.
+    # `None` for a caller that sent no proof — unchanged behaviour, and a
+    # caller with no chain stays anonymous. A caller that *did* send a
+    # chain is refused by core (`PresenterRequired` -> 401), not here:
+    # one refusal in one place beats two that can disagree.
+    presenter = presenter_key_of(request.headers.get(PRESENTER_HEADER), await request.body())
+    result = await AGUIAdapter(funduq).run(agent, body, presenter_key=presenter)
 
     if isinstance(result, ThreadSnapshot):
         # The resolved thread_id is already the top-level `thread_id` field
@@ -164,6 +183,12 @@ async def _run_agent(funduq: Funduq, agent: AgentRef, body: RunAgentInput):
 
 @router.post("/agui/{provider}/{name}", response_model=None)
 async def run_agent_by_id(
-    provider: str, name: str, body: RunAgentInput, funduq: Funduq = Depends(get_souk)
+    provider: str,
+    name: str,
+    body: RunAgentInput,
+    request: Request,
+    funduq: Funduq = Depends(get_souk),
 ) -> EventSourceResponse | JSONResponse:
-    return await _run_agent(funduq, await resolve_ref(funduq, provider, name), body)
+    return await _run_agent(
+        funduq, await resolve_ref(funduq, provider, name), body, request
+    )

@@ -290,7 +290,12 @@ class EchoAgent:
         self.seen_chain: list | None = None
 
     async def run_stream(self, agent_name: str, run_input):
-        self.seen_chain = (run_input.forwarded_props or {}).get("actorChain")
+        # Under `funduq` since contract revision 18: everything funduq
+        # itself puts in a caller's bag lives beneath that one key, so a
+        # caller's own props and funduq's declarations cannot collide.
+        self.seen_chain = ((run_input.forwarded_props or {}).get("funduq") or {}).get(
+            "actorChain"
+        )
         ids = {"threadId": run_input.thread_id, "runId": run_input.run_id}
         yield {"type": "RUN_STARTED", **ids}
         yield {"type": "TEXT_MESSAGE_START", "messageId": "m1", "role": "assistant"}
