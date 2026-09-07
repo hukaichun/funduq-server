@@ -106,7 +106,7 @@ catches all of it; "verified end to end" is a claim about one path.
 
 ## Upstream's contract (currently revision 21)
 
-The pin is `funduq` 0.0.8, `funduq-provider-sdk[llm]` 0.0.9,
+The pin is `funduq` 0.0.9, `funduq-provider-sdk[llm]` 0.0.9,
 `funduq-contract` 0.0.11. Read
 [upstream's `docs/contract-changelog.md`](https://github.com/hukaichun/funduq/blob/main/docs/contract-changelog.md)
 before moving it: it says what an implementation must change, which

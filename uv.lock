@@ -438,7 +438,7 @@ wheels = [
 
 [[package]]
 name = "funduq"
-version = "0.0.8"
+version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -451,9 +451,9 @@ dependencies = [
     { name = "pyjwt" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/73/62/abbc78ad196024d011d044b65e4f2c70a46905c56e6fd66f4e7bda9ac6c6/funduq-0.0.8.tar.gz", hash = "sha256:2f467a04afd65d645ebf96b28b03447eee235937367e80372483705813566738", size = 253406, upload-time = "2026-09-07T19:04:37.964Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d6/7b/1ec62ed47e926127e505f6f785a0fb9f0e3c943f1dc9904042c89f42ceef/funduq-0.0.9.tar.gz", hash = "sha256:3f38693d2a78c0cd75ef72f80ae30e06206555bb015d276390073576703629a6", size = 254420, upload-time = "2026-09-07T20:38:39.588Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/9f/9321e594883e5fd2cd5cdcecdef696de5fcd7bdc051daa45c00ce4d6f33a/funduq-0.0.8-py3-none-any.whl", hash = "sha256:f9fe755864cfedfc556b486e7478ce21c98029f94a7f396aad52ced8d1fe6f52", size = 79225, upload-time = "2026-09-07T19:04:36.729Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/20/be1200f19cb1e19e6491c72616dea9ace457d2a049f3bc1337ce601d599a/funduq-0.0.9-py3-none-any.whl", hash = "sha256:3efbb628b451a6108f55e55fa42b8aff27680a11cd77c3ff74fe2c6053e5c561", size = 79527, upload-time = "2026-09-07T20:38:38.238Z" },
 ]
 
 [package.optional-dependencies]
@@ -1595,7 +1595,7 @@ requires-dist = [
     { name = "a2a-sdk", specifier = ">=1.1,<2" },
     { name = "ag-ui-protocol", specifier = ">=0.1.22" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "funduq", specifier = ">=0.0.8,<0.1" },
+    { name = "funduq", specifier = ">=0.0.9,<0.1" },
     { name = "funduq", extras = ["postgres"], marker = "extra == 'postgres'" },
     { name = "funduq-contract", specifier = ">=0.0.11,<0.1" },
     { name = "funduq-provider-sdk", extras = ["llm"], specifier = ">=0.0.9,<0.1" },

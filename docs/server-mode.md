@@ -5,7 +5,7 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Upstream is the published `funduq` packages now (`funduq` 0.0.8,
+Upstream is the published `funduq` packages now (`funduq` 0.0.9,
 `funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.11 — the repo is
 [hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
 payloads and delivery envelopes on this wire are theirs, pinned at a
@@ -1346,16 +1346,21 @@ would be worse than the limit.
   gateway reaching inside a2a-sdk's compat adapter, which is the one
   place in this system whose whole value is being the package's business
   and not ours.
-- **`historyLength: 0` still returns the whole history.** Revision 19's
-  changelog says the field's presence is read and 0 means no history; the
-  released `a2a_translate.history_of` still ends `history[-limit:] if
-  limit else history`, so 0 falls through the falsy branch and returns
-  everything. **Deliberately not worked around here**
-  ([funduq#268](https://github.com/hukaichun/funduq/issues/268)): a
-  gateway-side special case would make this door disagree with the same
-  adapter used in-process, and two answers to one question is a worse bug
-  than one wrong answer in one place. Reported upstream; it is a fix in
-  `history_of`, not a fix in a transport.
+- **`historyLength: 0` — fixed upstream, and worth keeping the story.**
+  Revision 19 said the field's presence was read and 0 meant no history;
+  the released `history_of` still ended `history[-limit:] if limit else
+  history`, so 0 fell through the falsy branch and returned everything.
+  It was reported rather than patched here
+  ([funduq#268](https://github.com/hukaichun/funduq/issues/268)) because a
+  gateway-side special case would have made this door disagree with the
+  same adapter used in-process, and two answers to one question is worse
+  than one wrong answer in one place. Fixed in `funduq` 0.0.9, which this
+  repo now pins. The correction this repo *offered* was itself wrong and
+  is the more useful half of the lesson: `if limit is not None` fixes
+  nothing, because `-0 == 0` and `history[-0:]` is `history[0:]`. The two
+  cases have to be split before the slice. A one-line fix proposed
+  without running it, in a repo whose first rule is that reading produces
+  confident wrong answers.
 - **Two thread reads still bypass revision 21's reader rule** —
   `GET /threads/{id}`, `GET /threads/{id}/tree` and the MCP docent go
   through the unchecked facade rather than `as_reader(...)`. See "MCP:
