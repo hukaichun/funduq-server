@@ -5,22 +5,37 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Upstream is the published `funduq` packages now (`funduq` 0.0.7,
-`funduq-provider-sdk[llm]` 0.0.8, `funduq-contract` 0.0.10 — the repo is
+Upstream is the published `funduq` packages now (`funduq` 0.0.8,
+`funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.11 — the repo is
 [hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
 payloads and delivery envelopes on this wire are theirs, pinned at a
-named **contract revision** (currently 17, vendored in
+named **contract revision** (currently 21, vendored in
 [`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json)).
 The *framing* — which frames exist, what each carries, the handshake's
 shape on a socket — remains this repo's to decide, and this gateway has
 no deployments outside this repo, so a wire change is still a hard
 cutover selected by the `version` field rather than a staged migration.
 
-**Revisions 8–17 changed nothing about the frame vocabulary.** The wire
+**Revisions 8–21 changed nothing about the frame vocabulary.** The wire
 is still v4 — same frames, same `handshake_version`, and every signed
-payload byte-identical since revision 16. What moved is underneath: the
-types the frames validate into, and — at revision 17 — which door a
-verdict enters core by.
+payload upstream defines byte-identical since revision 16. What moved is
+underneath and beside: the types the frames validate into, which door a
+verdict enters core by (17), where a caller's declarations sit in the bag
+it sends (18 and 20), what a run *is* (19), and how a read is authorized
+(21).
+
+Revision 21 is the one that changed this gateway's own surface rather
+than its plumbing, and it did so by asking a question this document had
+been answering with "nobody": **who is presenting this request.** Core
+now refuses an actor chain handed to a door that cannot name its
+presenter, so this gateway grew the one thing operational-limits §1 has
+called the serving layer's job for three rounds — an authenticating
+seat, `Funduq-Presenter`, described under "The A2A door" and published in
+[`docs/wire-vectors.json`](wire-vectors.json). It is also the revision
+that let a header go: `X-Funduq-View` is **deleted**, because the hook it
+fed is gone and one mechanism now answers reads and writes alike. This
+repo is down to one invented header, and it is the seat upstream asked
+for rather than a bridge over a gap.
 
 ## The decision
 
@@ -448,8 +463,8 @@ pending map, a timeout, and a rule for a socket that dies mid-question.
 more.** An AG-UI client resends its whole history every turn by
 convention; A2A's `message/send` carries one message. The same agent,
 unchanged, cannot tell a tenth turn from a first — and souk has held the
-thread the whole time. `funduq_provider_sdk.FunduqLink.thread_messages`
-is the question, and this is how it crosses a wire.
+thread the whole time. `thread_messages` is the question, and this is how
+it crosses a wire.
 
 ```json
 ↑ {"type": "query", "queryId": "9f3c…", "method": "thread_messages",
@@ -461,15 +476,27 @@ is the question, and this is how it crosses a wire.
   parameter exists to keep the response frame bounded; trimming after
   receiving would bound nothing and put a months-old thread on the wire to
   do it.
-- **A provider may only read threads for agents it serves.** Not in the
-  upstream design and added here. Thread ids are not guessable, but
-  unguessable is not an authorization rule: a provider that served one run
-  knows that thread id permanently, and would otherwise keep reading the
-  conversation after being de-listed, or after the agent moved to another
-  stall. A thread names its agent and an agent is `(provider_key, name)`,
-  so souk can already make the comparison. "Not yours" and "no such
-  thread" get the *same* answer — telling them apart would confirm a
-  thread's existence to somebody who may not read it.
+- **Two checks stand in front of this read, and both earn their place.**
+  Revision 21 made reading the record one surface with one rule:
+  `Funduq.as_reader(key)`, where an unbound thread is readable by whoever
+  holds its id and a bound one only by its parties. The read here goes
+  through `funduq.as_reader(public_key)` — the key this socket proved at
+  the handshake — so a thread bound to a responsibility segment answers
+  only its parties, and this gateway stopped having its own opinion about
+  that case.
+
+  In front of it stands this gateway's older rule: **a provider may only
+  read threads for agents it serves.** It stays, because core's circle is
+  the *weaker* of the two — `readers_of` returns "anyone holding the id"
+  for an unbound thread, so `as_reader` alone would let any connected
+  provider read any unbound thread whose id it once saw. Thread ids are
+  not guessable, but unguessable is not an authorization rule: a provider
+  that served one run knows that thread id permanently, and would
+  otherwise keep reading the conversation after being de-listed, or after
+  the agent moved to another stall. The two compose cleanly because both
+  answer "not yours" and "no such thread" *identically* — telling them
+  apart would confirm a thread's existence to somebody who may not read
+  it, which is the whole of what either check is for.
 - **A malformed query is answered, not dropped.** The far side is waiting
   on that `queryId`; silence costs it the full timeout for a mistake souk
   could see at once.
@@ -482,12 +509,25 @@ is the question, and this is how it crosses a wire.
   souk's API: every method admitted is one more frame type every
   transport must carry. The gateway used to read upstream's
   `contract.LINK_QUERY_METHODS`, which was withdrawn at revision 11 with
-  the rest of the field-list constants — the models are the single
-  definition now and there is no list left to read. So the one method is
-  named in `ws_provider.QUERY_METHODS` and asserted to be a subset of
-  `FunduqLink.__abstractmethods__` at import: the link ABC is the surface
-  that would actually grow a second query, and a verb that stops existing
-  upstream fails at import here rather than at a provider.
+  the rest of the field-list constants; it then asserted its one method
+  was a subset of `FunduqLink.__abstractmethods__`, on the reasoning that
+  the link ABC was the surface a second query would grow on. **Revision
+  21 ended that too**, and the tripwire is deleted rather than repaired:
+  `thread_messages` left the link ABC entirely, because reading the
+  record is *every party's* job and does not belong on the provider's
+  private channel. So the method list is simply named in
+  `ws_provider.QUERY_METHODS` now, with nothing upstream to check it
+  against — an assertion that says the opposite of what it was written to
+  say is worse than no assertion.
+
+  **The `query`/`queryResult` frames stay.** Core stopped *requiring* the
+  verb on the link; it did not stop a provider needing the answer, and
+  the way it says a transport should provide it is exactly this — "over
+  the wire the serving layer exposes the read surface as an endpoint
+  authenticated with the link's key". This repo owns both ends of every
+  wire it defines, so the frame is ours to keep and the shape does not
+  change; what changed is what stands behind it (see the two checks
+  above).
 
 Adding frames like these does **not** bump `version`. They are additive:
 a provider that never asks is unaffected, and an older gateway answers an
@@ -499,7 +539,10 @@ which is the part that genuinely cannot interoperate across shapes.
 `FunduqLink` is one provider joined to one funduq — both directions, one
 object — and the socket client in souk-agent-sdk is one, because over a
 wire that is literally true: run frames arrive on the same socket event
-frames leave by.
+frames leave by. Its `thread_messages` is **no longer one of the link's
+verbs** (revision 21 took it off the ABC); the SDK keeps the method as
+its own addition, over the `query` frame, because an agent still needs
+the answer and this wire is where it crosses.
 
 The gateway's `SocketProvider` is **not** one, and upstream's own docstring
 says so. It sits on souk's side, holds an outbound queue and no runtime,
@@ -734,6 +777,82 @@ one — the run id, the proven calling agent, the caller's context and the
 actor chain arrive on every `completionRequest` frame
 ([hukaichun/funduq#26](https://github.com/hukaichun/funduq/issues/26)).
 
+## A run is a run, and a task is a lineage
+
+Revision 19 collapsed two models of a run that funduq had been stacking
+on each other — AG-UI's, where every `RunAgentInput` is a run, and A2A's
+task, which pauses in `input-required` and continues under the same id.
+There is one model now, AG-UI's, and four consequences land on this
+gateway's doors.
+
+- **`input-required` is not a run status.** A run that finishes asking —
+  an interrupt outcome, a tool call nobody answered — is `completed`, as
+  AG-UI says. Nothing is reopened.
+- **The answer is a *new* run**, with `parentRunId` naming the one that
+  asked. An A2A task is the lineage those links form: **task id = the
+  root run's id, task state = the tail run's**, and every event of a
+  later run reaches the A2A client labelled with the task's id.
+- **Whether a thread is waiting is read from its latest run's *events***
+  (`funduq.pause.open_asks`), never from a status name and never from run
+  metadata. Both doors here do exactly that —
+  `api_agui._with_outstanding_asks` off `repo.latest_run_for_thread`,
+  `api_a2a._annotate_asks` off `funduq.lineage(task.id)[-1]` — and the
+  reason is not tidiness: the status this used to be read from was
+  deleted, and a status name may spell a pause differently again.
+- **The record lost four columns.** `RunRecord` has no `metadata`, no
+  `head_key`, no `protocol`, no `input_json`; `runs` is `RunAgentInput`
+  one column per field plus funduq's own state. The head of a run's chain
+  is computed — `doors.head_key_of(run)` — rather than stored, which is
+  the honest version: it was always derivable from the chain.
+
+**Reading the tail is the part that a first-turn test passes by
+accident.** A resolution proof is signed over the **task/root id** plus
+the open ask ids, and on a first pause the root run *is* the waiting run,
+so root-vs-tail cannot be told apart. Read `get_run(task.id)` instead of
+the lineage's last entry and a second pause is answered with the first
+one's ask ids, which no proof will ever match. The suite therefore has a
+two-pause test (`test_a_resolution_answering_a_second_pause_signs_the_task_id`)
+whose entire job is to make the two ids differ.
+
+## One key for what funduq adds, and it is request-level
+
+Revisions 18 and 20 between them fixed a namespace and a level, and both
+are things a caller has to get right or its declaration is silently not
+one.
+
+**The key** (18). Everything funduq writes into somebody else's bag now
+lives under one `funduq` key, unconditionally its own, never relayed from
+a caller:
+
+| surface | what sits under `funduq` |
+|---|---|
+| AG-UI `forwardedProps` | `kyok`, `actorChain`, `addressedRunId` |
+| A2A task / status-update `metadata` | `agui_event`, `agui_events`, `interrupts`, `cancelRequested` (was the flat `funduq/cancelRequested`) |
+
+The gateway's own A2A key moved with them: outstanding ask ids are at
+**`metadata.funduq.outstandingAsks`**, not the flat `funduq/…` it used.
+That spelling was copied from core's old flat key, and leaving it behind
+after core moved would make a gateway key look like a caller's — the
+exact confusion revision 18 set out to end, since a caller who typed
+`forwardedProps.addressedRunId` itself used to be indistinguishable from
+funduq having verified one.
+
+**Merge into `metadata.funduq`; never assign over it.** A protobuf
+`Struct` field is replaced wholesale, so `task.metadata.update({"funduq":
+{...ours}})` silently drops `interrupts` and `cancelRequested` — the two
+keys a caller most needs *beside* the ask ids. `_annotate_asks` reads
+what core wrote (`funduq_metadata_of(task)`) and merges; the failure it
+avoids is invisible in every test that does not assert on core's keys.
+
+**The level** (20). The caller's bag — its declarations to funduq
+(`actorChain`, `kyok`, `resolution`, the interjection target) — is
+**request-level on both doors**: `forwardedProps` on `RunAgentInput`, the
+*request's* `metadata` on A2A's `SendMessageRequest`. funduq reads
+nothing from a message's own metadata; `Message.metadata` is carried to
+the agent on that message and stored with it, and that is all it is for.
+An A2A caller that puts its chain on the message declares nothing and is
+told nothing — the request simply proceeds as an anonymous one.
+
 ## The A2A door
 
 Core no longer speaks JSON-RPC at all. `funduq.protocols.a2a.A2AAdapter`
@@ -763,13 +882,17 @@ ask ids A2A has no field for. Everything else is inherited.
   shapes. That header is exactly why this cannot live in core: only the
   transport ever sees one, and the version decision belongs to the party
   holding the evidence.
-- **Two errors deliberately leave A2A's vocabulary**, because A2A has no
-  word for either and one that means something else would be worse:
-  `AgentNotFound` is a **404 on the route** — the agent is the endpoint,
-  resolved from the path before the dispatcher runs, never a JSON-RPC
-  error inside a 200 — and `ThreadQueueFull` is a **429 with
-  `Retry-After`**: backpressure, the request was *not* accepted, and
-  accept-then-expire is the lie this refuses to tell.
+- **Three errors deliberately leave A2A's vocabulary**, because A2A has
+  no word for any of them and one that means something else would be
+  worse: `AgentNotFound` is a **404 on the route** — the agent is the
+  endpoint, resolved from the path before the dispatcher runs, never a
+  JSON-RPC error inside a 200 — `ThreadQueueFull` is a **429 with
+  `Retry-After`** (backpressure, the request was *not* accepted, and
+  accept-then-expire is the lie this refuses to tell), and
+  `PresenterRequired` is a **401**, in upstream's own words "map it to
+  authentication required, not bad request". All three ride out as
+  Starlette `HTTPException`s, the one type the dispatcher re-raises
+  instead of converting to a JSON-RPC internal error inside a 200.
 - **Cancel metadata passes through whole.** A run on a thread that bound
   an authority at birth can only be stopped by one of that thread's
   authorities, and the proof rides in `CancelTaskRequest.metadata`
@@ -779,28 +902,124 @@ ask ids A2A has no field for. Everything else is inherited.
   `metadata.delegation`**: the session delegation certificate was removed
   at revision 15 and nothing here signs, sends or relays one — see "The
   proofs" below.
-- **`presenter_key=None` today, and the deployment invariant is
-  upstream's operational-limits §1**: core's caller doors are not
-  independently safe. Verifying a chain proves the head's key signed hop
-  zero, never that whoever *presented* it holds that key — and the chain
-  is not a secret, since every serving provider receives it verbatim. A
-  deployment therefore puts an authenticating seat in front of the
-  doors, and this gateway is that seat: the adapter call sites in
-  `api_a2a.py` are the plug point where an edge-authenticated caller's
-  key becomes `presenter_key`, at which point funduq refuses a chain
-  whose last hop someone else signed. Unbuilt here (open market, no edge
-  auth), and this paragraph is the record that the exposure is chosen,
-  not missed.
+- **The seat is built** — see "The authenticating seat" below. This
+  paragraph used to say `presenter_key=None` and record the exposure as
+  chosen rather than missed; revision 21 turned the choice into a
+  refusal, so the seat is a plug point no longer.
+- **A task is a lineage here, not a run.** The ask ids this door
+  surfaces come off the lineage's *tail* (`funduq.lineage(task.id)[-1]`),
+  while the proof answering them is signed over the task id — the root.
+  See "A run is a run, and a task is a lineage" above.
 - **Events are dumped `exclude_none=True`, and unknown event types are
   relayed untouched.** A default dump injects `timestamp: null` into the
   caller's stream; and funduq is a relay, so a provider on a newer AG-UI
   must not be cut off by an event type nobody here has heard of.
 
 Interjection rides the standard extension point — the A2A extension's
-metadata key, and `forwardedProps.addressedRunId` on AG-UI — and funduq
-handles it; the gateway just relays. The agent card announces which
-agents understand one in `capabilities.extensions`, from what the
-serving link declared at registration.
+metadata key, on the **request's** metadata since revision 20, reaching
+the agent as `forwardedProps.funduq.addressedRunId` — and funduq handles
+it; the gateway just relays. The agent card announces which agents
+understand one in `capabilities.extensions`, from what the serving link
+declared at registration. **Only this door sets it**: the AG-UI door
+never does, which is why souk-client-sdk's `addressed_run_id` argument
+was removed rather than kept as a promise no door delivers.
+
+### The authenticating seat
+
+Core's caller doors are not independently safe, and never claimed to be
+(upstream's operational-limits §1). Verifying an actor chain proves the
+head's key signed hop zero; it proves nothing about *possession*, because
+the chain is not a secret — every serving provider receives it verbatim.
+For three revisions the answer was "a deployment puts an authenticating
+seat in front of the doors", and this gateway wrote down that it had not.
+Revision 21 stopped accepting that: a chain handed to a door that cannot
+name its presenter is refused, by name, with `PresenterRequired`.
+
+**The scope is deliberately small, and this is the sentence to read
+first: a caller without a chain is unaffected and still anonymous.** No
+header, `presenter_key=None`, no change, exactly as before. So this is
+not "the gateway grew auth"; it is "a party that already holds an
+Ed25519 key may prove it at the door". Today that party is always a
+provider delegating to another agent — it has a key because it needed one
+to attach, and souk-agent-sdk's `a2a_client` is the only thing in the
+tree that sends an `actorChain` at all.
+
+The proof rides in a header, because A2A's read requests carry no caller
+data whatsoever and there is nowhere in the protocol for it to travel:
+
+```
+Funduq-Presenter: {"publicKey":"…","timestamp":…,"signature":"…"}
+```
+
+compact JSON, the same three fields as every other proof in this system,
+signed over
+
+```
+funduq-server-presenter:{public_key}:{timestamp}:{sha256hex(body)}
+```
+
+No `X-` prefix: RFC 6648 deprecated that in 2012, and the two
+`X-Souk-Kyok-*` headers here predate this repo owning the question
+(renaming those is its own round). Three properties, each earning its
+place:
+
+- **the body hash** binds the proof to *this* request. Be precise about
+  what that buys, because upstream pushed back on an earlier and looser
+  claim here (funduq#269): a captured *chain* is already worthless to
+  whoever cannot sign the next hop — `verify_chain` refuses a hop
+  following a dispatch hop unless the party that dispatch named signed
+  it — so replay of the chain is not what this closes. What it closes is
+  narrower and real: the chain is not a secret, so an attacker holding a
+  captured request holds the header too, and without the binding could
+  swap that header onto a *different body* inside the freshness window —
+  "B asked for a translation" replayed as B asking for something else.
+  This gateway wants request binding for that reason, which is its own,
+  not because chains require it. Modelled on `kyok_call_payload`, the one
+  payload upstream already uses to authenticate an HTTP call with a body
+  — and it is why `view_payload` could not be reused: that binds one
+  `run_id`, and a request that *opens* a run has no run id yet;
+- **the timestamp** bounds capture-and-replay of the same request to the
+  60-second window the cancel family already uses
+  (`funduq.identity.is_timestamp_fresh`, so there is one window here, not
+  a second one);
+- **the public key inside the payload** means the proof names the key it
+  claims, so it cannot be presented as an answer to a different question.
+
+**The domain tag is ours on purpose.** `funduq-server-presenter:`, not
+`funduq-presenter:`. The `funduq-*` payload namespace is upstream's, and
+this payload has no upstream definition — `funduq_contract` publishes six
+payload builders and none authenticates a write. Squatting the namespace
+would mint a name that looks canonical and is not, which is the exact
+failure mode the contract vectors exist to prevent. So it is implemented
+under this repo's own tag, published in `docs/wire-vectors.json` beside
+the frames, and **proposed upstream**
+([funduq#269](https://github.com/hukaichun/funduq/issues/269)) — because
+every transport that authenticates callers needs this payload, and if
+each invents its own, a provider SDK cannot delegate across two funduq
+deployments. When upstream ships a `presenter_payload`, this family is
+deleted rather than kept beside it.
+
+**A bad header is `None`, never an error.** Absent, unparseable, stale
+and forged all read the same way in `souk_server/presenter.py`, and the
+refusal that matters belongs to core: a chain with no presenter is
+`PresenterRequired` (401), a chain whose last hop is not this key is
+`InvalidChain`. One refusal in one place beats two that can disagree —
+and a chainless caller with a broken header keeps working, which is
+right, because nothing it sent depended on the proof.
+
+**The hook is per-request, closed over the body** — read once on the
+route, before the dispatcher parses anything, so the signature covers the
+very bytes the dispatcher goes on to read and the two can never disagree.
+On the AG-UI door the same function is called directly with
+`request.body()` and the key handed to `AGUIAdapter.run(presenter_key=…)`.
+
+**One header, not two.** `X-Funduq-View` is deleted along with the
+`view_metadata_of` hook it fed: revision 21 made `presenter_key_of` serve
+reads and writes alike, so for a write the answer is the key the chain's
+last hop must match, and for a read it is simply who is looking.
+`funduq_contract.view_payload` survives upstream as a payload a transport
+*may* have a reader sign to establish a key for one read; nothing here
+signs it, and souk-agent-sdk's `view_headers()` is gone.
 
 ### Which funduq error becomes which status
 
@@ -808,84 +1027,82 @@ One mapping, registered once for the whole app
 (`souk_server/deps.install_error_handlers`), because which status a
 failure deserves is a property of the failure and not of the route that
 hit it. The rows that matter for this revision are the singular acts:
-`InvalidCancel`, `InvalidResolution` and `InvalidView` are plain
-`ValueError`s upstream, so without a row each one reaches a caller as a
-**500** — a server fault for a caller mistake, saying nothing about what
-to send instead.
+`InvalidCancel` and `InvalidResolution` are plain `ValueError`s upstream,
+so without a row each one reaches a caller as a **500** — a server fault
+for a caller mistake, saying nothing about what to send instead.
 
 | error | status | why that one |
 |---|---|---|
-| `InvalidCancel`, `InvalidResolution`, `InvalidView` | **401** | the act was refused for want of a valid proof from one of the run's authorities. `InvalidView` is listed for completeness only: the read doors answer an unproven view as *absence* and never raise it outward |
+| `InvalidCancel`, `InvalidResolution` | **401** | the act was refused for want of a valid proof from one of the run's authorities. There is no `InvalidView` row any more: `verify_view` and `InvalidView` left core at revision 21, and an unauthorized read is now *absence*, which raises nothing |
+| `PresenterRequired` | **401** | a chain arrived at a door that could not say who presented it. Its own row rather than folded into `InvalidChain`, so the message and the log say which of the two it is: an unverifiable chain and an unauthenticated presenter are different mistakes with different fixes |
 | `ThreadMembershipRequired` | **403** | writing to a thread bound to a responsibility segment while being neither its head nor its serving provider. Not 401 — the caller identified itself perfectly well, its chain verified; it simply is not a member of this conversation. A bare `Exception` upstream, not even a `ValueError`, so it is the likeliest of these to have surfaced as a 500 |
 | `InvalidChain` | 401 | a tampered actor chain, refused at the door (`funduq_contract.InvalidChain`, which replaced core's `InvalidActorChain`) |
 | a KYOK body that is not a chat-completion request | **400** | `model` is required, and the body is validated as OpenAI's own request shape before any socket is touched |
 | `ThreadQueueFull` | 429 | backpressure; the A2A door maps it itself before the JSON-RPC dispatcher can swallow it |
 
-### The proofs: view, cancel, resolve
+### The proofs: read, cancel, resolve
 
-Three singular acts on a chain-bound run, and after revision 16 they are
-no longer one family.
+Two singular acts on a chain-bound run, and one read that is no longer an
+act at all.
 
-**A read needs a view proof** (revision 13), and its absence is answered
-as **absence**: `get_task` and `resubscribe_task` on a run whose thread
-is bound to a chain answer "not found" without one, because *existence
-is part of what is guarded*. Unbound runs stay as public as their
-funduq-minted ids. This is a real behavior change for a caller that read
-such runs before, and it fails quietly by design — the read that used to
-work now looks like a run that is not there.
+**A read takes a key, not a signed act** (revision 21). The view proof is
+gone: `GetTask` and `SubscribeToTask` take the key the *transport*
+authenticated, and every party reads through one surface,
+`Funduq.as_reader(key)`, under one rule — a thread nobody bound is
+readable by whoever holds its id; a bound thread by its parties (the
+head, the provider serving its agent, every key on its runs' chains); to
+anyone else it does not exist. The read circle is still wider than the
+act circle, and it is now stated once in core instead of at each door.
 
-**The read circle is wider than the act circle.** Every actor on the
-run's chain may sign a view — the parties responsibility flowed through
-may look — while cancel and resolve stay with the head and the serving
-provider.
+Absence is still the answer to an unauthorized read, and that has not
+softened: a bound run read by a stranger is "not found", because
+*existence is part of what is guarded*. It fails quietly by design — the
+read looks like a run that is not there — and this is exactly why the
+transport must never raise on a bad `Funduq-Presenter`: a 400 would tell
+a caller holding a broken proof that there was something behind the id
+worth fixing it for.
 
-A2A read requests carry no caller data at all, so the proof has nowhere
-in the protocol to travel and rides the transport instead:
-
-```
-X-Funduq-View: {"publicKey":"…","timestamp":…,"signature":"…"}
-```
-
-compact JSON, signed over `funduq-view:{run_id}:{timestamp}`, reaching
-core through `A2ARequestHandler(view_metadata_of=…)` as `{"view": {…}}`.
-The gateway judges none of it — whether the signature verifies, whether
-the signer is on the chain, whether the timestamp is inside the 60-second
-window are core's questions about a run this code has never seen. Absent
-or malformed passes **nothing** rather than raising: a 400 there would
-tell a caller holding a bad proof that there was a run behind the id
-worth fixing it for, which is precisely what an unauthorized read must
-not learn. `souk-agent-sdk`'s `view_headers()` builds the header from an
-identity, and the same header name is what a thread read would use.
-
-**A resolve proof signs the ask, not the clock** (revision 16). The
-signed bytes are `funduq-resolve:{run_id}:{sha256 hex of the outstanding
-ask ids, sorted and NUL-joined}`, canonicalized inside
+**A resolve proof signs the ask, not the clock** (revision 16), and since
+revision 19 it signs the **task** — the lineage's root. The signed bytes
+are `funduq-resolve:{root_run_id}:{sha256 hex of the outstanding ask ids,
+sorted and NUL-joined}`, canonicalized inside
 `funduq_contract.resolve_payload` and nowhere else, and the wire proof
-shrinks to `{publicKey, signature}` — **no timestamp, and the 60-second
-freshness window does not apply to resolve at all**. Instance binding
-replaces the clock: a later pause has new ids, so the proof never
-verifies against any ask but the one it was signed for. Cancel and view
-keep the timestamp family and the window; resolve was the one act where
-replay changed what happened, and it is now the one act that cannot be
-replayed.
+is `{publicKey, signature}` — **no timestamp, and the 60-second freshness
+window does not apply to resolve at all**. Instance binding replaces the
+clock: a later pause has new ids, so the proof never verifies against any
+ask but the one it was signed for. Cancel and the presenter header keep
+the timestamp family and the window; resolve was the one act where replay
+changed what happened, and it is now the one act that cannot be replayed.
+
+The root-versus-tail split is the trap here: the ids come from the tail
+run, the id signed over is the root's, and on a *first* pause the two are
+the same run. See "A run is a run, and a task is a lineage" above.
 
 **So a paused run must say what it is waiting on** — the one genuinely
 new capability this gateway grew for revision 16, rather than an edit. A
 caller that cannot enumerate the ask ids cannot build a proof at all, and
-the pause is unanswerable. Core holds them on the run's metadata
-(`funduq.pause.outstanding_asks`) and neither protocol has a field for
-them, which makes surfacing them this seat's job:
+the pause is unanswerable. Core has them in the run's **events**
+(`funduq.pause.open_asks` — revision 19 took away the run metadata this
+used to be read off, and the `input-required` status it used to be found
+by) and neither protocol has a field for them, which makes surfacing them
+this seat's job:
 
 | door | where the ids appear |
 |---|---|
-| A2A | `funduq/outstandingAsks` on the Task's `metadata` — the same visibly-not-A2A namespace as core's own `funduq/cancelRequested`, on every Task this door hands back |
-| AG-UI / threads | `active_run.outstanding_asks` on `GET /threads/{id}` |
+| A2A | `metadata.funduq.outstandingAsks` on the Task, merged into whatever core wrote under `funduq`, on every Task this door hands back. The ids are the **lineage tail's**; the proof answering them is signed over the task id, which is the root's |
+| AG-UI / threads | `waiting_run: {run_id, outstanding_asks}` on `GET /threads/{id}` |
 
-Both are read off the *run* rather than off a status name, so they answer
-the question actually asked — is anything outstanding — and both are
-sorted, matching the canonical order the payload hashes in, so a signer
-has one fewer thing to get wrong. Absent when nothing is outstanding, so
-the key's presence means something. (`souk-client-sdk` also tracks the
+`waiting_run`, not `active_run`: a run that finished asking is
+`completed` and therefore is not the thread's *active* run — there is
+nothing in flight to hang the ids on. The question is about the thread's
+latest run and its events, and the key is absent when nothing is
+outstanding, because an empty list would read as "a pause with no asks",
+which is a pause nobody could ever resolve.
+
+Both sides are read off the run's *events* rather than off a status name,
+so they answer the question actually asked — is anything outstanding —
+and both are sorted, matching the canonical order the payload hashes in,
+so a signer has one fewer thing to get wrong. (`souk-client-sdk` also tracks the
 ids from the stream as it goes — announced tool calls not answered, plus
 the interrupts the `RUN_FINISHED` outcome names — and exposes them as
 `last_outstanding_asks`, for the caller that never left the stream.)
@@ -900,10 +1117,11 @@ identity machinery that *manufactured* authority ("B counts as A until
 T") rather than recording a fact and demanding proof from the key it
 names — an unscoped grant is policy, and policy belongs at the
 authenticating seat, which holds the keys and decides which one signs.
-That seat is this gateway. Nothing here ever issued one, so nothing here
+That seat is this gateway, and as of revision 21 it is occupied rather
+than reserved. Nothing here ever issued a certificate, so nothing here
 had to be migrated; what changes is that a deployment wanting delegation
-builds it where `presenter_key_of` plugs in, not by minting a certificate
-core would honour.
+builds it behind `Funduq-Presenter` — where it knows which key signed —
+not by minting a certificate core would honour.
 
 ## Health and lifecycle
 
@@ -912,15 +1130,19 @@ Liveness and readiness stay two endpoints (`/healthz` touches nothing;
 conjunction of three facts — database answers ∧ `schema_current` ∧
 `dispatching`** — and `background_running` is gone from `Health` because
 the health sweeps it reported no longer exist: upstream removed the
-paused-run deadline and the sweep loop with it, so **a paused
-(`input-required`) run now waits indefinitely**, across restarts. It
-costs a row, not a slot; the parties that hold the lever (the asking
-provider's `Interrupt.expires_at`, the caller that owes the answer) are
-the ones funduq's clock could only have overruled. Relatedly, the final
-status of a run is decided in a fixed order in which an interrupt
-outcome outranks everything — a stream that ends on `RUN_FINISHED` with
-unanswered tool calls is `input-required`, not `completed`: the run
-stopped to ask, and is not filed as one that finished.
+paused-run deadline and the sweep loop with it, so **a pause now waits
+indefinitely**, across restarts. It costs a row, not a slot; the parties
+that hold the lever (the asking provider's `Interrupt.expires_at`, the
+caller that owes the answer) are the ones funduq's clock could only have
+overruled.
+
+A pause costs even less than it used to. **Revision 19 deleted the
+`input-required` status**: a run that finishes asking — an interrupt
+outcome, a stream that ends on `RUN_FINISHED` with unanswered tool calls
+— is `completed`, as AG-UI says, and nothing is held open to be reopened.
+The answer arrives as a *new* run naming it with `parentRunId`. So "is
+this thread waiting" is a question about the latest run's events, not
+about a status, and a restart has no half-open run to reconcile.
 
 `Funduq.start()` returns the ids of runs it had to fail as orphaned by a
 previous process; the gateway logs them (`souk_server/server.py`) so a
@@ -988,6 +1210,18 @@ fixes the surface below at "who is here, what do they do, where do I go".
   a directory that advertises live updates off registration events alone
   would miss the ones its users care most about. Not load-bearing either
   way.
+- **Reads through the unchecked facade, and that is an open
+  decision.** `browse_souk` and friends go through `Funduq`'s plain
+  roster methods, not `as_reader(None)`, and so do `GET /threads/{id}`
+  and `GET /threads/{id}/tree` on the AG-UI door. For the docent the
+  question barely arises — the roster is public by construction and it
+  serves nothing thread-shaped — but the two thread reads *are*
+  thread-shaped, and revision 21's rule (an unbound thread is readable by
+  whoever holds its id; a bound one only by its parties) is not applied
+  to them. Routing them through `as_reader` of the key the presenter
+  header proves is the obvious next round; it is listed here as
+  **not done**, so that nobody reads the seat above as covering more than
+  it does.
 - **Not exposed:** invocation (A2A's job), registration/identity
   (provider business), KYOK (bridge business), threads/runs (run
   observation is a different feature with a different audience — add
@@ -1040,6 +1274,17 @@ Tests migrate through the same door (`funduq.migrate.migrate(url)`).
 That is not an accident to preserve by luck — it is the state this rule
 protects.
 
+> **The revision-19 upgrade is destructive, by design.** Alembic revision
+> `a1f4c9d27e3b` reshaped `runs` around `RunAgentInput` — dropping
+> `input_json`, `metadata`, `head_key`, `protocol` and the
+> `input-required` status — and upstream chose **not** to migrate rows:
+> it **deletes every row in `runs`, `run_events` and `thread_messages`**.
+> Agents, providers and threads survive; conversation history does not.
+> Nothing is published from these packages that would make that a
+> data-loss event upstream cares about, and a restart already voids held
+> runs — but a deployment with a database it wants to keep must know
+> this *before* `docker compose up --build` runs `souk-migrate` for it.
+
 **When serving *does* need persistence, it is isolated from core's, and
 the isolation is structural rather than a naming convention.** Whatever
 it turns out to be — edge-auth records, rate limits, admin state, an MCP
@@ -1087,6 +1332,35 @@ database in practice however they are namespaced, and forecloses the
 split deployment silently. Serving persistence therefore gets its own
 engine and sessionmaker, never core's session.
 
+## Known limits, recorded rather than papered over
+
+Three things this gateway does not do, each because working around it
+would be worse than the limit.
+
+- **A v0.3 A2A caller cannot receive the 401** — nor the 429. a2a-sdk's
+  `V03JsonRpcAdapter` converts *every* exception, `HTTPException`
+  included, into a JSON-RPC `InternalError` inside a 200, so a status can
+  only escape on the native v1.0 path. This is the same limitation the
+  429 has had since it was added, and the tests say so in as many words
+  by sending both in the v1.0 vocabulary. Escaping it would mean this
+  gateway reaching inside a2a-sdk's compat adapter, which is the one
+  place in this system whose whole value is being the package's business
+  and not ours.
+- **`historyLength: 0` still returns the whole history.** Revision 19's
+  changelog says the field's presence is read and 0 means no history; the
+  released `a2a_translate.history_of` still ends `history[-limit:] if
+  limit else history`, so 0 falls through the falsy branch and returns
+  everything. **Deliberately not worked around here**
+  ([funduq#268](https://github.com/hukaichun/funduq/issues/268)): a
+  gateway-side special case would make this door disagree with the same
+  adapter used in-process, and two answers to one question is a worse bug
+  than one wrong answer in one place. Reported upstream; it is a fix in
+  `history_of`, not a fix in a transport.
+- **Two thread reads still bypass revision 21's reader rule** —
+  `GET /threads/{id}`, `GET /threads/{id}/tree` and the MCP docent go
+  through the unchecked facade rather than `as_reader(...)`. See "MCP:
+  the docent" above; it is an open decision, not a finished one.
+
 ## Where examples live
 
 Split by what an example teaches, not by where it happens to run — and
@@ -1117,7 +1391,7 @@ and upstream keeps none: this repo owns both ends of every wire it
 defines. What used to be "pinned by commit" is now pinned by version
 bounds in each `pyproject.toml`, and what used to be a path into the
 submodule (vectors, scripts, docs) now has an in-repo home:
-`docs/upstream-contract-vectors.json` (vendored at contract revision 17,
+`docs/upstream-contract-vectors.json` (vendored at contract revision 21,
 regenerated by re-vendoring when the pin moves) and
 `scripts/gen_dev_tls_cert.py`.
 

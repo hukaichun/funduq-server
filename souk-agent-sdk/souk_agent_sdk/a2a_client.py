@@ -23,6 +23,7 @@ the SDK's own dispatcher and would reject these shapes if they drifted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
@@ -30,7 +31,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-from funduq_contract import view_payload
 from funduq_provider_sdk import ProviderIdentity
 from httpx_sse import aconnect_sse
 
@@ -42,59 +42,128 @@ from httpx_sse import aconnect_sse
 A2A_VERSION_HEADER = "A2A-Version"
 A2A_PROTOCOL_VERSION = "1.0"
 
-# funduq's declared A2A extension for interjection: a message whose
+# funduq's declared A2A extension for interjection: a request whose
 # metadata carries this key asks to join the named run's turn in flight,
-# rather than opening the next turn. souk relays it to the addressed
-# agent as `forwardedProps.addressedRunId`.
+# rather than opening the next turn. It rides the *request's* metadata,
+# beside `actorChain` — funduq has read nothing from a message's own
+# metadata since contract revision 20 — and souk relays it to the
+# addressed agent as `forwardedProps.funduq.addressedRunId` (revision 18
+# moved funduq's own keys under one `funduq` key so a caller's bag and
+# funduq's own can never be mistaken for each other).
 INTERJECTION_EXTENSION_URI = "https://github.com/hukaichun/funduq/ext/interjection/v1"
 ADDRESSED_RUN_METADATA_KEY = f"{INTERJECTION_EXTENSION_URI}/addressedRunId"
 
 
-# Contract revision 13: reading a run whose thread is bound to an actor
-# chain demands a view proof, and its absence is answered as "not found"
-# — existence is part of what is guarded, so a read that works today
-# silently 404s once the callee is on rev 13 unless the proof is sent.
-# A2A's read requests carry no caller data, so the proof rides the
-# transport; this gateway takes it as a header with compact JSON
-# `{"publicKey", "timestamp", "signature"}` (docs/server-mode.md).
+# Contract revision 21: a door that cannot say *who presented* a request
+# must refuse a chain presented at it (`PresenterRequired`). The chain
+# itself proves who signed each hop; it does not prove that the party on
+# the far end of this connection is the one whose key ends it, and reading
+# the presenter off the chain would make that check a tautology — the
+# caller-impersonation hole upstream closed. So the presenter authenticates
+# itself at the transport, and souk's `presenter_key_of` reads it here.
 #
-# The read circle is wider than the act circle: every actor on the run's
-# chain may sign a view, while cancel and resolve stay with the head and
-# the serving provider.
-VIEW_PROOF_HEADER = "X-Funduq-View"
+# The header is `Funduq-Presenter` — no `X-` prefix, deprecated by RFC 6648
+# in 2012 — carrying compact JSON `{"publicKey", "timestamp", "signature"}`,
+# the same three fields as every other proof in this system.
+PRESENTER_HEADER = "Funduq-Presenter"
+
+# The domain tag is *ours*, deliberately. `funduq-*` is upstream's
+# namespace and funduq_contract publishes no builder for authenticating a
+# presenter — squatting the namespace would mint a name that looks
+# canonical and is not. When upstream ships one, this constant and
+# `presenter_payload` below are what gets deleted.
+PRESENTER_DOMAIN = "funduq-server-presenter"
+
+# The freshness window the far side enforces, restated here only so a
+# caller knows how stale a pre-signed header may be. Modelled on the
+# cancel/view family and on `kyok_call_payload`, which likewise binds a
+# body hash.
+PRESENTER_FRESHNESS_SECONDS = 60
 
 
-def view_proof(
-    identity: ProviderIdentity, run_id: str, *, timestamp: int | None = None
-) -> dict[str, Any]:
-    """The `{publicKey, timestamp, signature}` proof that this identity
-    asks to see `run_id`, now.
+class PresenterIdentityRequired(ValueError):
+    """A chain was passed with no identity to present it with.
 
-    Still the timestamp family, unlike a resolve proof — a view is a
-    standing capability rather than an answer to one particular ask, so
-    there is nothing instance-shaped to bind it to and freshness has to
-    come from the clock (60s window on the far side). The signed bytes
-    are `funduq_contract.view_payload(run_id, timestamp)`, imported, not
-    restated.
+    Raised here rather than sent: souk refuses a chain from a caller it
+    cannot authenticate, so this request has a known answer, and a local
+    error naming the missing half beats a 401 three layers away.
     """
+
+
+def presenter_payload(public_key: str, timestamp: int, body_hash: str) -> bytes:
+    """The exact bytes a presenter signs:
+
+        funduq-server-presenter:{public_key}:{timestamp}:{sha256hex(body)}
+
+    Each of the three earns its place. The **body hash** binds the proof
+    to *this* request, so a captured header cannot be replayed onto a
+    different call. The **timestamp** bounds replay of the same request to
+    the freshness window. The **public key inside the payload** makes the
+    proof name the key it claims, so it cannot answer a different question.
+
+    `body_hash` is the lowercase hex sha256 of the request bytes actually
+    put on the wire — which is why every send here serializes once and
+    posts those same bytes, rather than letting httpx re-serialize.
+    """
+    return f"{PRESENTER_DOMAIN}:{public_key}:{timestamp}:{body_hash}".encode()
+
+
+def presenter_proof(
+    identity: ProviderIdentity, body: bytes, *, timestamp: int | None = None
+) -> dict[str, Any]:
+    """The `{publicKey, timestamp, signature}` proof that this identity is
+    the party presenting `body`, now."""
     timestamp = int(time.time()) if timestamp is None else timestamp
+    body_hash = hashlib.sha256(body).hexdigest()
     return {
         "publicKey": identity.public_key,
         "timestamp": timestamp,
-        "signature": identity.sign(view_payload(run_id, timestamp)),
+        "signature": identity.sign(
+            presenter_payload(identity.public_key, timestamp, body_hash)
+        ),
     }
 
 
-def view_headers(
-    identity: ProviderIdentity | None, run_id: str, *, timestamp: int | None = None
+def presenter_headers(
+    identity: ProviderIdentity | None, body: bytes, *, timestamp: int | None = None
 ) -> dict[str, str]:
-    """`view_proof` as the header a read carries. No identity, no header —
-    which reads a bound run as absent, the designed answer, rather than an
-    error."""
+    """`presenter_proof` as the header a request carries. No identity, no
+    header — an anonymous caller, which is exactly what a call with no
+    chain is, and souk keeps serving it."""
     if identity is None:
         return {}
-    proof = view_proof(identity, run_id, timestamp=timestamp)
-    return {VIEW_PROOF_HEADER: json.dumps(proof, separators=(",", ":"))}
+    proof = presenter_proof(identity, body, timestamp=timestamp)
+    return {PRESENTER_HEADER: json.dumps(proof, separators=(",", ":"))}
+
+
+def _presented(
+    body: dict[str, Any],
+    identity: ProviderIdentity | None,
+    *,
+    actor_chain_present: bool,
+) -> tuple[bytes, dict[str, str]]:
+    """One JSON-RPC body, serialized once, with the presenter header over
+    exactly those bytes.
+
+    Serializing here and posting `content=` is the load-bearing detail: a
+    signature over bytes httpx would go on to produce differently is a
+    signature over nothing.
+    """
+    if actor_chain_present and identity is None:
+        raise PresenterIdentityRequired(
+            "actor_chain was given but identity was not: souk refuses a chain "
+            "from a caller it cannot authenticate (PresenterRequired), so this "
+            "call would be rejected. Pass identity= — the same ProviderIdentity "
+            f"whose key ends the chain — so the {PRESENTER_HEADER} header can "
+            "be signed."
+        )
+    raw = json.dumps(body, separators=(",", ":")).encode()
+    headers = {
+        A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION,
+        "Content-Type": "application/json",
+        **presenter_headers(identity, raw),
+    }
+    return raw, headers
 
 
 def new_request_id() -> str:
@@ -115,6 +184,7 @@ async def call_agent_streaming(
     addressed_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     actor_chain: list[str] | None = None,
+    identity: ProviderIdentity | None = None,
     reference_task_ids: list[str] | None = None,
     timeout: float = 120.0,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -125,6 +195,15 @@ async def call_agent_streaming(
     one. Entirely optional: souk doesn't require callers to authenticate.
     It rides the *request*-level metadata as `actorChain`, which is where
     the gateway's adapter reads it.
+
+    `identity` is the `ProviderIdentity` **presenting** this call — the one
+    whose key ends `actor_chain`. Since contract revision 21 souk refuses a
+    chain from a caller it cannot authenticate, so a chain without an
+    identity is a request with a known answer and this client raises
+    `PresenterIdentityRequired` instead of sending it. Given, the identity
+    signs the `Funduq-Presenter` header over the exact bytes of this
+    request. Without a chain it is optional: a chainless caller stays
+    anonymous, which souk serves unchanged.
 
     `context_id`, if given, is real A2A (`Message.contextId` — the
     caller passes back whatever `contextId` it was returned on an
@@ -142,9 +221,11 @@ async def call_agent_streaming(
     `addressed_run_id`, if given, declares an *interjection*: this
     message wants into the named run's turn while it is still in flight
     (distinct from a resume, which answers a run that paused). It rides
-    the message's metadata under funduq's declared extension key
-    (`ADDRESSED_RUN_METADATA_KEY`); souk relays it to the agent as
-    `forwardedProps.addressedRunId`.
+    under funduq's declared extension key
+    (`ADDRESSED_RUN_METADATA_KEY`) on the *request's* metadata, beside
+    `actorChain` — funduq reads nothing from a message's own metadata
+    since revision 20 — and souk relays it to the agent as
+    `forwardedProps.funduq.addressedRunId`.
 
     `reference_task_ids`, if given, is real A2A (`Message.referenceTaskIds`
     — "a list of other task IDs that this message references for
@@ -165,14 +246,15 @@ async def call_agent_streaming(
         reference_task_ids=reference_task_ids,
     )
     body = {"jsonrpc": "2.0", "id": request_id, "method": "SendStreamingMessage", "params": params}
+    raw, headers = _presented(body, identity, actor_chain_present=actor_chain is not None)
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with aconnect_sse(
             client,
             "POST",
             a2a_rpc_url,
-            json=body,
-            headers={A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION},
+            content=raw,
+            headers=headers,
         ) as event_source:
             async for sse in event_source.aiter_sse():
                 payload = json.loads(sse.data)
@@ -196,6 +278,11 @@ def _send_message_params(
     metadata = dict(metadata) if metadata else {}
     if actor_chain is not None:
         metadata["actorChain"] = actor_chain
+    if addressed_run_id:
+        # Request level, beside `actorChain`. It used to ride the message's
+        # own metadata; funduq has read nothing from there since revision
+        # 20, so the old location was a declaration nobody heard.
+        metadata[ADDRESSED_RUN_METADATA_KEY] = addressed_run_id
 
     # v1.0 `Part` is a oneof, so the field name is the type — no `kind`, no
     # `type`. Role gained its enum prefix in the same move.
@@ -210,8 +297,6 @@ def _send_message_params(
         message["contextId"] = context_id
     if task_id:
         message["taskId"] = task_id
-    if addressed_run_id:
-        message["metadata"] = {ADDRESSED_RUN_METADATA_KEY: addressed_run_id}
 
     params: dict[str, Any] = {"message": message}
     if metadata:
@@ -225,11 +310,12 @@ async def _rpc(
     params: dict[str, Any],
     *,
     request_id: str | None = None,
-    headers: dict[str, str] | None = None,
+    identity: ProviderIdentity | None = None,
+    actor_chain_present: bool = False,
     timeout: float = 120.0,
 ) -> Any:
-    """One JSON-RPC call, returning its `result` (which may be absent —
-    a read of a bound run without a valid view proof answers nothing, and
+    """One JSON-RPC call, returning its `result` (which may be absent — a
+    read the callee will not answer to this reader answers nothing, and
     that is the designed answer, not an error to raise)."""
     body = {
         "jsonrpc": "2.0",
@@ -237,12 +323,9 @@ async def _rpc(
         "method": method,
         "params": params,
     }
+    raw, headers = _presented(body, identity, actor_chain_present=actor_chain_present)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            a2a_rpc_url,
-            json=body,
-            headers={A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION, **(headers or {})},
-        )
+        response = await client.post(a2a_rpc_url, content=raw, headers=headers)
         response.raise_for_status()
         payload = response.json()
     if payload.get("error") is not None:
@@ -260,6 +343,7 @@ async def call_agent(
     addressed_run_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     actor_chain: list[str] | None = None,
+    identity: ProviderIdentity | None = None,
     reference_task_ids: list[str] | None = None,
     return_immediately: bool = False,
     history_length: int | None = None,
@@ -296,7 +380,13 @@ async def call_agent(
     if configuration:
         params["configuration"] = configuration
     return await _rpc(
-        a2a_rpc_url, "SendMessage", params, request_id=request_id, timeout=timeout
+        a2a_rpc_url,
+        "SendMessage",
+        params,
+        request_id=request_id,
+        identity=identity,
+        actor_chain_present=actor_chain is not None,
+        timeout=timeout,
     )
 
 
@@ -312,11 +402,14 @@ async def get_task(
     """Read one task. `None` means the callee answered absence.
 
     Pass `identity` — this provider's own `ProviderIdentity` — for any run
-    whose thread is bound to an actor chain: since contract revision 13
-    such a read demands a view proof, and without one the answer is
-    "not found" whether or not the task exists. Any actor on the run's
-    chain may sign one, so a provider that delegated work can still watch
-    the task it is on the chain of.
+    whose thread is bound to an actor chain: a read is answered as the key
+    the transport authenticated, and an unauthenticated reader is told
+    "not found" whether or not the task exists. Revision 21 folded reads
+    and writes into that one hook (`presenter_key_of`), so the header a
+    read carries is the same `Funduq-Presenter` a chained send carries —
+    there is no separate view proof any more. Any actor on the run's chain
+    is inside its read circle, so a provider that delegated work can still
+    watch the task it is on the chain of.
 
     Omitting it is right for an unbound run, which stays as public as its
     funduq-minted id.
@@ -329,7 +422,7 @@ async def get_task(
         "GetTask",
         params,
         request_id=request_id,
-        headers=view_headers(identity, task_id),
+        identity=identity,
         timeout=timeout,
     )
 
@@ -344,24 +437,22 @@ async def resubscribe_task(
 ) -> AsyncIterator[dict[str, Any]]:
     """Re-attach to a task's event stream (`SubscribeToTask`), yielding
     each `StreamResponse` — the read path for a run already in flight,
-    e.g. after a dropped connection. Same view-proof rule as `get_task`:
-    a bound run without one streams nothing."""
+    e.g. after a dropped connection. Same presenter rule as `get_task`: a
+    bound run streams nothing to a reader the transport could not name."""
     body = {
         "jsonrpc": "2.0",
         "id": request_id or new_request_id(),
         "method": "SubscribeToTask",
         "params": {"id": task_id},
     }
+    raw, headers = _presented(body, identity, actor_chain_present=False)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with aconnect_sse(
             client,
             "POST",
             a2a_rpc_url,
-            json=body,
-            headers={
-                A2A_VERSION_HEADER: A2A_PROTOCOL_VERSION,
-                **view_headers(identity, task_id),
-            },
+            content=raw,
+            headers=headers,
         ) as event_source:
             async for sse in event_source.aiter_sse():
                 payload = json.loads(sse.data)

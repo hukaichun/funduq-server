@@ -8,7 +8,12 @@ gone, and there is nothing left to rebuild. Revision 16 made a resolve
 proof sign the paused run's outstanding asks instead of a timestamp, which
 is why this client has to surface those ask ids at all: without them a
 caller cannot construct the proof, and a run bound to an actor chain can
-never be answered.
+never be answered. Revision 19 then moved the *id* that proof signs from
+the paused run to its lineage root — the A2A task id — which coincide on a
+first pause and diverge on every one after, so `last_task_id` is surfaced
+beside the asks and the two-pause test below is the one that can tell them
+apart. Revision 20 moved the caller's whole bag to request level
+(`forwardedProps`), where the tests here assert it.
 """
 
 from __future__ import annotations
@@ -95,9 +100,61 @@ def test_a_proof_for_other_asks_is_not_the_proof_for_these():
     )
 
 
-async def test_resolution_rides_the_runs_metadata(monkeypatch):
-    """Where souk reads it: `metadata.resolution` on the resuming
-    request, alongside whatever else the caller was already sending."""
+async def test_the_callers_declarations_ride_forwarded_props(monkeypatch):
+    """Where souk reads them. Since contract revision 20 a caller's
+    declarations to funduq — the KYOK opt-in and the resolution proof
+    alike — are **request level**: `forwardedProps` on the AG-UI door, the
+    request's `metadata` on A2A. funduq reads nothing from a message's own
+    metadata, and the run row has no metadata column at all any more.
+
+    This was a *silent* failure, which is why it gets its own test: sent
+    in `body["metadata"]` the opt-in minted no grant, no exception was
+    raised anywhere, and the agent simply answered with no model."""
+    client = SoukClient("http://souk.example")
+    seen = _stub_stream(monkeypatch, [])
+    async for _ in client.run(
+        _agent(),
+        "hi",
+        thread_id="t1",
+        forwarded_props={"kyok": {"llmProvider": {}}},
+        resolution={"publicKey": "ab", "signature": "cd"},
+    ):
+        pass
+    assert seen["body"]["forwardedProps"]["resolution"] == {
+        "publicKey": "ab",
+        "signature": "cd",
+    }
+    assert seen["body"]["forwardedProps"]["kyok"] == {"llmProvider": {}}
+    # And nowhere else: a second copy in the old place would let a stale
+    # gateway keep passing while a current one silently ignored it.
+    assert "metadata" not in seen["body"]
+
+
+async def test_the_bag_merges_rather_than_replacing_the_callers_own(monkeypatch):
+    """The old code *assigned* `forwardedProps` for one declaration, so a
+    caller sending a KYOK opt-in and an interjection in the same call lost
+    one of them without a word. Everything the caller sent survives beside
+    what the SDK adds."""
+    client = SoukClient("http://souk.example")
+    seen = _stub_stream(monkeypatch, [])
+    async for _ in client.run(
+        _agent(),
+        "hi",
+        thread_id="t1",
+        forwarded_props={"kyok": {"llmProvider": {}}, "mine": {"deep": [1, 2]}},
+        resolution={"publicKey": "ab", "signature": "cd"},
+    ):
+        pass
+    bag = seen["body"]["forwardedProps"]
+    assert set(bag) == {"kyok", "mine", "resolution"}
+    assert bag["mine"] == {"deep": [1, 2]}
+
+
+async def test_metadata_is_the_old_name_for_the_same_bag(monkeypatch):
+    """`metadata=` used to name this bag when it landed in
+    `body["metadata"]`. Kept as an alias — `KyokBridge.run_metadata()`
+    builds into it — and merged into the one bag rather than sent to the
+    place nothing reads."""
     client = SoukClient("http://souk.example")
     seen = _stub_stream(monkeypatch, [])
     async for _ in client.run(
@@ -105,20 +162,34 @@ async def test_resolution_rides_the_runs_metadata(monkeypatch):
         "hi",
         thread_id="t1",
         metadata={"kyok": {"llmProvider": {}}},
-        resolution={"publicKey": "ab", "signature": "cd"},
+        forwarded_props={"mine": 1},
     ):
         pass
-    assert seen["body"]["metadata"]["resolution"] == {
-        "publicKey": "ab",
-        "signature": "cd",
-    }
-    assert seen["body"]["metadata"]["kyok"] == {"llmProvider": {}}
+    assert seen["body"]["forwardedProps"] == {"kyok": {"llmProvider": {}}, "mine": 1}
+    assert "metadata" not in seen["body"]
+
+
+def test_there_is_no_agui_interjection_argument():
+    """Removed rather than faked. Core reads an interjection declaration
+    on the **A2A door only**; the AG-UI door never sets one, and the
+    `forwardedProps` key this argument wrote to (`addressedRunId`) now
+    belongs to funduq under `forwardedProps.funduq`. Keeping the parameter
+    would promise a delivery no door makes."""
+    import inspect
+
+    assert "addressed_run_id" not in inspect.signature(SoukClient.run).parameters
+    # And the docstring says where interjection *does* work, rather than
+    # leaving a caller to find out by silence.
+    assert "A2A door only" in (SoukClient.run.__doc__ or "")
 
 
 def _agent():
     from souk_client_sdk import Agent
 
     return Agent(provider="ab" * 8, name="echo", provider_key="ab" * 32)
+
+
+_REAL_ASYNC_CLIENT = __import__("httpx").AsyncClient
 
 
 def _stub_stream(monkeypatch, events: list[dict]) -> dict:
@@ -139,7 +210,11 @@ def _stub_stream(monkeypatch, events: list[dict]) -> dict:
                 200, headers={"content-type": "text/event-stream"}, content=payload
             )
 
-    real = httpx.AsyncClient
+    # The *unpatched* class, captured once at import. Reading
+    # `httpx.AsyncClient` here would capture a previous stub when a test
+    # stubs twice — and the second stream would then quietly replay the
+    # first one's events, which is a green test asserting nothing.
+    real = _REAL_ASYNC_CLIENT
 
     def _client(*args, **kwargs):
         kwargs["transport"] = _Transport()
@@ -189,10 +264,14 @@ async def test_the_outstanding_asks_of_a_paused_run_are_surfaced_to_the_caller(m
     assert "tool_answered" not in client.last_outstanding_asks
     assert len(client.last_outstanding_asks) == 2
 
-    # Which is the whole point: the proof that answers this pause.
+    # Which is the whole point: the proof that answers this pause. It
+    # signs the *task* id — the lineage root — which on a first turn is
+    # also the paused run's id. See the two-pause test below for why that
+    # coincidence makes this one prove nothing about the id.
+    assert client.last_task_id == "r1"
     identity = _test_identity()
     proof = resolution_proof(
-        identity, client.last_run_id, client.last_outstanding_asks
+        identity, client.last_task_id, client.last_outstanding_asks
     )
     assert verify_signature(
         proof["publicKey"],
@@ -215,6 +294,104 @@ async def test_a_run_that_ends_without_pausing_leaves_no_asks(monkeypatch):
     async for _ in client.run(_agent(), "hi", thread_id="t1"):
         pass
     assert client.last_outstanding_asks == []
+
+
+async def test_a_finished_run_with_an_unanswered_tool_call_is_waiting_too(monkeypatch):
+    """`funduq.pause.open_asks` is the single definition of the ask id
+    space now, and it says: everything a *finished* run left waiting on —
+    its interrupts **and** its unanswered tool calls — whether or not it
+    finished on an interrupt outcome. Tracking only the interrupt outcome
+    reported "nothing outstanding" for a run core considers open, and the
+    caller could not build a proof it needed."""
+    client = SoukClient("http://souk.example")
+    _stub_stream(
+        monkeypatch,
+        [
+            {"type": "RUN_STARTED", "threadId": "t1", "runId": "r1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "tool_a"},
+            {"type": "RUN_FINISHED", "threadId": "t1", "runId": "r1"},
+        ],
+    )
+    async for _ in client.run(_agent(), "hi", thread_id="t1"):
+        pass
+    assert client.last_outstanding_asks == ["tool_a"]
+
+
+async def test_a_second_pause_signs_the_task_id_not_the_run_that_asked(monkeypatch):
+    """The reason a single-pause test proves nothing. Revision 19 made
+    answering a pause open the *next* run rather than reopen the paused
+    one, and core verifies a resolution over `repo.root_of(the run that
+    asked)` — the lineage root, the id A2A calls the task id. On the first
+    pause root and run coincide; on the second they do not, and a proof
+    signed over `last_run_id` fails to verify against the bytes core
+    builds."""
+    client = SoukClient("http://souk.example")
+
+    def _pause(run_id: str, ask: str) -> list[dict]:
+        return [
+            {"type": "RUN_STARTED", "threadId": "t1", "runId": run_id},
+            {
+                "type": "RUN_FINISHED",
+                "threadId": "t1",
+                "runId": run_id,
+                "outcome": {"type": "interrupt", "interrupts": [{"id": ask}]},
+            },
+        ]
+
+    _stub_stream(monkeypatch, _pause("r1", "int_1"))
+    async for _ in client.run(_agent(), "hi", thread_id="t1"):
+        pass
+    assert client.last_task_id == client.last_run_id == "r1"
+
+    # The answer opens r2, a child of r1 — same lineage, same task id.
+    _stub_stream(monkeypatch, _pause("r2", "int_2"))
+    async for _ in client.run(
+        _agent(),
+        "answer",
+        thread_id="t1",
+        resume=[{"interruptId": "int_1", "status": "resolved"}],
+    ):
+        pass
+    assert client.last_run_id == "r2"
+    assert client.last_task_id == "r1"
+
+    identity = _test_identity()
+    proof = resolution_proof(identity, client.last_task_id, client.last_outstanding_asks)
+    assert verify_signature(
+        proof["publicKey"], proof["signature"], resolve_payload("r1", {"int_2"})
+    )
+    # Signed over the run that asked, it answers nothing core will build.
+    assert not verify_signature(
+        proof["publicKey"], proof["signature"], resolve_payload("r2", {"int_2"})
+    )
+
+
+async def test_a_fresh_turn_starts_a_new_task(monkeypatch):
+    """The other half of the rule: a run that answers nothing starts its
+    own lineage, so the task id follows it rather than staying pinned to a
+    conversation that already settled."""
+    client = SoukClient("http://souk.example")
+    _stub_stream(
+        monkeypatch,
+        [
+            {"type": "RUN_STARTED", "threadId": "t1", "runId": "r1"},
+            {"type": "RUN_FINISHED", "threadId": "t1", "runId": "r1"},
+        ],
+    )
+    async for _ in client.run(_agent(), "hi", thread_id="t1"):
+        pass
+    assert client.last_task_id == "r1"
+
+    _stub_stream(
+        monkeypatch,
+        [
+            {"type": "RUN_STARTED", "threadId": "t1", "runId": "r2"},
+            {"type": "RUN_FINISHED", "threadId": "t1", "runId": "r2"},
+        ],
+    )
+    async for _ in client.run(_agent(), "again", thread_id="t1"):
+        pass
+    assert client.last_task_id == "r2"
 
 
 # --- the completion shape ----------------------------------------------------

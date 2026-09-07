@@ -1,5 +1,5 @@
 """The A2A HTTP surface: pair routing, the version-negotiating
-dispatcher, and the two errors that escape as HTTP.
+dispatcher, and the errors that escape as HTTP.
 
 The JSON-RPC layer is a2a-sdk's now, and version negotiation is the
 reason it has to be: which protocol a request speaks rides the
@@ -8,24 +8,36 @@ sees a header. Both vocabularies are exercised here — `message/send`
 headerless the way an unmodified v0.3 client sends it, and v1.0
 `SendMessage` with the header the way this repo's own a2a_client speaks.
 
-The two escapes are the writing-a-transport rules: `AgentNotFound` is a
+The escapes are the writing-a-transport rules: `AgentNotFound` is a
 404 on the route (the agent is the endpoint, resolved before the
-dispatcher runs — never a JSON-RPC error inside a 200), and
+dispatcher runs — never a JSON-RPC error inside a 200),
 `ThreadQueueFull` is a 429 that says retry, because the request was NOT
-accepted. And `CancelTaskRequest.metadata` must pass through whole —
+accepted, and `PresenterRequired` is a 401, because authentication is
+the transport's business and a missing credential is not a server fault.
+Both statuses can only escape on the **v1.0** path: a2a-sdk's v0.3
+compatibility adapter converts every exception, `HTTPException`
+included, into a JSON-RPC internal error inside a 200. And `CancelTaskRequest.metadata` must pass through whole —
 the cancel-authority proof rides in it, and a gateway that drops the
 field silently refuses every cancel on a bound thread.
 
-**The proofs are the rest of this file**, and both moved this round.
-Reading a chain-bound run needs a view proof (contract revision 13), and
-A2A read requests carry no caller data at all, so it rides the
-`X-Funduq-View` header and reaches core through the handler's
-`view_metadata_of` hook. Answering a paused one needs a resolve proof
-that signs the *asks* rather than the clock (revision 16), which only
-works if the door tells a caller what those asks are — so a paused run
-carries them under `funduq/outstandingAsks`. Every proof here is signed
-with the real payload builders, never a hand-written string: a test that
-retyped the bytes could agree with itself while disagreeing with core.
+**The proofs are the rest of this file**, and revision 21 collapsed them
+onto one seat. A2A requests carry no caller data at all, so who is
+presenting a request rides the `Funduq-Presenter` header
+(souk_server.presenter), signed over the request body — and that one key
+answers both halves: for a read it is who is looking, for a write it is
+the key the chain's last hop must match. A chain presented with no proof
+is refused by core, by name, because origin is not possession. Answering
+a pause needs a resolve proof that signs the *asks* rather than the clock
+(revision 16) and is signed over the **task** id — the lineage root, the
+id a caller holds across every turn (revision 19) — which only works if
+the door tells a caller what those asks are, so a waiting task carries
+them under `metadata.funduq.outstandingAsks`.
+
+Every proof here is signed with the real payload builders, never a
+hand-written string: a test that retyped the bytes could agree with
+itself while disagreeing with core. And every request that carries one is
+posted as bytes rather than `json=`, because the presenter proof covers
+the body — re-serializing after signing would hash something else.
 """
 
 from __future__ import annotations
@@ -39,6 +51,8 @@ from sqlalchemy import func, select
 
 from funduq import repo
 from funduq.errors import ThreadQueueFull
+from funduq.pause import failure_reason_of, open_asks
+from funduq.props import OBSERVED_METADATA_KEY
 from funduq.protocols.a2a import A2AAdapter
 from funduq.schema import runs
 from funduq_contract import (
@@ -46,16 +60,29 @@ from funduq_contract import (
     extend_chain,
     new_chain,
     resolve_payload,
-    view_payload,
 )
 from souk_server.api_a2a import OUTSTANDING_ASKS_METADATA_KEY
+from souk_server.presenter import PRESENTER_HEADER, presenter_payload
 
 
 def _now() -> int:
-    """A real clock, because view and cancel proofs still carry one and
-    core still enforces a 60-second window on both. Only *resolve* stopped
-    signing time this round."""
+    """A real clock, because the presenter and cancel proofs both carry
+    one and both are checked against a 60-second window. Only *resolve*
+    signs no time: it binds the asks instead."""
     return int(time.time())
+
+
+async def _rpc(client, served, payload: dict, *, presenter=None, header=None):
+    """One JSON-RPC call, with the presenter proof signed over the exact
+    bytes posted. `json=` would re-serialize the payload and the body hash
+    would cover different bytes than the ones signed."""
+    raw = json.dumps(payload).encode()
+    headers = {"content-type": "application/json"}
+    if header is not None:
+        headers.update(header)
+    elif presenter is not None:
+        headers.update(presenter.presenter_header(raw))
+    return await client.post(f"/a2a/{served.path()}/rpc", content=raw, headers=headers)
 
 
 def _v03_send(
@@ -93,53 +120,94 @@ class _Party:
     def sign(self, payload: bytes) -> str:
         return self.key.sign(payload).hex()
 
-    def view_header(self, run_id: str, timestamp: int) -> dict[str, str]:
-        """The `X-Funduq-View` header this gateway defines: compact JSON,
-        the proof upstream's `view_payload` states, nothing else."""
+    def presenter_header(self, body: bytes, timestamp: int | None = None) -> dict[str, str]:
+        """The `Funduq-Presenter` header this gateway defines: compact
+        JSON, the three fields every proof here uses, over
+        `funduq-server-presenter:{publicKey}:{timestamp}:{sha256hex(body)}`
+        — built from the gateway's own payload function, never retyped."""
+        when = _now() if timestamp is None else timestamp
         return {
-            "X-Funduq-View": json.dumps(
+            PRESENTER_HEADER: json.dumps(
                 {
                     "publicKey": self.public_key,
-                    "timestamp": timestamp,
-                    "signature": self.sign(view_payload(run_id, timestamp)),
+                    "timestamp": when,
+                    "signature": self.sign(
+                        presenter_payload(self.public_key, when, body)
+                    ),
                 },
                 separators=(",", ":"),
             )
         }
 
-    def resolution(self, run_id: str, ask_ids: list[str]) -> dict[str, str]:
+    def resolution(self, task_id: str, ask_ids: list[str]) -> dict[str, str]:
         """A resolve proof: `{publicKey, signature}` and **no timestamp**.
         Revision 16 took the clock out — the signature binds the exact
         asks being answered, so a later pause's new ids are what makes it
-        single-purpose, and there is no freshness window left to miss."""
+        single-purpose, and there is no freshness window left to miss.
+
+        Signed over the **task** id, which revision 19 made the lineage's
+        root rather than the run that asked: the id the caller has held
+        since its first message, and the one thing about a conversation
+        that does not change when its second turn opens a new run."""
         return {
             "publicKey": self.public_key,
-            "signature": self.sign(resolve_payload(run_id, ask_ids)),
+            "signature": self.sign(resolve_payload(task_id, ask_ids)),
         }
 
 
-async def _bound_paused_run(souk, session, served, *, chain: list[str], head: str, asks: list[str]):
-    """A paused run on a thread bound to `chain`.
+def _asking_events(run_id: str, thread_id: str, asks: list[str]) -> list[dict]:
+    """The events a run that finished asking leaves behind.
+
+    Revision 19 deleted the `input-required` status and the run metadata
+    that carried the ask ids: a run that finished asking is `completed`,
+    and that it left the thread waiting is read from its own events. So a
+    waiting run is now built by writing the events a real provider
+    writes — a RUN_FINISHED whose outcome is an interrupt.
+    """
+    return [
+        {"type": "RUN_STARTED", "runId": run_id, "threadId": thread_id},
+        {
+            "type": "RUN_FINISHED",
+            "runId": run_id,
+            "threadId": thread_id,
+            "outcome": {"type": "interrupt", "interrupts": [{"id": ask} for ask in asks]},
+        },
+    ]
+
+
+async def _run_that_asked(
+    session, served, thread_id: str, *, chain: list[str], asks: list[str], parent: str | None = None
+) -> str:
+    """One completed-with-asks run on `thread_id`, optionally continuing
+    `parent`'s lineage.
 
     Built through repo rather than by sending: a run that really pauses
     needs a provider to pause it, and what these tests are about is the
     door in front of the pause, not the pause itself. Through the legal
     status transitions, because the status machine refuses a jump straight
-    from queued to input-required — correctly.
+    from queued to completed — correctly.
     """
-    thread_id = await repo.create_thread(session, served.ref(), head_key=head)
     created = await repo.create_run(
-        session, thread_id, served.ref(), "a2a", {}, head_key=head, actor_chain=chain
-    )
-    await repo.mark_run_status(session, created["run_id"], "running")
-    await repo.mark_run_status(
         session,
-        created["run_id"],
-        "input-required",
-        metadata={"interrupts": [{"id": ask} for ask in asks]},
+        thread_id,
+        served.ref(),
+        {"parentRunId": parent} if parent else {},
+        actor_chain=chain,
     )
+    run_id = created["run_id"]
+    for seq, event in enumerate(_asking_events(run_id, thread_id, asks)):
+        await repo.append_run_event(session, run_id, seq, event)
+    await repo.mark_run_status(session, run_id, "running")
+    await repo.mark_run_status(session, run_id, "completed")
     await session.commit()
-    return thread_id, created["run_id"]
+    return run_id
+
+
+async def _bound_paused_run(souk, session, served, *, chain: list[str], head: str, asks: list[str]):
+    """A run waiting for input, on a thread bound to `chain`."""
+    thread_id = await repo.create_thread(session, served.ref(), head_key=head)
+    run_id = await _run_that_asked(session, served, thread_id, chain=chain, asks=asks)
+    return thread_id, run_id
 
 
 async def test_the_card_is_served_by_pair_and_says_where_the_rpc_is(client, register):
@@ -267,7 +335,7 @@ async def test_a_v10_client_speaks_the_native_vocabulary_with_the_header(client,
     assert task["status"]["state"] == "TASK_STATE_COMPLETED"
 
 
-async def test_offline_target_fails_fast_instead_of_queueing(client, register, session):
+async def test_offline_target_fails_fast_instead_of_queueing(client, register, session, souk):
     """Registered but unattached: nobody is serving it, so the run must end
     rather than wait — `online` is `is_serving`, so this needs no clock
     manipulation."""
@@ -284,16 +352,17 @@ async def test_offline_target_fails_fast_instead_of_queueing(client, register, s
     assert result["status"]["state"] == "failed"
 
     run = (
-        await session.execute(
-            select(runs.c.status, runs.c.metadata).where(runs.c.run_id == result["id"])
-        )
+        await session.execute(select(runs.c.status).where(runs.c.run_id == result["id"]))
     ).mappings().first()
     assert run["status"] == "failed"
-    assert run["metadata"]["failureReason"] == "agent_offline"
+    # The reason is in the run's own terminal RUN_ERROR now: revision 19
+    # deleted `runs.metadata`, and `dispatch` closes an offline run with a
+    # terminal event rather than only telling the caller's stream.
+    assert failure_reason_of(await souk.get_run_events(result["id"])) == "agent_offline"
 
 
 async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
-    client, register, session
+    client, register, session, souk
 ):
     """An unaddressed second send on the same context, even one that
     tries the old metadata.resume=true convention, must not resolve an
@@ -306,14 +375,7 @@ async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
     # Built directly via repo, not through a live send — that would block
     # draining a run nothing ever claims/finishes.
     thread_id = await repo.create_thread(session, served.ref())
-    created = await repo.create_run(session, thread_id, served.ref(), "a2a", {})
-    # Through the legal transitions — the status machine refuses a jump
-    # straight from queued to paused, correctly.
-    await repo.mark_run_status(session, created["run_id"], "running")
-    await repo.mark_run_status(
-        session, created["run_id"], "input-required", metadata={"interrupts": [{"id": "int_1"}]}
-    )
-    await session.commit()
+    asked = await _run_that_asked(session, served, thread_id, chain=None, asks=["int_1"])
 
     second = await client.post(
         f"/a2a/{served.path()}/rpc",
@@ -321,12 +383,14 @@ async def test_a2a_can_never_bypass_a_paused_run_even_with_a_resume_flag(
     )
     assert second.status_code == 200, second.text
     result = second.json()["result"]
-    # Its own run, not a second life for the paused one…
-    assert result["id"] != created["run_id"]
+    # Its own task, not a continuation of the waiting one…
+    assert result["id"] != asked
 
-    # …and the interrupt was not resolved by it: the paused run stands.
-    paused = await repo.get_run(session, created["run_id"])
-    assert paused.status == "input-required"
+    # …and the interrupt was not answered by it: the wait stands. Read
+    # from the events, which is where a wait lives since revision 19 —
+    # and the stray run is not on its lineage.
+    assert open_asks(await souk.get_run_events(asked)) == {"int_1"}
+    assert [r.run_id for r in await souk.lineage(asked)] == [asked]
     assert (
         await session.execute(select(func.count()).select_from(runs))
     ).scalar() == 2
@@ -428,17 +492,19 @@ async def test_cancel_passes_the_request_metadata_through_whole(
 # --- the view proof: reading a chain-bound run ------------------------------
 
 
-async def test_a_bound_run_read_without_a_view_proof_reads_as_absent(
+async def test_a_bound_run_read_without_a_presenter_proof_reads_as_absent(
     client, register, session, souk
 ):
-    """Contract revision 13's exposure, from this door's side. A run whose
-    thread bound a chain is not public any more: a read carrying no view
-    proof is answered *absent*, not refused, because existence is part of
-    what is guarded — a 403 would confirm the run to somebody who may not
-    see it.
+    """Contract revision 13's exposure, from this door's side, now answered
+    by revision 21's one seat. A run whose thread bound a chain is not
+    public: a read that proves no key is answered *absent*, not refused,
+    because existence is part of what is guarded — a 403 would confirm the
+    run to somebody who may not see it.
 
     The same read with a proof from the head succeeds, which is what makes
-    the first answer a decision rather than a broken route.
+    the first answer a decision rather than a broken route. One header
+    does both halves now: `presenter_key_of` feeds `as_reader` for a read
+    exactly as it feeds `verify_caller` for a write.
     """
     head = _Party()
     served = await register("approver")
@@ -448,44 +514,48 @@ async def test_a_bound_run_read_without_a_view_proof_reads_as_absent(
     )
     get_task = {"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}}
 
-    bare = await client.post(f"/a2a/{served.path()}/rpc", json=get_task)
+    bare = await _rpc(client, served, get_task)
 
     assert bare.status_code == 200
     assert "result" not in bare.json(), bare.text
 
-    proven = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json=get_task,
-        headers=head.view_header(run_id, _now()),
-    )
+    proven = await _rpc(client, served, get_task, presenter=head)
 
     assert proven.json()["result"]["id"] == run_id
 
 
-async def test_a_malformed_view_header_is_absence_and_never_a_500(
+async def test_a_malformed_presenter_header_is_absence_and_never_a_500(
     client, register, session, souk
 ):
-    """Garbage in the header must not become a stack trace. Passing
+    """Garbage in the header must not become a stack trace. Proving
     nothing is the designed answer: a caller holding a broken proof learns
     exactly what a caller holding none does, which is the whole point of
-    answering absence."""
+    answering absence. A *stale* proof and one signed over a different
+    body are in the list because they are the two ways a real, honest
+    header goes wrong."""
     head = _Party()
     served = await register("approver")
     _, run_id = await _bound_paused_run(
         souk, session, served, chain=new_chain(head.key), head=head.public_key, asks=["ask_1"]
     )
+    get_task = {"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}}
+    raw = json.dumps(get_task).encode()
 
-    for header in ("not json at all", "[]", '{"publicKey": "nope"}', ""):
-        resp = await client.post(
-            f"/a2a/{served.path()}/rpc",
-            json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
-            headers={"X-Funduq-View": header},
-        )
+    broken = [
+        {PRESENTER_HEADER: "not json at all"},
+        {PRESENTER_HEADER: "[]"},
+        {PRESENTER_HEADER: '{"publicKey": "nope"}'},
+        {PRESENTER_HEADER: ""},
+        head.presenter_header(raw, _now() - 3600),
+        head.presenter_header(b"some other request"),
+    ]
+    for header in broken:
+        resp = await _rpc(client, served, get_task, header=header)
         assert resp.status_code == 200, (header, resp.text)
         assert "result" not in resp.json(), (header, resp.text)
 
 
-async def test_a_mid_chain_hop_may_view_the_run_it_may_not_cancel(
+async def test_a_mid_chain_hop_may_read_the_run_it_may_not_cancel(
     client, register, session, souk
 ):
     """The read circle is wider than the act circle, and one key proves
@@ -506,16 +576,18 @@ async def test_a_mid_chain_hop_may_view_the_run_it_may_not_cancel(
     )
     now = _now()
 
-    seen = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
-        headers=mid.view_header(run_id, now),
+    seen = await _rpc(
+        client,
+        served,
+        {"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
+        presenter=mid,
     )
     assert seen.json()["result"]["id"] == run_id, seen.text
 
-    refused = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json={
+    refused = await _rpc(
+        client,
+        served,
+        {
             "jsonrpc": "2.0",
             "id": "10",
             "method": "tasks/cancel",
@@ -542,7 +614,8 @@ async def test_a_paused_run_says_what_it_is_waiting_on(client, register, session
     the asks it answers, so a caller that cannot enumerate them has no
     proof to build — the pause would be unanswerable by anyone who was not
     already watching the stream that announced it. A2A has no field for
-    them, so this door puts them on the Task's metadata."""
+    them, so this door puts them under `metadata.funduq` — beside core's
+    own keys, where everything that is visibly not A2A's now lives."""
     head = _Party()
     served = await register("approver")
     _, run_id = await _bound_paused_run(
@@ -553,16 +626,27 @@ async def test_a_paused_run_says_what_it_is_waiting_on(client, register, session
         head=head.public_key,
         asks=["ask_1", "ask_2"],
     )
+    # An event A2A has no mapping for, so core writes its own
+    # `metadata.funduq.agui_events` beside what this door adds — which is
+    # what makes the merge below a real assertion and not a tautology.
+    async with souk.session() as writing:
+        await repo.append_run_event(writing, run_id, 9, {"type": "CUSTOM_STEP", "name": "x"})
+        await writing.commit()
 
-    resp = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json={"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
-        headers=head.view_header(run_id, _now()),
+    resp = await _rpc(
+        client,
+        served,
+        {"jsonrpc": "2.0", "id": "9", "method": "tasks/get", "params": {"id": run_id}},
+        presenter=head,
     )
 
-    task = resp.json()["result"]
+    ours = resp.json()["result"]["metadata"][OBSERVED_METADATA_KEY]
     # Sorted, the order `resolve_payload` canonicalizes in.
-    assert task["metadata"][OUTSTANDING_ASKS_METADATA_KEY] == ["ask_1", "ask_2"]
+    assert ours[OUTSTANDING_ASKS_METADATA_KEY] == ["ask_1", "ask_2"]
+    # Merged, not assigned over: core's own keys are still there. A
+    # protobuf Struct field is replaced wholesale, so a plain update here
+    # would silently drop everything core wrote under the same key.
+    assert [e["type"] for e in ours["agui_events"]] == ["CUSTOM_STEP"]
 
 
 async def test_a_resolution_signing_the_right_asks_is_accepted(
@@ -578,9 +662,10 @@ async def test_a_resolution_signing_the_right_asks_is_accepted(
         souk, session, served, chain=chain, head=head.public_key, asks=["ask_1", "ask_2"]
     )
 
-    resp = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json=_v03_send(
+    resp = await _rpc(
+        client,
+        served,
+        _v03_send(
             "approved",
             context_id=thread_id,
             task_id=run_id,
@@ -592,14 +677,17 @@ async def test_a_resolution_signing_the_right_asks_is_accepted(
                 "resolution": head.resolution(run_id, ["ask_1", "ask_2"]),
             },
         ),
+        presenter=head,
     )
 
     assert resp.status_code == 200, resp.text
     assert "error" not in resp.json(), resp.text
-    # The same run continuing, not a new one queued behind it.
+    # The same *task* continuing: revision 19 made the answer a new run
+    # with `parentRunId`, and the task keeps the root's id throughout.
     assert resp.json()["result"]["id"] == run_id
-    reopened = await repo.get_run(session, run_id)
-    assert reopened.status != "input-required"
+    lineage = await souk.lineage(run_id)
+    assert [r.run_id for r in lineage][0] == run_id
+    assert len(lineage) == 2 and lineage[1].parent_run_id == run_id
 
 
 @pytest.mark.parametrize(
@@ -625,9 +713,10 @@ async def test_a_resolution_signing_the_wrong_asks_is_refused(
         souk, session, served, chain=chain, head=head.public_key, asks=["ask_1", "ask_2"]
     )
 
-    resp = await client.post(
-        f"/a2a/{served.path()}/rpc",
-        json=_v03_send(
+    resp = await _rpc(
+        client,
+        served,
+        _v03_send(
             "approved",
             context_id=thread_id,
             task_id=run_id,
@@ -640,8 +729,114 @@ async def test_a_resolution_signing_the_wrong_asks_is_refused(
                 "resolution": head.resolution(run_id, asks),
             },
         ),
+        presenter=head,
     )
 
     assert "result" not in resp.json(), resp.text
-    still_paused = await repo.get_run(session, run_id)
-    assert still_paused.status == "input-required"
+    # Nothing opened under it, and the wait still stands.
+    assert [r.run_id for r in await souk.lineage(run_id)] == [run_id]
+    assert open_asks(await souk.get_run_events(run_id)) == {"ask_1", "ask_2"}
+
+
+async def test_a_chain_presented_without_the_header_is_a_401(client, register, session):
+    """The A2A half of revision 21's refusal. `PresenterRequired` leaves
+    A2A's vocabulary on purpose: authentication is the transport's
+    business — the header is not in A2A's vocabulary, so neither is its
+    absence — and a JSON-RPC internal error inside a 200 would report a
+    missing credential as a server fault.
+
+    Sent in the v1.0 vocabulary, like the 429 above and for the same
+    reason: a2a-sdk's v0.3 compatibility adapter converts *every*
+    exception, `HTTPException` included, into a JSON-RPC internal error,
+    so a status can only escape on the native path."""
+    head = _Party()
+    served = await register("approver")
+
+    resp = await client.post(
+        f"/a2a/{served.path()}/rpc",
+        headers={"A2A-Version": "1.0"},
+        json={
+            "jsonrpc": "2.0",
+            "id": "3",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}],
+                    "messageId": "m1",
+                },
+                "metadata": {"actorChain": new_chain(head.key)},
+            },
+        },
+    )
+
+    assert resp.status_code == 401, resp.text
+
+
+async def test_the_presenter_must_be_the_chains_last_hop(client, register):
+    """A proof that verifies is not a proof that fits. `mid` holds a real
+    key and signs a real header, but the chain it presents ends at
+    somebody else — which is precisely the impersonation the presenter
+    check exists to catch, and it is core's `InvalidChain`, not this
+    gateway's to pre-empt."""
+    head, mid = _Party(), _Party()
+    served = await register("approver")
+
+    resp = await _rpc(
+        client,
+        served,
+        _v03_send("hi", metadata={"actorChain": new_chain(head.key)}),
+        presenter=mid,
+    )
+
+    # Not a 401 escape: the chain is bad, not the authentication, so it
+    # travels as the JSON-RPC error the dispatcher makes of it.
+    assert "result" not in resp.json(), resp.text
+
+
+async def test_a_resolution_answering_a_second_pause_signs_the_task_id(
+    client, register, session, souk
+):
+    """The one that a first-turn test passes by accident.
+
+    Revision 19 made an answer a **new run** with `parentRunId`, and made
+    the A2A task id the lineage's **root**. `open_run` verifies the
+    resolution over `repo.root_of(the asking run)` — so on a first pause,
+    where root and asking run are the same id, signing either works and
+    proves nothing. On the second pause they differ, and only the task id
+    verifies: a caller signing the run that actually asked is refused.
+
+    Both proofs cover the same, correct ask ids — the tail's — so the
+    only variable is which id the payload names.
+    """
+    head = _Party()
+    served = await register("approver")
+    chain = new_chain(head.key)
+    thread_id = await repo.create_thread(session, served.ref(), head_key=head.public_key)
+    task_id = await _run_that_asked(session, served, thread_id, chain=chain, asks=["ask_1"])
+    tail = await _run_that_asked(
+        session, served, thread_id, chain=chain, asks=["ask_2"], parent=task_id
+    )
+    assert tail != task_id
+
+    def answer(resolution: dict) -> dict:
+        return _v03_send(
+            "approved",
+            context_id=thread_id,
+            task_id=task_id,
+            metadata={"actorChain": chain, "resolution": resolution},
+        )
+
+    # Signed over the run that asked — the id a pre-revision-19 caller
+    # would have used, and the one this test exists to catch.
+    wrong = await _rpc(client, served, answer(head.resolution(tail, ["ask_2"])), presenter=head)
+    assert "result" not in wrong.json(), wrong.text
+    assert [r.run_id for r in await souk.lineage(task_id)] == [task_id, tail]
+
+    right = await _rpc(
+        client, served, answer(head.resolution(task_id, ["ask_2"])), presenter=head
+    )
+    assert "error" not in right.json(), right.text
+    assert right.json()["result"]["id"] == task_id
+    lineage = await souk.lineage(task_id)
+    assert len(lineage) == 3 and lineage[2].parent_run_id == tail

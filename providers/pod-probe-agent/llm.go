@@ -137,20 +137,30 @@ func (c *LLMClient) endpoint(kyok *KyokToken, body []byte) (string, map[string]s
 // forwardedProps, or returns nil if the caller did not opt this run in. The
 // token is the only thing souk forwards there, deliberately.
 func extractKyokToken(input json.RawMessage) *KyokToken {
+	// Everything funduq adds to forwardedProps sits under its own key
+	// since contract revision 18 — `forwardedProps.funduq.kyok`, not
+	// `forwardedProps.kyok`. Reading the old path does not fail: it finds
+	// nothing, returns no token, and this agent quietly answers without a
+	// model, which is the same shape as a caller who never opted in. The
+	// vectors are what tell the two apart, so the delivered-run frame in
+	// docs/upstream-contract-vectors.json is replayed through this
+	// function in wire_test.go.
 	var parsed struct {
 		ForwardedProps struct {
-			Kyok struct {
-				Token string `json:"token"`
-			} `json:"kyok"`
+			Funduq struct {
+				Kyok struct {
+					Token string `json:"token"`
+				} `json:"kyok"`
+			} `json:"funduq"`
 		} `json:"forwardedProps"`
 	}
 	if err := json.Unmarshal(input, &parsed); err != nil {
 		return nil
 	}
-	if parsed.ForwardedProps.Kyok.Token == "" {
+	if parsed.ForwardedProps.Funduq.Kyok.Token == "" {
 		return nil
 	}
-	return &KyokToken{Token: parsed.ForwardedProps.Kyok.Token}
+	return &KyokToken{Token: parsed.ForwardedProps.Funduq.Kyok.Token}
 }
 
 func truncate(s string, n int) string {

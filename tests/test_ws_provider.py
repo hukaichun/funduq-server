@@ -38,6 +38,7 @@ from httpx_ws import WebSocketDisconnect, aconnect_ws
 from httpx_ws.transport import ASGIWebSocketTransport
 
 import funduq_contract
+from funduq.pause import failure_reason_of
 from funduq_provider_sdk import verify_signature
 from souk_server import ws_provider
 from souk_server.handshake import WIRE_VERSION, funduq_connect_payload, new_nonce
@@ -491,8 +492,10 @@ async def test_a_reasoned_decline_fails_the_run_with_the_reason_recorded(souk):
                     await asyncio.sleep(0.01)
             await socket.expect_nothing()
 
-        stored = await souk.get_run(handle.run_id)
-        assert stored.metadata["failureReason"] == (
+        # The reason is read from the run's own terminal RUN_ERROR, not
+        # from a metadata column: revision 19 deleted `runs.metadata`, and
+        # `pause.failure_reason_of` is where the answer moved.
+        assert failure_reason_of(await souk.get_run_events(handle.run_id)) == (
             "input does not validate as RunAgentInput: probe"
         )
         assert souk.broker.get(handle.run_id) is None
@@ -604,8 +607,10 @@ async def test_a_dropped_socket_fails_the_run_it_was_holding_and_a_reconnect_ser
             while (await souk.get_run(handle.run_id)).status != "failed":
                 await asyncio.sleep(0.01)
         assert souk.broker.get(handle.run_id) is None
-        stored = await souk.get_run(handle.run_id)
-        assert stored.metadata["failureReason"] == "provider_left_holding_it"
+        assert (
+            failure_reason_of(await souk.get_run_events(handle.run_id))
+            == "provider_left_holding_it"
+        )
 
         async with _connect(client) as ws:
             socket = await _handshake(ws, souk, identity, "greeter")
@@ -740,17 +745,30 @@ async def _query(socket: _Socket, **params) -> dict:
     return frame
 
 
-async def _thread_with_messages(souk, ref, contents: list[str]) -> str:
+async def _thread_with_messages(souk, ref, contents: list[str], *, bound_to=None) -> str:
+    """A thread with some history. `bound_to` is a chain, and binds the
+    thread to its head the way a chained caller's first run does."""
     from funduq import repo
 
-    thread_id = await souk.create_thread(ref)
+    async with souk.session() as binding:
+        thread_id = await repo.create_thread(
+            binding,
+            ref,
+            head_key=funduq_contract.verify_chain(bound_to).head if bound_to else None,
+        )
+        await binding.commit()
     async with souk.session() as session:
-        run = await repo.create_run(session, thread_id, ref, "ag-ui", {})
+        run = await repo.create_run(session, thread_id, ref, {}, actor_chain=bound_to)
         await repo.append_thread_messages(
             session,
             thread_id,
             run["run_id"],
-            [{"role": "user", "content": c} for c in contents],
+            # Stamped the way a door stamps them: funduq mints the ids,
+            # and `append_thread_messages` now writes the id it is given.
+            repo.stamp_messages([{"role": "user", "content": c} for c in contents]),
+            # Revision 19 records who said each message. These are the
+            # caller's, carried in with the run.
+            origin="caller",
         )
         await session.commit()
     return thread_id
@@ -788,6 +806,32 @@ async def test_limit_is_applied_by_funduq_not_by_the_caller(souk, register):
 
             # The most recent, because context is wanted from the recent end.
             assert [m["content"] for m in answer["result"]] == ["4", "5"]
+
+
+async def test_a_thread_read_goes_through_the_readers_own_key(souk, register, new_identity):
+    """Revision 21 made reading one surface — `Funduq.as_reader(key)` —
+    and a provider reads as the key it proved at the handshake. This is
+    that key travelling: the thread is bound to a responsibility segment,
+    which `readers_of` closes to its parties, and the serving provider is
+    one of them. Read as nobody (`as_reader(None)`, which is what passing
+    the wrong key or none would amount to) the same thread answers
+    absence, so a socket that dropped the key on the floor would fail
+    here rather than quietly reading everything.
+    """
+    served = await register("greeter")
+    caller = new_identity()
+    thread_id = await _thread_with_messages(
+        souk, served.ref(), ["one"], bound_to=[caller.sign_hop()]
+    )
+
+    assert await souk.as_reader(None).thread_messages(thread_id) == []
+
+    async with _provider_client(souk) as ws_client:
+        async with _connect(ws_client) as ws:
+            socket = await _handshake(ws, souk, served.identity, "greeter")
+            answer = await _query(socket, threadId=thread_id)
+
+            assert [m["content"] for m in answer["result"]] == ["one"]
 
 
 async def test_a_provider_cannot_read_a_thread_that_is_not_its_own(souk, register):

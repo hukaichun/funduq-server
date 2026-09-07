@@ -22,7 +22,12 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.ui.ag_ui import AGUIAdapter
 from souk_agent_sdk import AgentHandle, KyokSigningAuth, SoukProvider
-from souk_agent_sdk.identity import load_or_create_identity, new_actor_chain, public_key_hex
+from souk_agent_sdk.identity import (
+    load_or_create_identity,
+    new_actor_chain,
+    provider_identity,
+    public_key_hex,
+)
 
 from pydantic_ai_agent.config import AgentConfig, load_config
 from pydantic_ai_agent.souk_tools import build_souk_tools
@@ -155,6 +160,12 @@ def make_run_stream(
             thread_id=run_input.get("threadId"),
             run_id=run_input.get("runId"),
             actor_chain=actor_chain,
+            # The chain and the proof that this process holds the key it
+            # names are two halves of one credential since contract
+            # revision 21 — built from the same signing key, handed over
+            # together, because a chain without the proof is a call the
+            # gateway is required to refuse.
+            identity=provider_identity(signing_key),
             # Per parent conversation, not per run — see AgentDeps. One
             # conversation with this agent is one conversation with each
             # of its sub-agents, which is what a person would assume and

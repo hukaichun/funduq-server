@@ -258,6 +258,16 @@ class SoukProvider(FunduqLink):
         """This thread's messages, oldest first — the one thing a provider
         cannot work out for itself.
 
+        **Not an upstream link verb.** `FunduqLink.thread_messages` left
+        the ABC at contract revision 21: reading the record is no longer
+        the link's job, and in-process a provider reads through
+        `Funduq.as_reader(its key)` instead. The `query`/`queryResult`
+        frame pair this method rides is *this repo's* wire, defined in
+        docs/server-mode.md, and the gateway answers it out of the same
+        read surface as the key this link proved at the handshake. So:
+        implement nothing upstream against this signature, and expect no
+        upstream vector for it.
+
         What arrives in `run_input` is exactly what the *caller* sent for
         this run: an AG-UI client resends its whole history every turn,
         while A2A's `message/send` carries one message. The same agent

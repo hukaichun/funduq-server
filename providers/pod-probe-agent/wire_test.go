@@ -24,7 +24,7 @@ import (
 //   - docs/wire-vectors.json: this repo's frame vocabulary + handshake
 //     version.
 //   - docs/upstream-contract-vectors.json: upstream funduq's payload
-//     vectors, vendored verbatim at contract revision 17.
+//     vectors, vendored verbatim at contract revision 21.
 
 func repoRoot(t *testing.T) string {
 	// providers/pod-probe-agent -> repo root
@@ -105,7 +105,7 @@ func TestHandshakeVersionAndVocabulary(t *testing.T) {
 // singular-act family, which this binary does not sign today but keeps
 // byte-exact so a reshape upstream is caught here.
 //
-// Every kind published at revision 17 is replayed — there is no longer a
+// Every kind published at revision 21 is replayed — there is no longer a
 // vector this file skips. `delegation` is gone from the file entirely
 // (revision 15 deleted the certificate and the funduq-delegate tag with
 // it), and `resolution` changed shape at 16: an ask hash where a
@@ -140,8 +140,8 @@ func TestContractVectors(t *testing.T) {
 	if err := json.Unmarshal(data, &cf); err != nil {
 		t.Fatal(err)
 	}
-	if cf.Contract.Revision != 17 {
-		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 17 — re-read the changelog before bumping", cf.Contract.Revision)
+	if cf.Contract.Revision != 21 {
+		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 21 — re-read the changelog before bumping", cf.Contract.Revision)
 	}
 
 	testKey := ed25519.NewKeyFromSeed(mustHex(t, cf.TestKey.PrivateHex))
@@ -301,4 +301,50 @@ func mustHex(t *testing.T, s string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// The delivered-run frame upstream publishes, replayed through this
+// binary's own reader. This is the test that would have caught contract
+// revision 18 renesting funduq's additions under `forwardedProps.funduq`:
+// reading the old path does not error, it finds nothing, and the agent
+// answers without a model — indistinguishable from a caller who never
+// opted in to KYOK. A shape change that turns a feature off silently is
+// exactly what a vector is for, so the published frame goes through
+// extractKyokToken rather than being compared field by field.
+func TestDeliveredRunVectorYieldsItsKyokToken(t *testing.T) {
+	data := mustRead(t, "docs", "upstream-contract-vectors.json")
+	var cf struct {
+		Wire []struct {
+			Kind  string          `json:"kind"`
+			Frame json.RawMessage `json:"frame"`
+		} `json:"wire"`
+	}
+	if err := json.Unmarshal(data, &cf); err != nil {
+		t.Fatalf("vectors do not parse: %v", err)
+	}
+
+	var found bool
+	for _, w := range cf.Wire {
+		if w.Kind != "delivered-run" {
+			continue
+		}
+		found = true
+		var frame struct {
+			RunInput json.RawMessage `json:"runInput"`
+		}
+		if err := json.Unmarshal(w.Frame, &frame); err != nil {
+			t.Fatalf("delivered-run frame does not parse: %v", err)
+		}
+		tok := extractKyokToken(frame.RunInput)
+		if tok == nil {
+			t.Fatal("published delivered-run frame carries a kyok grant and this binary read none — " +
+				"forwardedProps layout moved; see contract-changelog revision 18")
+		}
+		if tok.Token == "" {
+			t.Error("kyok token read as empty from the published frame")
+		}
+	}
+	if !found {
+		t.Fatal("no delivered-run entry in the vendored vectors")
+	}
 }
