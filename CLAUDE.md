@@ -104,10 +104,10 @@ catches all of it; "verified end to end" is a claim about one path.
   finalise a fixture from a different task than it set up in, which a
   cancel scope cannot survive.
 
-## Upstream's contract (currently revision 21)
+## Upstream's contract (currently revision 22)
 
-The pin is `funduq` 0.0.9, `funduq-provider-sdk[llm]` 0.0.9,
-`funduq-contract` 0.0.11. Read
+The pin is `funduq` 0.0.10, `funduq-provider-sdk[llm]` 0.0.9,
+`funduq-contract` 0.0.12. Read
 [upstream's `docs/contract-changelog.md`](https://github.com/hukaichun/funduq/blob/main/docs/contract-changelog.md)
 before moving it: it says what an implementation must change, which
 commit subjects cannot. These bite in ways a green suite does not always
@@ -164,15 +164,21 @@ catch first:
   message's own metadata. **Merge into `metadata.funduq`, never assign**:
   a protobuf `Struct` is replaced wholesale, so assigning drops core's
   own keys silently.
-- **Reads go through `Funduq.as_reader(key)`** (revision 21);
-  `FunduqLink.thread_messages` left the ABC. This repo keeps its
-  `query`/`queryResult` frames — the wire is ours, core only stopped
-  requiring the verb — backed by `as_reader(public_key)` **behind** the
-  existing "a provider may only read threads for agents it serves" check.
-  Core's circle is the weaker one (an unbound thread is readable by
-  anyone holding its id), and the two compose because both answer "not
-  yours" and "no such thread" identically. The old subset-of-
-  `__abstractmethods__` assertion is deleted, not repaired.
+- **Who may read is *ours* now** (revision 22). `Funduq.as_reader` and
+  the `Reader` class are gone; core answers `parties_of(thread_id)` — the
+  circle, or `None` — and the rule lives in `souk_server/reads.py`,
+  called by the three A2A read operations and the provider socket's
+  `thread_messages` query. Two traps it exists to hold: **`parties_of`
+  spells "unbound" and "no such thread" both as `None`** (revision 21's
+  `Reader` admitted the first and denied the second, so the convenient
+  reading makes every id that names nothing readable by anyone), and
+  **nothing goes red if a door simply stops calling it** — the tests that
+  cover it are `tests/test_reads.py` plus the read-scope tests in
+  `tests/test_api_a2a.py`, and each one was checked by neutering
+  `may_read` and watching it fail. `FunduqLink.thread_messages` left the
+  ABC at revision 21; the `query`/`queryResult` frames stay, because the
+  wire is ours and core only stopped requiring the verb. The old
+  subset-of-`__abstractmethods__` assertion is deleted, not repaired.
 - **Migrating deletes history.** `python -m funduq.migrate` to revision
   `a1f4c9d27e3b` **drops every row in `runs`, `run_events` and
   `thread_messages`** by design. `docker compose up` runs it.

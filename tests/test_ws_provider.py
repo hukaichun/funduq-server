@@ -42,6 +42,7 @@ from funduq.pause import failure_reason_of
 from funduq_provider_sdk import verify_signature
 from souk_server import ws_provider
 from souk_server.handshake import WIRE_VERSION, funduq_connect_payload, new_nonce
+from souk_server.reads import may_read
 from souk_server.server import create_app
 
 from tests.conftest import Identity
@@ -809,14 +810,16 @@ async def test_limit_is_applied_by_funduq_not_by_the_caller(souk, register):
 
 
 async def test_a_thread_read_goes_through_the_readers_own_key(souk, register, new_identity):
-    """Revision 21 made reading one surface — `Funduq.as_reader(key)` —
-    and a provider reads as the key it proved at the handshake. This is
-    that key travelling: the thread is bound to a responsibility segment,
-    which `readers_of` closes to its parties, and the serving provider is
-    one of them. Read as nobody (`as_reader(None)`, which is what passing
-    the wrong key or none would amount to) the same thread answers
-    absence, so a socket that dropped the key on the floor would fail
-    here rather than quietly reading everything.
+    """A provider reads as the key it proved at the handshake.
+
+    This is that key travelling: the thread is bound to a responsibility
+    segment, which closes it to its parties, and the serving provider is
+    one of them. Read as nobody — which is what passing the wrong key or
+    none would amount to — the same thread is refused, so a socket that
+    dropped the key on the floor would fail here rather than quietly
+    reading everything. Revision 22 moved the rule out of core and into
+    `souk_server.reads`; what it admits did not change, and this test did
+    not either, beyond which object it asks.
     """
     served = await register("greeter")
     caller = new_identity()
@@ -824,7 +827,7 @@ async def test_a_thread_read_goes_through_the_readers_own_key(souk, register, ne
         souk, served.ref(), ["one"], bound_to=[caller.sign_hop()]
     )
 
-    assert await souk.as_reader(None).thread_messages(thread_id) == []
+    assert await may_read(souk, thread_id, None) is False
 
     async with _provider_client(souk) as ws_client:
         async with _connect(ws_client) as ws:

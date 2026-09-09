@@ -94,6 +94,7 @@ from a2a.server.events.event_queue import Event
 from a2a.server.routes.jsonrpc_dispatcher import JsonRpcDispatcher
 from a2a.types import a2a_pb2 as pb
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
+from a2a.utils.errors import TaskNotFoundError
 from fastapi import APIRouter, Depends, Request
 from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
@@ -109,6 +110,7 @@ from funduq.props import OBSERVED_METADATA_KEY
 from souk_server.config import ServingSettings
 from souk_server.deps import get_serving_settings, get_souk, resolve_ref
 from souk_server.presenter import PRESENTER_HEADER, presenter_key_of
+from souk_server.reads import may_read
 
 logger = logging.getLogger("souk.api_a2a")
 
@@ -176,11 +178,13 @@ def _presenter_key_of(body: bytes) -> Callable[[ServerCallContext], str | None]:
     another call, which is the property that makes a captured header
     worthless.
 
-    Nothing here judges *whether* the key may do what the request asks.
-    An unproven read answers absence; a chain whose last hop is not this
-    key is `InvalidChain`; a chain with no proof at all is
-    `PresenterRequired`. All three are core's to say, and saying any of
-    them twice would eventually say them differently.
+    Nothing *here* judges whether the key may do what the request asks:
+    this function's whole job is to say who is asking. A chain whose last
+    hop is not this key is `InvalidChain` and a chain with no proof at all
+    is `PresenterRequired` — both core's to say, and saying either twice
+    would eventually say it differently. What a read is allowed to see
+    stopped being core's at revision 22 and is answered in one place on
+    this side, `souk_server.reads.may_read`, off the parties core derives.
     """
 
     def read(context: ServerCallContext) -> str | None:
@@ -233,15 +237,18 @@ async def _annotate_asks(funduq: Funduq, task: pb.Task | None) -> pb.Task | None
 
 
 class SoukA2ARequestHandler(A2ARequestHandler):
-    """Upstream's handler, plus the two things a transport owns.
+    """Upstream's handler, plus the three things a transport owns.
 
     Everything about *A2A* is inherited — the protobuf conversions, the
     parameter validation, the configuration mapping, which operations are
-    offered. What is overridden is the pair of decisions that are
-    genuinely this gateway's: which funduq errors escape as HTTP statuses
-    rather than as JSON-RPC errors inside a 200, and surfacing a paused
-    run's ask ids, which A2A has no field for and a caller cannot proceed
-    without.
+    offered. What is overridden is the decisions that are genuinely this
+    gateway's: which funduq errors escape as HTTP statuses rather than as
+    JSON-RPC errors inside a 200; surfacing a paused run's ask ids, which
+    A2A has no field for and a caller cannot proceed without; and, since
+    contract revision 22, **who may read** — core answers only who the
+    parties are (`Funduq.parties_of`) and leaves the rule to the door, so
+    the three read operations gate on `souk_server.reads.may_read`. The
+    rule is revision 21's, unchanged; what moved is where it is written.
     """
 
     def __init__(self, funduq: Funduq, agent: AgentRef, body: bytes) -> None:
@@ -280,20 +287,76 @@ class SoukA2ARequestHandler(A2ARequestHandler):
     async def on_get_task(
         self, params: pb.GetTaskRequest, context: ServerCallContext
     ) -> pb.Task | None:
-        # None means not-this-agent's, or a bound run read without a valid
-        # view proof — indistinguishable from not-found, which is the
-        # point. An id naming nothing at all raises A2A's own
-        # TaskNotFoundError inside the adapter.
-        return await _annotate_asks(
-            self._funduq, await super().on_get_task(params, context)
-        )
+        """One task, for a party to its thread.
+
+        `None` means not-this-agent's, or a bound task read by a stranger
+        — indistinguishable from not-found, which is the point. An id
+        naming nothing at all raises A2A's own `TaskNotFoundError` inside
+        the adapter.
+
+        Gated on the way *out*, off the Task's own `context_id`, which is
+        the thread id core just resolved. Doing the work and withholding
+        the answer costs a read of a record this process already holds and
+        saves a second way of getting from a task id to a thread id — and
+        two ways to answer one question is how the answers start
+        disagreeing.
+        """
+        task = await super().on_get_task(params, context)
+        if task is not None and not await may_read(
+            self._funduq, task.context_id, self._presenter_key(context)
+        ):
+            return None
+        return await _annotate_asks(self._funduq, task)
 
     async def on_cancel_task(
         self, params: pb.CancelTaskRequest, context: ServerCallContext
     ) -> pb.Task | None:
+        # Not gated here: cancelling is an *act*, and its own proof
+        # governs it (`authorize_cancel` upstream). The Task it hands back
+        # is the snapshot the act was made against, so a caller entitled
+        # to stop a run is entitled to see what it stopped.
         return await _annotate_asks(
             self._funduq, await super().on_cancel_task(params, context)
         )
+
+    async def on_subscribe_to_task(
+        self, params: pb.SubscribeToTaskRequest, context: ServerCallContext
+    ) -> AsyncGenerator[Event]:
+        """Reattach to a task's stream — for a party to its thread.
+
+        Gated *before* delegating, because the refusal has to be the same
+        shape as "there is no such task": `TaskNotFoundError` is what the
+        adapter raises for an id naming nothing, and existence is part of
+        what is guarded. A run this door cannot find is left to the
+        adapter to refuse in its own words rather than pre-empted here.
+        """
+        run = await self._funduq.get_run(params.id)
+        if run is not None and not await may_read(
+            self._funduq, run.thread_id, self._presenter_key(context)
+        ):
+            raise TaskNotFoundError(f"no task '{params.id}' for this agent")
+        async for event in super().on_subscribe_to_task(params, context):
+            yield event
+
+    async def on_list_tasks(
+        self, params: pb.ListTasksRequest, context: ServerCallContext
+    ) -> pb.ListTasksResponse:
+        """The tasks of one thread — named by holding its id, seen by being a party.
+
+        Two rules, and A2A §3.1.4 only states the first. Holding the
+        `contextId` is what makes a thread's tasks *addressable*: without
+        one nothing is named and the page is empty, which is upstream's
+        answer and stays. Whether the caller may see what it named is this
+        door's, and an empty page is how it says no — the same answer a
+        thread with no tasks gives, which is the point.
+        """
+        if params.context_id and not await may_read(
+            self._funduq, params.context_id, self._presenter_key(context)
+        ):
+            return pb.ListTasksResponse(
+                tasks=[], next_page_token="", page_size=0, total_size=0
+            )
+        return await super().on_list_tasks(params, context)
 
 
 # The path comes from a2a.utils.constants rather than being typed here, for

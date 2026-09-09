@@ -30,7 +30,7 @@ license-files = ["LICENSE"]
 # revision inside the 0.0.x line; docs/contract-changelog.md upstream is
 # the record to read before widening these.
 dependencies = [
-    "funduq>=0.0.9,<0.1",
+    "funduq>=0.0.10,<0.1",
     # The AG-UI wire model both ends of every run frame validate against.
     # Pinned with a floor here, and not left to whatever each subproject's
     # lock happened to resolve: `funduq-contract` floors it at >=0.1, and
@@ -47,7 +47,7 @@ dependencies = [
     "funduq-provider-sdk[llm]>=0.0.9,<0.1",
     # The signing vocabulary both ends verify: connect payloads, actor
     # chains, CONTRACT_REVISION.
-    "funduq-contract>=0.0.11,<0.1",
+    "funduq-contract>=0.0.12,<0.1",
     "fastapi>=0.115",
     # ServingSettings reads SOUK_* from the environment; funduq's own
     # CoreSettings stopped being a settings model, so nothing upstream
