@@ -212,6 +212,13 @@ Breaking one has caused a real bug here or upstream.
 
 ## Where the design lives
 
+`docs/authorization.md` — who may do what, at every door, and which of
+three layers can answer it (core's record facts, this gateway's
+who-is-at-the-door, the deployment's entitlement — the last of which has
+no expression here yet). Read it before adding a door, or a check to one:
+it is what stops a hard-coded default being mistaken for a rule nobody
+had to choose.
+
 `docs/server-mode.md` — the wire, the MCP docent, the DB boundary, and
 the decisions that were tried and rejected. Read it before changing the
 frame protocol, the docent's surface, or anything about persistence; if
