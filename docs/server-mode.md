@@ -1069,6 +1069,9 @@ anyone else it does not exist. The read circle is still wider than the
 act circle, and it is still stated once.
 
 **Where that once is, is what revision 22 changed** — and only that.
+The whole inventory of who decides what, across every door this gateway
+serves, is [`docs/authorization.md`](authorization.md); this section is
+the read row of it.
 Core answers `Funduq.parties_of(thread_id)` and stops; the rule reading
 that answer is `souk_server/reads.py:may_read`, and the three read
 operations above are its only callers on the A2A door (the provider
@@ -1405,7 +1408,10 @@ would be worse than the limit.
   `GET /threads/{id}`, `GET /threads/{id}/tree` and the MCP docent go
   through the unchecked facade rather than `souk_server.reads.may_read`,
   which the A2A door and the provider socket both call. See "MCP: the
-  docent" above; it is an open decision, not a finished one.
+  docent" above; it is an open decision, not a finished one, and
+  [`docs/authorization.md`](authorization.md) is where it sits in the
+  larger picture — one of four doors whose real question belongs to a
+  layer this repo has no way to express yet.
 
 ## Where examples live
 
