@@ -24,7 +24,7 @@ import (
 //   - docs/wire-vectors.json: this repo's frame vocabulary + handshake
 //     version.
 //   - docs/upstream-contract-vectors.json: upstream funduq's payload
-//     vectors, vendored verbatim at contract revision 22.
+//     vectors, vendored verbatim at contract revision 23.
 
 func repoRoot(t *testing.T) string {
 	// providers/pod-probe-agent -> repo root
@@ -105,7 +105,7 @@ func TestHandshakeVersionAndVocabulary(t *testing.T) {
 // singular-act family, which this binary does not sign today but keeps
 // byte-exact so a reshape upstream is caught here.
 //
-// Every kind published at revision 22 is replayed — there is no longer a
+// Every kind published at revision 23 is replayed — there is no longer a
 // vector this file skips. `delegation` is gone from the file entirely
 // (revision 15 deleted the certificate and the funduq-delegate tag with
 // it), and `resolution` changed shape at 16: an ask hash where a
@@ -140,8 +140,8 @@ func TestContractVectors(t *testing.T) {
 	if err := json.Unmarshal(data, &cf); err != nil {
 		t.Fatal(err)
 	}
-	if cf.Contract.Revision != 22 {
-		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 22 — re-read the changelog before bumping", cf.Contract.Revision)
+	if cf.Contract.Revision != 23 {
+		t.Fatalf("vendored vectors are contract revision %d; this binary is written against 23 — re-read the changelog before bumping", cf.Contract.Revision)
 	}
 
 	testKey := ed25519.NewKeyFromSeed(mustHex(t, cf.TestKey.PrivateHex))
@@ -303,48 +303,47 @@ func mustHex(t *testing.T, s string) []byte {
 	return b
 }
 
-// The delivered-run frame upstream publishes, replayed through this
-// binary's own reader. This is the test that would have caught contract
-// revision 18 renesting funduq's additions under `forwardedProps.funduq`:
-// reading the old path does not error, it finds nothing, and the agent
-// answers without a model — indistinguishable from a caller who never
-// opted in to KYOK. A shape change that turns a feature off silently is
-// exactly what a vector is for, so the published frame goes through
-// extractKyokToken rather than being compared field by field.
+// The delivered-run envelope, replayed through this binary's own reader.
+// This is the test that would have caught contract revision 18 renesting
+// funduq's additions under `forwardedProps.funduq`: reading the old path
+// does not error, it finds nothing, and the agent answers without a model
+// — indistinguishable from a caller who never opted in to KYOK. A shape
+// change that turns a feature off silently is exactly what a vector is
+// for, so the frame goes through extractKyokToken rather than being
+// compared field by field.
+//
+// The envelope is wire-vectors.json's since contract revision 23, which
+// deleted upstream's `wire` section on the rule that an entry is published
+// there because getting it wrong fails a signature check — and nothing
+// signs an envelope (funduq#282). The bytes did not change; the owner did.
 func TestDeliveredRunVectorYieldsItsKyokToken(t *testing.T) {
-	data := mustRead(t, "docs", "upstream-contract-vectors.json")
-	var cf struct {
-		Wire []struct {
-			Kind  string          `json:"kind"`
-			Frame json.RawMessage `json:"frame"`
-		} `json:"wire"`
+	data := mustRead(t, "docs", "wire-vectors.json")
+	var vf struct {
+		Envelopes struct {
+			DeliveredRun struct {
+				Frame json.RawMessage `json:"frame"`
+			} `json:"delivered_run"`
+		} `json:"envelopes"`
 	}
-	if err := json.Unmarshal(data, &cf); err != nil {
-		t.Fatalf("vectors do not parse: %v", err)
+	if err := json.Unmarshal(data, &vf); err != nil {
+		t.Fatalf("wire vectors do not parse: %v", err)
+	}
+	if len(vf.Envelopes.DeliveredRun.Frame) == 0 {
+		t.Fatal("no envelopes.delivered_run entry in docs/wire-vectors.json")
 	}
 
-	var found bool
-	for _, w := range cf.Wire {
-		if w.Kind != "delivered-run" {
-			continue
-		}
-		found = true
-		var frame struct {
-			RunInput json.RawMessage `json:"runInput"`
-		}
-		if err := json.Unmarshal(w.Frame, &frame); err != nil {
-			t.Fatalf("delivered-run frame does not parse: %v", err)
-		}
-		tok := extractKyokToken(frame.RunInput)
-		if tok == nil {
-			t.Fatal("published delivered-run frame carries a kyok grant and this binary read none — " +
-				"forwardedProps layout moved; see contract-changelog revision 18")
-		}
-		if tok.Token == "" {
-			t.Error("kyok token read as empty from the published frame")
-		}
+	var frame struct {
+		RunInput json.RawMessage `json:"runInput"`
 	}
-	if !found {
-		t.Fatal("no delivered-run entry in the vendored vectors")
+	if err := json.Unmarshal(vf.Envelopes.DeliveredRun.Frame, &frame); err != nil {
+		t.Fatalf("delivered-run frame does not parse: %v", err)
+	}
+	tok := extractKyokToken(frame.RunInput)
+	if tok == nil {
+		t.Fatal("the published delivered-run frame carries a kyok grant and this binary read none — " +
+			"forwardedProps layout moved; see contract-changelog revision 18")
+	}
+	if tok.Token == "" {
+		t.Error("kyok token read as empty from the published frame")
 	}
 }

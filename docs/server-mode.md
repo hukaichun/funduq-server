@@ -5,18 +5,18 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Upstream is the published `funduq` packages now (`funduq` 0.0.10,
-`funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.12 — the repo is
+Upstream is the published `funduq` packages now (`funduq` 0.0.11,
+`funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.13 — the repo is
 [hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
-payloads and delivery envelopes on this wire are theirs, pinned at a
-named **contract revision** (currently 22, vendored in
+payloads on this wire are theirs, pinned at a
+named **contract revision** (currently 23, vendored in
 [`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json)).
 The *framing* — which frames exist, what each carries, the handshake's
 shape on a socket — remains this repo's to decide, and this gateway has
 no deployments outside this repo, so a wire change is still a hard
 cutover selected by the `version` field rather than a staged migration.
 
-**Revisions 8–22 changed nothing about the frame vocabulary.** The wire
+**Revisions 8–23 changed nothing about the frame vocabulary.** The wire
 is still v4 — same frames, same `handshake_version`, and every signed
 payload upstream defines byte-identical since revision 16. What moved is
 underneath and beside: the types the frames validate into, which door a
@@ -150,6 +150,44 @@ real improvement:
 - **`A2ARequestHandler`** is upstream's real `a2a.server.RequestHandler`,
   and the gateway's hand-rolled equivalent is gone — see "The A2A door".
 
+### The envelopes came home
+
+Revision 11 took the frame vocabulary and its codec out of upstream and
+left two things behind in `contract-vectors.json`: byte-pinned samples of
+`delivered-run` and `delivered-completion`, with a note saying to produce
+them with `model_dump(by_alias=True)`. They sat beside six payload
+families that a signature is computed over, in a file whose whole purpose
+is that being wrong by one colon means a signature does not verify.
+
+Nothing signs an envelope. What those two entries pinned was **how a
+model is spelled on a wire**, down to the capitalisation of its field
+names — which is framing, which is the thing revision 11 had just given
+away. Filed as
+[funduq#282](https://github.com/hukaichun/funduq/issues/282); **contract
+revision 23 deleted the section**, and stated the rule that keeps it
+deleted: an entry is published there because getting it wrong fails a
+signature check, asserted now by a test on the file's own top-level shape.
+
+The two frames are in [`docs/wire-vectors.json`](wire-vectors.json)'s
+`envelopes` key instead, byte-identical, replayed by `souk-agent-sdk`,
+`souk-client-sdk` and the Go pod-probe exactly as before. What changed is
+whose statement they are.
+
+**This wire still carries camelCase**, and the reason is now the honest
+one: this file says so, in the same breath as every other frame. The
+aliases remain upstream's and remain fingerprinted — `model_validate`
+accepts either spelling — so a transport whose wire is snake_case is
+upstream-compatible too. It simply is not this one.
+
+Upstream declined the other available fix, and its reason is worth
+keeping: `serialize_by_alias=True` on `Shape` would have made
+`model_dump()` match the old vectors in one line and spared every
+downstream a flag — and would have settled field naming for every
+transport there will ever be, from the package that gave that decision
+away at revision 11. The flag stays, and so does the reason to be careful
+with it: the dump rules two sections above are this document's to state
+precisely because nothing upstream states them.
+
 **Our envelopes stay flat, so both ends strip the transport key.** A run
 frame is `{"type": "run", **DeliveredRun}`, not
 `{"type": "run", "run": {…}}` — the frame shape predates the models and
@@ -242,8 +280,8 @@ Frames are JSON text messages, camelCase — matching the AG-UI/A2A wire
 style, readable in devtools, and free for the browser providers that
 justify ws in the first place. The frame vocabulary is published in
 [`docs/wire-vectors.json`](wire-vectors.json) and asserted equal to the
-gateway's dispatch sets in tests; the signed payloads and envelopes
-inside the frames are upstream's, vectored in
+gateway's dispatch sets in tests, along with the two delivery envelopes;
+the signed payloads inside the frames are upstream's, vectored in
 [`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json).
 
 **funduq hands work over; it does not wait to be asked for it.** There is
@@ -460,7 +498,7 @@ The semantics are core's, restated here because they shape the wire:
 | ↓ | `{"type": "registered", "names": […]}` | what is now live, sorted |
 | ↑ | `{"type": "deleteAgent", "name"}` | remove one record outright |
 | ↓ | `{"type": "deleted", "name"}` | it is gone |
-| ↓ | `{"type": "run", **DeliveredRun}` | an **offer**: the frame is upstream's declared envelope — `DeliveredRun.model_dump(by_alias=True)` and never `exclude_none` (`runId`, `agentName`, `runInput`, `threadId`, `metadata`), rebuilt on the far side with `model_validate` once the transport's `type` key is stripped. Since revision 11 core *hands `deliver` the `DeliveredRun` itself*, so there is no translation left on either side. Canonical frame in `docs/upstream-contract-vectors.json`'s `wire` section; neither end hand-writes the mapping |
+| ↓ | `{"type": "run", **DeliveredRun}` | an **offer**: the frame carries upstream's model — `DeliveredRun.model_dump(by_alias=True)` and never `exclude_none` (`runId`, `agentName`, `runInput`, `threadId`, `metadata`), rebuilt on the far side with `model_validate` once the transport's `type` key is stripped. Since revision 11 core *hands `deliver` the `DeliveredRun` itself*, so there is no translation left on either side. Canonical frame in [`docs/wire-vectors.json`](wire-vectors.json)'s `envelopes` key — it was upstream's `wire` section until contract revision 23 deleted that; see "The envelopes came home" above. Neither end hand-writes the mapping |
 | ↑ | `{"type": "ack", "runId", "accepted", "reason"?}` | whether this provider took it — and the answer is a **receipt**, produced from the provider's own state without asking the agent anything (upstream holds the next utterance of the same conversation until it lands, so a link that waits for the agent to start turns that round-trip into startup time). A bare `accepted: false` is how a full one says so — transient, souk re-offers later. `reason` makes the decline *permanent* (an input that does not parse): souk fails the run with the provider's words recorded verbatim and stops re-offering. souk invents no reason vocabulary; the string is the provider's own. The three names are `funduq_contract.Verdict`'s (accepted / declined / refused); the v4 frame keeps its boolean-plus-reason spelling and the gateway translates, so the *meaning* has one definition and the frame stays what every shipped provider sends |
 | ↑ | `{"type": "event", "runId", "event"}` | one AG-UI event; authorized against the run's claim |
 | ↑ | `{"type": "finish", "runId"}` | that run's stream ended |

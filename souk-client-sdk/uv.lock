@@ -647,7 +647,7 @@ wheels = [
 
 [[package]]
 name = "funduq-contract"
-version = "0.0.11"
+version = "0.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
@@ -656,9 +656,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/65/79c10df15348d498da7046e0d347b2c089abbe5ffc6cabb67f85fac74538/funduq_contract-0.0.11.tar.gz", hash = "sha256:a48429bd8af9cfabbc2a4029b6ffc350a27d2bad37daafcc8619c6a043f87444", size = 47072, upload-time = "2026-09-07T19:04:04.477Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/64/b4/583da96eef798b44a6a200a098d718469a925ed515d2ac01474303f0b3f3/funduq_contract-0.0.13.tar.gz", hash = "sha256:97ec6dee526e0b6543c5cad85fbd05ca4bc426d3f3b677f57ddfd46f94a4e4b6", size = 47072, upload-time = "2026-09-10T20:30:48.804Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/64/c6d02839dcbae8466bcd758389504ab5f75ea80267e71b47bca14388da02/funduq_contract-0.0.11-py3-none-any.whl", hash = "sha256:c6a2347a63361e269c7f23c3ffd9b7c080adb612618e812acd4a6661402c76ec", size = 13721, upload-time = "2026-09-07T19:04:03.057Z" },
+    { url = "https://files.pythonhosted.org/packages/97/95/5d561017820263527e99d3aae9960a83b379c5b384081a3686c560ed0929/funduq_contract-0.0.13-py3-none-any.whl", hash = "sha256:28660f4723c161627d283d2e4efd4e49f60826a55c3ee4d14aa3ee27ef8c0f68", size = 13719, upload-time = "2026-09-10T20:30:47.664Z" },
 ]
 
 [[package]]

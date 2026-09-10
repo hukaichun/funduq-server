@@ -28,9 +28,12 @@ from funduq_provider_sdk import ProviderIdentity, verify_signature
 
 from souk_client_sdk import SoukClient, resolution_proof
 
-UPSTREAM_VECTORS = json.loads(
-    (Path(__file__).parent.parent.parent / "docs" / "upstream-contract-vectors.json").read_text()
-)
+_DOCS = Path(__file__).parent.parent.parent / "docs"
+UPSTREAM_VECTORS = json.loads((_DOCS / "upstream-contract-vectors.json").read_text())
+# Envelopes live in this repo's own vectors since contract revision 23 —
+# upstream publishes only what a signature covers, and nothing signs an
+# envelope (funduq#282).
+WIRE_VECTORS = json.loads((_DOCS / "wire-vectors.json").read_text())
 
 
 def _vector(kind: str) -> dict:
@@ -398,10 +401,11 @@ async def test_a_fresh_turn_starts_a_new_task(monkeypatch):
 
 
 def test_a_completion_request_is_the_published_envelope():
-    """Upstream's `delivered-completion` wire vector, validated straight
-    into the model the bridge hands its handler — no `from_request`, no
-    field mapping, and `body` is OpenAI's own request shape."""
-    frame = next(v for v in UPSTREAM_VECTORS["wire"] if v["kind"] == "delivered-completion")["frame"]
+    """The `delivered-completion` envelope, validated straight into the
+    model the bridge hands its handler — no `from_request`, no field
+    mapping, and `body` is OpenAI's own request shape. This repo's vector
+    since contract revision 23, byte-identical to upstream's last."""
+    frame = WIRE_VECTORS["envelopes"]["delivered_completion"]["frame"]
     delivered = DeliveredCompletion.model_validate(frame)
     assert delivered.run_id == frame["runId"]
     assert delivered.provider_key == frame["providerKey"]
