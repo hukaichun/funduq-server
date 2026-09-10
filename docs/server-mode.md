@@ -179,14 +179,11 @@ aliases remain upstream's and remain fingerprinted — `model_validate`
 accepts either spelling — so a transport whose wire is snake_case is
 upstream-compatible too. It simply is not this one.
 
-Upstream declined the other available fix, and its reason is worth
-keeping: `serialize_by_alias=True` on `Shape` would have made
-`model_dump()` match the old vectors in one line and spared every
-downstream a flag — and would have settled field naming for every
-transport there will ever be, from the package that gave that decision
-away at revision 11. The flag stays, and so does the reason to be careful
-with it: the dump rules two sections above are this document's to state
-precisely because nothing upstream states them.
+Upstream declined the available one-line fix — `serialize_by_alias=True`
+on `Shape` — precisely because it would have settled field naming for
+every transport there will ever be. So the flag stays at every call site,
+and so does the reason to be careful with it: the dump rules two sections
+above are this document's to state because nothing upstream states them.
 
 **Our envelopes stay flat, so both ends strip the transport key.** A run
 frame is `{"type": "run", **DeliveredRun}`, not

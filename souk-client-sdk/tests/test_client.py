@@ -31,8 +31,7 @@ from souk_client_sdk import SoukClient, resolution_proof
 _DOCS = Path(__file__).parent.parent.parent / "docs"
 UPSTREAM_VECTORS = json.loads((_DOCS / "upstream-contract-vectors.json").read_text())
 # Envelopes live in this repo's own vectors since contract revision 23 —
-# upstream publishes only what a signature covers, and nothing signs an
-# envelope (funduq#282).
+# docs/server-mode.md, "The envelopes came home".
 WIRE_VECTORS = json.loads((_DOCS / "wire-vectors.json").read_text())
 
 

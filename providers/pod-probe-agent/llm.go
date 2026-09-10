@@ -143,8 +143,8 @@ func extractKyokToken(input json.RawMessage) *KyokToken {
 	// nothing, returns no token, and this agent quietly answers without a
 	// model, which is the same shape as a caller who never opted in. The
 	// vectors are what tell the two apart, so the delivered-run frame in
-	// docs/upstream-contract-vectors.json is replayed through this
-	// function in wire_test.go.
+	// docs/wire-vectors.json is replayed through this function in
+	// wire_test.go.
 	var parsed struct {
 		ForwardedProps struct {
 			Funduq struct {
