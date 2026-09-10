@@ -104,15 +104,23 @@ catches all of it; "verified end to end" is a claim about one path.
   finalise a fixture from a different task than it set up in, which a
   cancel scope cannot survive.
 
-## Upstream's contract (currently revision 22)
+## Upstream's contract (currently revision 23)
 
-The pin is `funduq` 0.0.10, `funduq-provider-sdk[llm]` 0.0.9,
-`funduq-contract` 0.0.12. Read
+The pin is `funduq` 0.0.11, `funduq-provider-sdk[llm]` 0.0.9,
+`funduq-contract` 0.0.13. Read
 [upstream's `docs/contract-changelog.md`](https://github.com/hukaichun/funduq/blob/main/docs/contract-changelog.md)
 before moving it: it says what an implementation must change, which
 commit subjects cannot. These bite in ways a green suite does not always
 catch first:
 
+- **The two delivery envelopes are vectored HERE**, in
+  `docs/wire-vectors.json`'s `envelopes` key — not in the vendored
+  upstream file. Revision 23 deleted upstream's `wire` section (funduq#282,
+  filed from here) on the rule that it publishes only what a signature
+  covers, and nothing signs an envelope. Three consumers replay them —
+  both SDK suites and the Go probe — and the Go one fatals by name if the
+  key is missing. When re-vendoring `upstream-contract-vectors.json`, do
+  not look for `wire` in it; it is gone and should stay gone.
 - **Two dump rules that pull opposite ways.** A frame envelope is dumped
   `by_alias=True` and **never** `exclude_none` (`RunAgentInput`'s
   `forwardedProps` is legitimately null, and stripping it

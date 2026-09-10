@@ -26,9 +26,13 @@ from funduq_provider_sdk import AgentHandle, ProviderIdentity, verify_signature
 from souk_agent_sdk import a2a_client
 from souk_agent_sdk.client import dump_envelope, dump_event
 
-UPSTREAM_VECTORS = json.loads(
-    (Path(__file__).parent.parent.parent / "docs" / "upstream-contract-vectors.json").read_text()
-)
+_DOCS = Path(__file__).parent.parent.parent / "docs"
+UPSTREAM_VECTORS = json.loads((_DOCS / "upstream-contract-vectors.json").read_text())
+# The envelopes moved here at contract revision 23: upstream's vectors now
+# publish only what a signature covers, and nothing signs an envelope
+# (funduq#282). Two files, because the two halves have different owners —
+# the signed payloads are upstream's statement, the framing is this wire's.
+WIRE_VECTORS = json.loads((_DOCS / "wire-vectors.json").read_text())
 
 
 def _vector(kind: str) -> dict:
@@ -132,12 +136,14 @@ def test_a_delivered_run_carries_funduqs_keys_under_one_key_of_its_own():
     the way in. So an agent reading `forwardedProps.funduq` knows funduq
     put it there, and a caller's `addressedRunId` can never pass for one.
 
-    Replayed from upstream's published `delivered-run` wire vector, so this
-    asserts the shape upstream ships rather than the shape this file
+    Replayed from the published `delivered-run` envelope, so this asserts
+    the shape that actually crosses rather than the shape this file
     imagines; `funduq_provider_sdk.runtime` reads the interjection target
-    from exactly this path.
+    from exactly this path. The envelope is `docs/wire-vectors.json`'s
+    since contract revision 23 — byte-identical to what upstream last
+    published, and now stated by the side that frames it.
     """
-    frame = next(v for v in UPSTREAM_VECTORS["wire"] if v["kind"] == "delivered-run")["frame"]
+    frame = WIRE_VECTORS["envelopes"]["delivered_run"]["frame"]
     bag = frame["runInput"]["forwardedProps"]
     assert set(bag) == {"funduq"}
     assert set(bag["funduq"]) == {"kyok", "actorChain"}
