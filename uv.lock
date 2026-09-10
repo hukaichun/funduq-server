@@ -438,7 +438,7 @@ wheels = [
 
 [[package]]
 name = "funduq"
-version = "0.0.8"
+version = "0.0.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -451,9 +451,9 @@ dependencies = [
     { name = "pyjwt" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/73/62/abbc78ad196024d011d044b65e4f2c70a46905c56e6fd66f4e7bda9ac6c6/funduq-0.0.8.tar.gz", hash = "sha256:2f467a04afd65d645ebf96b28b03447eee235937367e80372483705813566738", size = 253406, upload-time = "2026-09-07T19:04:37.964Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/d6/9c4bc9ccc56455cd0c6a32ee41c63fe1332603b19231ec9a8512dab5c5f0/funduq-0.0.10.tar.gz", hash = "sha256:54e786cc05ef99a4612da8181acd0bdcdaebd0253d528ae2444c35e8e97f6b10", size = 254300, upload-time = "2026-09-08T09:24:55.866Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/9f/9321e594883e5fd2cd5cdcecdef696de5fcd7bdc051daa45c00ce4d6f33a/funduq-0.0.8-py3-none-any.whl", hash = "sha256:f9fe755864cfedfc556b486e7478ce21c98029f94a7f396aad52ced8d1fe6f52", size = 79225, upload-time = "2026-09-07T19:04:36.729Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/11/5fd2801ffa23b4b5ca7a6da8dc8df167de3369545e309706a3b5b98dde4e/funduq-0.0.10-py3-none-any.whl", hash = "sha256:8af4b37320e476bf4a6df6f9657b94f0c53e13296445253dccd20e7cd665e8ef", size = 79070, upload-time = "2026-09-08T09:24:53.926Z" },
 ]
 
 [package.optional-dependencies]
@@ -463,7 +463,7 @@ postgres = [
 
 [[package]]
 name = "funduq-contract"
-version = "0.0.11"
+version = "0.0.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ag-ui-protocol" },
@@ -472,9 +472,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/65/79c10df15348d498da7046e0d347b2c089abbe5ffc6cabb67f85fac74538/funduq_contract-0.0.11.tar.gz", hash = "sha256:a48429bd8af9cfabbc2a4029b6ffc350a27d2bad37daafcc8619c6a043f87444", size = 47072, upload-time = "2026-09-07T19:04:04.477Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/9f/f5c8848a8246d44d8f55b8633f2fcdc9c672ca58ada4ea21649e86350f1b/funduq_contract-0.0.12.tar.gz", hash = "sha256:79cdf71063ebfbe924cff6b42c9cf9ab550c6347c6f12c547bb3d1f8c36a0916", size = 47069, upload-time = "2026-09-08T09:24:31.828Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4a/64/c6d02839dcbae8466bcd758389504ab5f75ea80267e71b47bca14388da02/funduq_contract-0.0.11-py3-none-any.whl", hash = "sha256:c6a2347a63361e269c7f23c3ffd9b7c080adb612618e812acd4a6661402c76ec", size = 13721, upload-time = "2026-09-07T19:04:03.057Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/ed/c767888f502042bbf7858d98cd93e06eb0a584ff302a1de7b24334c3fc1e/funduq_contract-0.0.12-py3-none-any.whl", hash = "sha256:fc1a720d62500da07b4d8df4aabc142dd1be91a847138a4f499c38b8cac3525f", size = 13721, upload-time = "2026-09-08T09:24:30.564Z" },
 ]
 
 [[package]]
@@ -1595,9 +1595,9 @@ requires-dist = [
     { name = "a2a-sdk", specifier = ">=1.1,<2" },
     { name = "ag-ui-protocol", specifier = ">=0.1.22" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "funduq", specifier = ">=0.0.8,<0.1" },
+    { name = "funduq", specifier = ">=0.0.10,<0.1" },
     { name = "funduq", extras = ["postgres"], marker = "extra == 'postgres'" },
-    { name = "funduq-contract", specifier = ">=0.0.11,<0.1" },
+    { name = "funduq-contract", specifier = ">=0.0.12,<0.1" },
     { name = "funduq-provider-sdk", extras = ["llm"], specifier = ">=0.0.9,<0.1" },
     { name = "mcp", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.6" },

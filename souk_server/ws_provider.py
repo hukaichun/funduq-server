@@ -58,6 +58,7 @@ from funduq.models import AgentRef
 from pydantic import ValidationError
 from funduq_provider_sdk import DeliveredRun, Refusal
 from souk_server.handshake import WIRE_VERSION
+from souk_server.reads import may_read
 from souk_server.ws_common import (
     POLICY_VIOLATION,
     close_frame,
@@ -80,9 +81,10 @@ router = APIRouter()
 # It used to be checked against `FunduqLink.__abstractmethods__`, on the
 # reasoning that the link ABC was the surface a second query would grow
 # on. Revision 21 ended that: reading is no longer a link verb at all —
-# `thread_messages` left the ABC, and every party now reads through
-# funduq's one read surface, `Funduq.as_reader(key)`, the provider as the
-# key it proved at the handshake. The frame stays, because this repo owns
+# `thread_messages` left the ABC — and revision 22 went further and took
+# the rule about who may read out of core entirely, leaving it here
+# (`souk_server.reads`), the provider as the key it proved at the
+# handshake. The frame stays, because this repo owns
 # both ends of every wire it defines and core only stopped *requiring*
 # the verb; what is gone is the tripwire, which now says the opposite of
 # what it was written to say.
@@ -267,14 +269,14 @@ async def _answer_query(
     to keep the response frame bounded; trimming after receiving would
     bound nothing and put a months-old thread on the wire to do it.
 
-    **Two checks, and both earn their place.** The read itself goes
-    through `funduq.as_reader(public_key)` — core's one read surface since
-    revision 21, entered as the key this socket proved at the handshake,
-    so a thread bound to a responsibility segment answers only its
-    parties. In front of it stands this gateway's older rule: *a provider
-    may only read threads for agents it serves*. Core's circle is the
-    weaker of the two — `readers_of` returns "anyone holding the id" for
-    an **unbound** thread, so `as_reader` alone would let any connected
+    **Two checks, and both earn their place.** `souk_server.reads.may_read`
+    is the party rule — this gateway's since revision 22 moved it out of
+    core, unchanged in what it admits — entered as the key this socket
+    proved at the handshake, so a thread bound to a responsibility segment
+    answers only its parties. In front of it stands this gateway's older
+    rule: *a provider may only read threads for agents it serves*. The
+    party rule is the weaker of the two — an **unbound** thread is
+    readable by whoever holds its id, so it alone would let any connected
     provider read any unbound thread whose id it once saw. Thread ids are
     not guessable, but "not guessable" is not an authorization rule: a
     provider that served one run knows that thread id permanently, and
@@ -314,7 +316,11 @@ async def _answer_query(
         answer(error="no such thread for this provider")
         return
 
-    messages = await funduq.as_reader(public_key).thread_messages(thread_id)
+    if not await may_read(funduq, thread_id, public_key):
+        answer(error="no such thread for this provider")
+        return
+
+    messages = await funduq.get_thread_messages(thread_id)
     answer(result=messages[-limit:] if limit is not None else messages)
 
 

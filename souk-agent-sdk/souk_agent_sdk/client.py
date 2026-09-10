@@ -260,13 +260,13 @@ class SoukProvider(FunduqLink):
 
         **Not an upstream link verb.** `FunduqLink.thread_messages` left
         the ABC at contract revision 21: reading the record is no longer
-        the link's job, and in-process a provider reads through
-        `Funduq.as_reader(its key)` instead. The `query`/`queryResult`
+        the link's job, and revision 22 went further and took the rule
+        about who may read out of core altogether. The `query`/`queryResult`
         frame pair this method rides is *this repo's* wire, defined in
-        docs/server-mode.md, and the gateway answers it out of the same
-        read surface as the key this link proved at the handshake. So:
-        implement nothing upstream against this signature, and expect no
-        upstream vector for it.
+        docs/server-mode.md, and the gateway answers it as the key this
+        link proved at the handshake, against its own rule. So: implement
+        nothing upstream against this signature, and expect no upstream
+        vector for it.
 
         What arrives in `run_input` is exactly what the *caller* sent for
         this run: an AG-UI client resends its whole history every turn,

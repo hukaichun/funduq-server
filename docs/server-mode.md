@@ -5,24 +5,40 @@ Status: **implemented** (`souk_server/ws_provider.py`,
 serves and over which transports. Supersedes the inherited HTTP+gRPC
 split.
 
-Upstream is the published `funduq` packages now (`funduq` 0.0.8,
-`funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.11 — the repo is
+Upstream is the published `funduq` packages now (`funduq` 0.0.10,
+`funduq-provider-sdk[llm]` 0.0.9, `funduq-contract` 0.0.12 — the repo is
 [hukaichun/funduq](https://github.com/hukaichun/funduq)), and the signed
 payloads and delivery envelopes on this wire are theirs, pinned at a
-named **contract revision** (currently 21, vendored in
+named **contract revision** (currently 22, vendored in
 [`docs/upstream-contract-vectors.json`](upstream-contract-vectors.json)).
 The *framing* — which frames exist, what each carries, the handshake's
 shape on a socket — remains this repo's to decide, and this gateway has
 no deployments outside this repo, so a wire change is still a hard
 cutover selected by the `version` field rather than a staged migration.
 
-**Revisions 8–21 changed nothing about the frame vocabulary.** The wire
+**Revisions 8–22 changed nothing about the frame vocabulary.** The wire
 is still v4 — same frames, same `handshake_version`, and every signed
 payload upstream defines byte-identical since revision 16. What moved is
 underneath and beside: the types the frames validate into, which door a
 verdict enters core by (17), where a caller's declarations sit in the bag
 it sends (18 and 20), what a run *is* (19), and how a read is authorized
-(21).
+(21, and then 22, which handed the question over entirely).
+
+**Revision 22 gave this gateway a rule to own.** Core no longer decides
+who may read: `Funduq.as_reader` and the `Reader` class are gone, and
+what is left is `Funduq.parties_of(thread_id)` — the head, the provider
+serving the agent, every key on the thread's runs' chains, or `None` for
+a thread nobody bound. Deriving that set stays core's, because the chains
+are verified there and only there; what follows from it is the wire's.
+Upstream's argument is worth carrying here, because it is also the reason
+this repo did not simply inline the check at each door: core's denial
+returned `[]` or `None`, which is what "there is nothing there" also
+looks like, so a serving layer that wanted a wider rule was overruled
+with no signal — and the only lever a door held was *which key it
+passed*, so the one way to widen was to pass a key already on the chain,
+which is to impersonate a party. This gateway keeps revision 21's circle
+exactly, in one place (`souk_server/reads.py`), read by all three of its
+read doors. See "The proofs: read, cancel, resolve" below.
 
 Revision 21 is the one that changed this gateway's own surface rather
 than its plumbing, and it did so by asking a question this document had
@@ -477,18 +493,15 @@ it crosses a wire.
   receiving would bound nothing and put a months-old thread on the wire to
   do it.
 - **Two checks stand in front of this read, and both earn their place.**
-  Revision 21 made reading the record one surface with one rule:
-  `Funduq.as_reader(key)`, where an unbound thread is readable by whoever
-  holds its id and a bound one only by its parties. The read here goes
-  through `funduq.as_reader(public_key)` — the key this socket proved at
-  the handshake — so a thread bound to a responsibility segment answers
-  only its parties, and this gateway stopped having its own opinion about
-  that case.
+  The party rule — `souk_server.reads.may_read`, revision 21's circle
+  kept where revision 22 left it — is entered as the key this socket
+  proved at the handshake, so a thread bound to a responsibility segment
+  answers only its parties.
 
   In front of it stands this gateway's older rule: **a provider may only
-  read threads for agents it serves.** It stays, because core's circle is
-  the *weaker* of the two — `readers_of` returns "anyone holding the id"
-  for an unbound thread, so `as_reader` alone would let any connected
+  read threads for agents it serves.** It stays, because the party rule
+  is the *weaker* of the two — an unbound thread is readable by whoever
+  holds its id, so the party rule alone would let any connected
   provider read any unbound thread whose id it once saw. Thread ids are
   not guessable, but unguessable is not an authorization rule: a provider
   that served one run knows that thread id permanently, and would
@@ -1015,8 +1028,10 @@ On the AG-UI door the same function is called directly with
 
 **One header, not two.** `X-Funduq-View` is deleted along with the
 `view_metadata_of` hook it fed: revision 21 made `presenter_key_of` serve
-reads and writes alike, so for a write the answer is the key the chain's
-last hop must match, and for a read it is simply who is looking.
+reads and writes alike, and revision 22 left that unchanged — what moved
+was who *judges* the key, not who establishes it. For a write the answer
+is the key the chain's last hop must match, checked in core; for a read
+it is simply who is looking, checked here.
 `funduq_contract.view_payload` survives upstream as a payload a transport
 *may* have a reader sign to establish a key for one read; nothing here
 signs it, and souk-agent-sdk's `view_headers()` is gone.
@@ -1046,13 +1061,39 @@ Two singular acts on a chain-bound run, and one read that is no longer an
 act at all.
 
 **A read takes a key, not a signed act** (revision 21). The view proof is
-gone: `GetTask` and `SubscribeToTask` take the key the *transport*
-authenticated, and every party reads through one surface,
-`Funduq.as_reader(key)`, under one rule — a thread nobody bound is
+gone: `GetTask`, `SubscribeToTask` and `ListTasks` take the key the
+*transport* authenticated, under one rule — a thread nobody bound is
 readable by whoever holds its id; a bound thread by its parties (the
 head, the provider serving its agent, every key on its runs' chains); to
 anyone else it does not exist. The read circle is still wider than the
-act circle, and it is now stated once in core instead of at each door.
+act circle, and it is still stated once.
+
+**Where that once is, is what revision 22 changed** — and only that.
+The whole inventory of who decides what, across every door this gateway
+serves, is [`docs/authorization.md`](authorization.md); this section is
+the read row of it.
+Core answers `Funduq.parties_of(thread_id)` and stops; the rule reading
+that answer is `souk_server/reads.py:may_read`, and the three read
+operations above are its only callers on the A2A door (the provider
+socket's `thread_messages` query is the fourth). Cancel is not among
+them: it is an *act*, its own proof governs it, and the Task it returns
+is the snapshot the act was made against.
+
+Two things about that move are worth writing down rather than
+rediscovering:
+
+- **`parties_of` says `None` for two different situations** — a thread
+  nobody bound, and a thread that does not exist. Revision 21's `Reader`
+  told them apart, admitting the first and denying the second. Reading
+  the ambiguity the convenient way turns every id that names nothing into
+  a readable thread, quietly, in a suite that stays green; `may_read`
+  asks `get_thread` first for exactly this, and `tests/test_reads.py`
+  fails without it.
+- **An empty page is how `ListTasks` says no.** Holding the `contextId`
+  is what makes a thread's tasks *addressable* (A2A §3.1.4, and
+  upstream's remaining half of the rule); being a party is what sees
+  them. The refusal is shaped like a thread with no tasks, for the same
+  reason `GetTask` answers absence.
 
 Absence is still the answer to an unauthorized read, and that has not
 softened: a bound run read by a stranger is "not found", because
@@ -1210,18 +1251,20 @@ fixes the surface below at "who is here, what do they do, where do I go".
   a directory that advertises live updates off registration events alone
   would miss the ones its users care most about. Not load-bearing either
   way.
-- **Reads through the unchecked facade, and that is an open
+- **Reads with no rule in front of them, and that is an open
   decision.** `browse_souk` and friends go through `Funduq`'s plain
-  roster methods, not `as_reader(None)`, and so do `GET /threads/{id}`
-  and `GET /threads/{id}/tree` on the AG-UI door. For the docent the
+  roster methods, and so do `GET /threads/{id}` and
+  `GET /threads/{id}/tree` on the AG-UI door. For the docent the
   question barely arises — the roster is public by construction and it
   serves nothing thread-shaped — but the two thread reads *are*
-  thread-shaped, and revision 21's rule (an unbound thread is readable by
+  thread-shaped, and the party rule (an unbound thread is readable by
   whoever holds its id; a bound one only by its parties) is not applied
-  to them. Routing them through `as_reader` of the key the presenter
-  header proves is the obvious next round; it is listed here as
-  **not done**, so that nobody reads the seat above as covering more than
-  it does.
+  to them. Since revision 22 there is no ambiguity left about whose
+  omission this is: the rule is this repo's, written once in
+  `souk_server/reads.py`, and these two doors do not call it. Passing
+  them the key the presenter header proves is the obvious next round; it
+  is listed here as **not done**, so that nobody reads the seat above as
+  covering more than it does.
 - **Not exposed:** invocation (A2A's job), registration/identity
   (provider business), KYOK (bridge business), threads/runs (run
   observation is a different feature with a different audience — add
@@ -1346,20 +1389,29 @@ would be worse than the limit.
   gateway reaching inside a2a-sdk's compat adapter, which is the one
   place in this system whose whole value is being the package's business
   and not ours.
-- **`historyLength: 0` still returns the whole history.** Revision 19's
-  changelog says the field's presence is read and 0 means no history; the
-  released `a2a_translate.history_of` still ends `history[-limit:] if
-  limit else history`, so 0 falls through the falsy branch and returns
-  everything. **Deliberately not worked around here**
-  ([funduq#268](https://github.com/hukaichun/funduq/issues/268)): a
-  gateway-side special case would make this door disagree with the same
-  adapter used in-process, and two answers to one question is a worse bug
-  than one wrong answer in one place. Reported upstream; it is a fix in
-  `history_of`, not a fix in a transport.
-- **Two thread reads still bypass revision 21's reader rule** —
+- **`historyLength: 0` — fixed upstream, and worth keeping the story.**
+  Revision 19 said the field's presence was read and 0 meant no history;
+  the released `history_of` still ended `history[-limit:] if limit else
+  history`, so 0 fell through the falsy branch and returned everything.
+  It was reported rather than patched here
+  ([funduq#268](https://github.com/hukaichun/funduq/issues/268)) because a
+  gateway-side special case would have made this door disagree with the
+  same adapter used in-process, and two answers to one question is worse
+  than one wrong answer in one place. Fixed in `funduq` 0.0.9, which this
+  repo now pins. The correction this repo *offered* was itself wrong and
+  is the more useful half of the lesson: `if limit is not None` fixes
+  nothing, because `-0 == 0` and `history[-0:]` is `history[0:]`. The two
+  cases have to be split before the slice. A one-line fix proposed
+  without running it, in a repo whose first rule is that reading produces
+  confident wrong answers.
+- **Two thread reads still apply no party rule** —
   `GET /threads/{id}`, `GET /threads/{id}/tree` and the MCP docent go
-  through the unchecked facade rather than `as_reader(...)`. See "MCP:
-  the docent" above; it is an open decision, not a finished one.
+  through the unchecked facade rather than `souk_server.reads.may_read`,
+  which the A2A door and the provider socket both call. See "MCP: the
+  docent" above; it is an open decision, not a finished one, and
+  [`docs/authorization.md`](authorization.md) is where it sits in the
+  larger picture — one of four doors whose real question belongs to a
+  layer this repo has no way to express yet.
 
 ## Where examples live
 

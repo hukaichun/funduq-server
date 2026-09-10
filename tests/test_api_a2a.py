@@ -46,6 +46,7 @@ import json
 import time
 
 import pytest
+from a2a.utils.errors import JSON_RPC_ERROR_CODE_MAP, TaskNotFoundError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import func, select
 
@@ -72,12 +73,18 @@ def _now() -> int:
     return int(time.time())
 
 
-async def _rpc(client, served, payload: dict, *, presenter=None, header=None):
+async def _rpc(client, served, payload: dict, *, presenter=None, header=None, version=None):
     """One JSON-RPC call, with the presenter proof signed over the exact
     bytes posted. `json=` would re-serialize the payload and the body hash
-    would cover different bytes than the ones signed."""
+    would cover different bytes than the ones signed.
+
+    `version` is the `A2A-Version` header; absent means 0.3, which is what
+    the v0.3 method names below rely on. The v1.0 names need "1.0" — and
+    two of them (`ListTasks`, `SubscribeToTask`) exist only there."""
     raw = json.dumps(payload).encode()
     headers = {"content-type": "application/json"}
+    if version is not None:
+        headers["A2A-Version"] = version
     if header is not None:
         headers.update(header)
     elif presenter is not None:
@@ -173,6 +180,28 @@ def _asking_events(run_id: str, thread_id: str, asks: list[str]) -> list[dict]:
             "outcome": {"type": "interrupt", "interrupts": [{"id": ask} for ask in asks]},
         },
     ]
+
+
+def _error_code(resp) -> int | None:
+    """The JSON-RPC error code, however the door chose to deliver it.
+
+    A streaming method answers as SSE even when what it has to say is a
+    refusal, so the same assertion has to read both shapes; `None` for a
+    response carrying no error at all, which is itself a failing answer
+    everywhere it is used.
+    """
+    body = resp.text
+    if body.lstrip().startswith("data:"):
+        body = "".join(
+            line.partition("data:")[2]
+            for line in body.splitlines()
+            if line.startswith("data:")
+        )
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return (payload.get("error") or {}).get("code")
 
 
 async def _run_that_asked(
@@ -503,8 +532,8 @@ async def test_a_bound_run_read_without_a_presenter_proof_reads_as_absent(
 
     The same read with a proof from the head succeeds, which is what makes
     the first answer a decision rather than a broken route. One header
-    does both halves now: `presenter_key_of` feeds `as_reader` for a read
-    exactly as it feeds `verify_caller` for a write.
+    does both halves: `presenter_key_of` feeds this gateway's party rule
+    for a read exactly as it feeds core's `verify_caller` for a write.
     """
     head = _Party()
     served = await register("approver")
@@ -604,6 +633,72 @@ async def test_a_mid_chain_hop_may_read_the_run_it_may_not_cancel(
         },
     )
     assert "result" not in refused.json(), refused.text
+
+
+async def test_listing_a_bound_threads_tasks_takes_being_a_party(
+    client, register, session, souk
+):
+    """Holding the `contextId` names a thread's tasks; being a party is
+    what sees them.
+
+    A2A §3.1.4 states only the first half, and upstream implements only
+    that half — since revision 22 core answers who the parties are and
+    stops. The second half is this door's, and an **empty page** is how it
+    says no: the same answer a thread with no tasks gives, so a stranger
+    holding an id learns nothing from the difference.
+    """
+    head, stranger = _Party(), _Party()
+    served = await register("approver")
+    thread_id, run_id = await _bound_paused_run(
+        souk, session, served, chain=new_chain(head.key), head=head.public_key, asks=["ask_1"]
+    )
+    listing = {
+        "jsonrpc": "2.0",
+        "id": "20",
+        "method": "ListTasks",
+        "params": {"contextId": thread_id},
+    }
+
+    for outsider in (None, stranger):
+        resp = await _rpc(client, served, listing, presenter=outsider, version="1.0")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"].get("tasks", []) == [], resp.text
+
+    party = await _rpc(client, served, listing, presenter=head, version="1.0")
+
+    assert [t["id"] for t in party.json()["result"]["tasks"]] == [run_id], party.text
+
+
+async def test_reattaching_to_a_bound_task_takes_being_a_party(
+    client, register, session, souk
+):
+    """`SubscribeToTask` is a read, and it answers a stranger the way
+    every other read does: not found.
+
+    The refusal has to be *that* error and not a distinct one, because
+    existence is part of what is guarded — a "you may not" would confirm
+    the task to somebody who may not see it. The party gets a different
+    refusal (there is nothing left to stream on a task that has finished
+    asking), and that difference is the whole assertion: one of these is
+    the gate talking, the other is the adapter.
+    """
+    head, stranger = _Party(), _Party()
+    served = await register("approver")
+    _, run_id = await _bound_paused_run(
+        souk, session, served, chain=new_chain(head.key), head=head.public_key, asks=["ask_1"]
+    )
+    subscribe = {
+        "jsonrpc": "2.0",
+        "id": "21",
+        "method": "SubscribeToTask",
+        "params": {"id": run_id},
+    }
+
+    outside = await _rpc(client, served, subscribe, presenter=stranger, version="1.0")
+    party = await _rpc(client, served, subscribe, presenter=head, version="1.0")
+
+    assert _error_code(outside) == JSON_RPC_ERROR_CODE_MAP[TaskNotFoundError], outside.text
+    assert _error_code(party) != _error_code(outside), party.text
 
 
 # --- the resolve proof: answering a paused run ------------------------------

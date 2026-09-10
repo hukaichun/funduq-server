@@ -399,7 +399,13 @@ async def get_task(
     request_id: str | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any] | None:
-    """Read one task. `None` means the callee answered absence.
+    """Read one task.
+
+    **Absence arrives as A2A's own `TaskNotFound` (-32001), raised**, not
+    as `None`: the JSON-RPC dispatcher turns a null result into that
+    error, which is the point — a reader who may not see a task gets the
+    answer a task that never existed gets. `None` is reachable only if a
+    door ever answers a null result some other way; handle both.
 
     Pass `identity` — this provider's own `ProviderIdentity` — for any run
     whose thread is bound to an actor chain: a read is answered as the key
@@ -407,8 +413,9 @@ async def get_task(
     "not found" whether or not the task exists. Revision 21 folded reads
     and writes into that one hook (`presenter_key_of`), so the header a
     read carries is the same `Funduq-Presenter` a chained send carries —
-    there is no separate view proof any more. Any actor on the run's chain
-    is inside its read circle, so a provider that delegated work can still
+    there is no separate view proof any more; revision 22 moved only who
+    *judges* the key, into the gateway. Any actor on the run's chain is
+    inside its read circle, so a provider that delegated work can still
     watch the task it is on the chain of.
 
     Omitting it is right for an unbound run, which stays as public as its
