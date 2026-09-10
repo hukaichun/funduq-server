@@ -312,33 +312,31 @@ func mustHex(t *testing.T, s string) []byte {
 // for, so the frame goes through extractKyokToken rather than being
 // compared field by field.
 //
-// The envelope is wire-vectors.json's since contract revision 23, which
-// deleted upstream's `wire` section on the rule that an entry is published
-// there because getting it wrong fails a signature check — and nothing
-// signs an envelope (funduq#282). The bytes did not change; the owner did.
+// The envelope is wire-vectors.json's since contract revision 23: the
+// bytes did not change, the owner did. Why, in docs/server-mode.md, "The
+// envelopes came home".
 func TestDeliveredRunVectorYieldsItsKyokToken(t *testing.T) {
 	data := mustRead(t, "docs", "wire-vectors.json")
 	var vf struct {
 		Envelopes struct {
 			DeliveredRun struct {
-				Frame json.RawMessage `json:"frame"`
+				Frame struct {
+					RunInput json.RawMessage `json:"runInput"`
+				} `json:"frame"`
 			} `json:"delivered_run"`
 		} `json:"envelopes"`
 	}
 	if err := json.Unmarshal(data, &vf); err != nil {
 		t.Fatalf("wire vectors do not parse: %v", err)
 	}
-	if len(vf.Envelopes.DeliveredRun.Frame) == 0 {
-		t.Fatal("no envelopes.delivered_run entry in docs/wire-vectors.json")
+	// Go zero-fills a key that is not there, so absence and a frame with no
+	// runInput both arrive as an empty message — one check, one message.
+	runInput := vf.Envelopes.DeliveredRun.Frame.RunInput
+	if len(runInput) == 0 {
+		t.Fatal("no envelopes.delivered_run frame with a runInput in docs/wire-vectors.json")
 	}
 
-	var frame struct {
-		RunInput json.RawMessage `json:"runInput"`
-	}
-	if err := json.Unmarshal(vf.Envelopes.DeliveredRun.Frame, &frame); err != nil {
-		t.Fatalf("delivered-run frame does not parse: %v", err)
-	}
-	tok := extractKyokToken(frame.RunInput)
+	tok := extractKyokToken(runInput)
 	if tok == nil {
 		t.Fatal("the published delivered-run frame carries a kyok grant and this binary read none — " +
 			"forwardedProps layout moved; see contract-changelog revision 18")

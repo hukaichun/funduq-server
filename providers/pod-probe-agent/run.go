@@ -11,7 +11,7 @@ import (
 
 // runFrame is the offer that arrives after registration: {"type": "run"}
 // plus the DeliveredRun envelope, model_dump(by_alias=True) on souk's side
-// (see docs/upstream-contract-vectors.json, kind "delivered-run").
+// (see docs/wire-vectors.json, envelopes.delivered_run).
 // agentName rides along because this provider routes by it and the
 // RunAgentInput does not name it. runInput is the AG-UI RunAgentInput,
 // kept raw so a KYOK token in its forwardedProps survives untouched.
