@@ -28,10 +28,10 @@ from souk_agent_sdk.client import dump_envelope, dump_event
 
 _DOCS = Path(__file__).parent.parent.parent / "docs"
 UPSTREAM_VECTORS = json.loads((_DOCS / "upstream-contract-vectors.json").read_text())
-# The envelopes moved here at contract revision 23: upstream's vectors now
-# publish only what a signature covers, and nothing signs an envelope
-# (funduq#282). Two files, because the two halves have different owners —
-# the signed payloads are upstream's statement, the framing is this wire's.
+# Two files because the two halves have different owners: the signed
+# payloads are upstream's statement, the framing — envelopes included since
+# contract revision 23 — is this wire's. See docs/server-mode.md, "The
+# envelopes came home".
 WIRE_VECTORS = json.loads((_DOCS / "wire-vectors.json").read_text())
 
 
